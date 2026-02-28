@@ -1,0 +1,19 @@
+[package]
+name = "ironsight"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Client library for the FlightScope Mevo+ / Mevo Gen2 binary protocol"
+repository = "https://github.com/divotmaker/ironsight"
+readme = "README.md"
+keywords = ["flightscope", "mevo", "golf", "launch-monitor"]
+categories = ["network-programming", "parser-implementations"]
+exclude = ["docs/"]
+
+[features]
+serde = ["dep:serde"]
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
