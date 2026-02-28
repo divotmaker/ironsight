@@ -23,8 +23,8 @@ use crate::protocol::handshake::{
 use crate::protocol::status::{AvrStatus, DspStatus, PiStatus, StatusPoll};
 use crate::protocol::{Command, Message};
 
-/// Per-exchange timeout (1s for all operations).
-pub const TIMEOUT: Duration = Duration::from_secs(1);
+/// Per-exchange timeout (2s for all operations).
+pub const TIMEOUT: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Internal: expect! macro
@@ -36,11 +36,18 @@ macro_rules! expect {
     ($env:expr, $pat:path) => {
         match $env.message {
             $pat(inner) => Ok(inner),
-            other => {
+            _ => {
+                let hex: String = $env
+                    .raw
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 Err(ConnError::Protocol(format!(
-                    "expected {}, got {:?}",
+                    "expected {}, got UnknownMessage(\"0x{:02X}\", [{}])",
                     stringify!($pat),
-                    std::mem::discriminant(&other),
+                    $env.type_id,
+                    hex,
                 )))
             }
         }

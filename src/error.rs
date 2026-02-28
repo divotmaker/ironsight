@@ -1,7 +1,5 @@
 use thiserror::Error;
 
-use crate::addr::BusAddr;
-
 /// Errors arising from wire protocol parsing and encoding.
 #[derive(Debug, Error)]
 pub enum WireError {
@@ -31,9 +29,6 @@ pub enum WireError {
         /// Raw unstuffed payload bytes for debug context.
         raw: Vec<u8>,
     },
-
-    #[error("unknown message type 0x{type_id:02X} from {src}")]
-    UnknownMessageType { type_id: u8, src: BusAddr },
 
     #[error("invalid FLOAT40: non-zero exponent with zero mantissa")]
     InvalidFloat40,
