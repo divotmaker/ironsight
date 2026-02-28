@@ -63,6 +63,7 @@ pub const TYPE_PROD_INFO: u8 = 0xFD;
 // Responses (device sends)
 pub const TYPE_CAM_IMAGE_AVAIL: u8 = 0x84;
 pub const TYPE_SENSOR_ACT_RESP: u8 = 0x89;
+pub const TYPE_CONFIG_NACK: u8 = 0x94;
 pub const TYPE_CONFIG_ACK: u8 = 0x95;
 pub const TYPE_CONFIG_RESP: u8 = 0xA0;
 pub const TYPE_AVR_CONFIG_RESP: u8 = 0xA2;
@@ -194,6 +195,7 @@ pub enum Message {
     DspStatus(status::DspStatus),
     PiStatus(status::PiStatus),
     ConfigAck(status::ConfigAck),
+    ConfigNack(status::ConfigAck),
     ModeAck(status::ModeAck),
     Text(status::Text),
 
@@ -259,6 +261,7 @@ impl Message {
                 }),
             },
             TYPE_CONFIG_ACK => Ok(Message::ConfigAck(status::ConfigAck::decode(p)?)),
+            TYPE_CONFIG_NACK => Ok(Message::ConfigNack(status::ConfigAck::decode(p)?)),
             TYPE_MODE_ACK => Ok(Message::ModeAck(status::ModeAck::decode(p)?)),
             TYPE_TEXT => Ok(Message::Text(status::Text::decode(p)?)),
 

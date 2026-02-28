@@ -94,13 +94,19 @@ pub fn send_recv(
             return Err(ConnError::Timeout { timeout });
         }
         let env = conn.recv_timeout(remaining)?;
-        // Skip: Text/DspDebug logs, unsolicited CamState/ModeAck, wrong-bus messages.
-        if matches!(
-            env.message,
-            Message::Text(_) | Message::DspDebug(_) | Message::CamState(_) | Message::ModeAck(_)
-        ) || env.src != dest
-        {
+        // Skip wrong-bus messages.
+        if env.src != dest {
             continue;
+        }
+        // Skip: Text/DspDebug logs, unsolicited CamState/ModeAck/ConfigNack, Unknown.
+        match &env.message {
+            Message::Text(_)
+            | Message::DspDebug(_)
+            | Message::CamState(_)
+            | Message::ModeAck(_)
+            | Message::ConfigNack(_)
+            | Message::Unknown { .. } => continue,
+            _ => {}
         }
         return Ok(env);
     }
@@ -126,7 +132,7 @@ fn recv_skip_ack<T>(
         let env = conn.recv_timeout(remaining)?;
         if matches!(
             env.message,
-            Message::Text(_) | Message::DspDebug(_) | Message::ConfigAck(_) | Message::Unknown { .. }
+            Message::Text(_) | Message::DspDebug(_) | Message::ConfigAck(_) | Message::ConfigNack(_) | Message::Unknown { .. }
         ) || env.src != from
         {
             continue;
@@ -300,7 +306,7 @@ pub fn sync_avr(conn: &mut Connection) -> Result<AvrSync, ConnError> {
 
     // CalParamReq → AVR
     // Device responds with Text + ConfigAck + CalParamResp (confirmed from pcap).
-    // May respond with Unknown(0x94) if device is in a stale state; CalParamResp
+    // May respond with ConfigNack(0x94) if device is in a stale state; CalParamResp
     // is constant factory data and not used downstream, so treat as optional.
     conn.send(&Command::CalParamReq(CalParamReq), BusAddr::Avr)?;
     let if_cal = match recv_skip_ack(conn, BusAddr::Avr, t, |m| match m {
