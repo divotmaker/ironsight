@@ -10,10 +10,8 @@ use std::time::{Duration, Instant};
 
 use ironsight::conn::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
-use ironsight::protocol::config::{MODE_OUTDOOR, ParamData, ParamValue, RadarCal};
-use ironsight::seq::{
-    self, Action, AvrSettings, AvrSync, DspSync, PiSync, ShotSequencer,
-};
+use ironsight::protocol::config::{ParamData, ParamValue, RadarCal, MODE_CHIPPING};
+use ironsight::seq::{self, Action, AvrSettings, AvrSync, DspSync, PiSync, ShotSequencer};
 use ironsight::{BinaryConnection, ConnError, Message, Sequence};
 
 // ---------------------------------------------------------------------------
@@ -46,7 +44,7 @@ fn m_to_in(m: f64) -> f64 {
 
 fn default_avr_settings() -> AvrSettings {
     AvrSettings {
-        mode: MODE_OUTDOOR,
+        mode: MODE_CHIPPING,
         params: vec![
             // Ball type: 0 = RCT
             ParamValue {
@@ -142,7 +140,10 @@ fn main() {
     }
 }
 
-fn send_action(conn: &mut BinaryConnection<std::net::TcpStream>, action: Action) -> Result<(), ConnError> {
+fn send_action(
+    conn: &mut BinaryConnection<std::net::TcpStream>,
+    action: Action,
+) -> Result<(), ConnError> {
     seq::send_action(conn, action)
 }
 

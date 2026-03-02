@@ -19,6 +19,7 @@
 //! | `RESULT` | GVP → APP | [`GvpMessage::Result`] |
 //! | `MT_VIDEO_AVAILABLE` | GVP → APP | [`GvpMessage::VideoAvailable`] |
 
+pub mod client;
 pub mod config;
 pub mod conn;
 pub mod log;
@@ -32,6 +33,7 @@ pub mod video;
 use serde_json::Value;
 use thiserror::Error;
 
+pub use client::{GvpClient, GvpEvent};
 pub use config::GvpConfig;
 pub use conn::GvpConnection;
 pub use result::BallTrackerResult;

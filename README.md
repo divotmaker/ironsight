@@ -7,11 +7,16 @@ FlightScope and Mevo are trademarks of their respective owner.
 
 ## Description
 
-Client library for the FlightScope Mevo+ / Mevo Gen2 binary protocol (TCP port
-5100). Handles wire framing, device handshake, keepalive, arming, and shot result
-parsing. The connection type is generic over any `Read + Write` stream, and
-`recv()` is non-blocking — callers own the event loop and drive all I/O. Blocking
-convenience wrappers are provided for simple use cases. No async runtime or
+Client library for the FlightScope Mevo+ / Mevo Gen2 protocol. Two non-blocking
+clients share the same `poll()` pattern:
+
+- **`BinaryClient`** — binary radar protocol (TCP port 5100). Handles
+  handshake, configuration, arming, keepalives, and shot detection.
+- **`GvpClient`** — GVP camera protocol (TCP port 1258, `gvp` feature). Handles
+  trigger, trajectory hints, and ball tracker results.
+
+Both are generic over any `Read + Write` stream. Blocking convenience wrappers
+and low-level sequencer state machines are also available. No async runtime or
 heavyweight dependencies.
 
 ## Legal Basis — DMCA Section 1201(f)
@@ -111,50 +116,41 @@ Detailed specs live in [`docs/`](docs/):
 
 ## Quick Start
 
-See [`examples/event_loop.rs`](examples/event_loop.rs) for a complete
-standalone example: connect, handshake, arm, poll for shots, and print results.
+See [`examples/client.rs`](examples/client.rs) for a complete standalone
+example: connect, handshake, configure, arm, and poll for shots.
 
-The core pattern is a non-blocking event loop. `BinaryConnection<S>` is generic
-over any `Read + Write` stream, and `recv()` returns `Ok(None)` when no data is
-available:
+`BinaryClient` wraps the connection and all protocol state machines behind a
+single `poll()` call. Keepalives, operation sequencing, and shot detection are
+handled automatically:
 
 ```rust
-use ironsight::{BinaryConnection, Sequence};
-use ironsight::seq::{self, ShotSequencer};
+use ironsight::client::{BinaryClient, BinaryEvent};
+use ironsight::BinaryConnection;
 
-// Handshake (blocking via drive())
-let dsp = seq::sync_dsp(&mut conn)?;
-let avr = seq::sync_avr(&mut conn)?;
-let pi = seq::sync_pi(&mut conn)?;
+let conn = BinaryConnection::connect("192.168.2.1:5100")?;
+let mut client = BinaryClient::from_tcp(conn)?;
 
-// Non-blocking event loop
-conn.stream_mut().set_read_timeout(Some(Duration::from_millis(1)))?;
-let mut shot: Option<ShotSequencer> = None;
+client.handshake();
+client.configure(avr_settings, cam_config);
+client.arm();
 
 loop {
-    if let Some(env) = conn.recv()? {
-        // Feed active shot sequencer
-        if let Some(ref mut s) = shot {
-            for a in s.feed(&env) { seq::send_action(&mut conn, a)?; }
-            if s.is_complete() { /* extract result */ }
-        }
-        // Start new shot on "PROCESSED"
-        if let Message::ShotText(st) = &env.message {
-            if st.is_processed() {
-                let (s, actions) = ShotSequencer::new();
-                for a in actions { seq::send_action(&mut conn, a)?; }
-                shot = Some(s);
-            }
-        }
+    match client.poll()? {
+        Some(BinaryEvent::Handshake(h)) => println!("SSID: {}", h.pi.ssid),
+        Some(BinaryEvent::Armed) => println!("Ready for shots"),
+        Some(BinaryEvent::Shot(data)) => println!("Shot! {data:?}"),
+        _ => {}
     }
-    // Keepalive on timer
-    for a in seq::keepalive_actions() { seq::send_action(&mut conn, a)?; }
 }
 ```
 
-Protocol sequences are pollable state machines implementing the `Sequence` trait.
-Each has `feed()` (accept a message, return commands to send) and `is_complete()`.
-The `drive()` function runs any sequencer to completion on a blocking stream.
+### Low-level sequencer API
+
+For callers that need full control over the event loop, the `Sequence` trait
+exposes the underlying pollable state machines. Each sequencer has `feed()`
+(accept a message, return commands to send) and `is_complete()`. The `drive()`
+function runs any sequencer to completion on a blocking stream. See
+[`examples/event_loop.rs`](examples/event_loop.rs).
 
 ## Dependencies
 
