@@ -66,6 +66,129 @@ pub struct CamConfig {
 }
 
 impl CamConfig {
+    /// Standard mode preset (1024x768).
+    ///
+    /// Used during camera warmup before switching to Fusion. The Pi camera
+    /// subsystem needs to boot in standard mode first (~14s) before the Fusion
+    /// SHM buffer can be allocated.
+    #[must_use]
+    pub fn standard_preset() -> Self {
+        Self {
+            dynamic_config: true,
+            resolution_width: 1024,
+            resolution_height: 768,
+            rotation: 0,
+            ev: 0,
+            quality: 20,
+            framerate: 20,
+            streaming_framerate: 20,
+            ringbuffer_pretime_ms: 2000,
+            ringbuffer_posttime_ms: 1500,
+            raw_camera_mode: 0,
+            fusion_camera_mode: false,
+            // Raw camera fields: -1 = disabled (matches native app wire encoding).
+            // Using 0 instead of -1 can cause the Pi to misinterpret these as
+            // real configuration values, affecting SHM buffer allocation.
+            raw_shutter_speed_max: 0.0,
+            raw_ev_roi_x: -1,
+            raw_ev_roi_y: -1,
+            raw_ev_roi_width: -1,
+            raw_ev_roi_height: -1,
+            raw_x_offset: -1,
+            raw_bin44: false,
+            raw_live_preview_write_interval_ms: -1,
+            raw_y_offset: -1,
+            buffer_sub_sampling_pre_trigger_div: -1,
+            buffer_sub_sampling_post_trigger_div: -1,
+            buffer_sub_sampling_switch_time_offset: -1.0,
+            buffer_sub_sampling_total_buffer_size: -1,
+            buffer_sub_sampling_pre_trigger_buffer_size: -1,
+        }
+    }
+
+    /// Fusion mode preset (1640x1232) — five_strikes pcap (older firmware).
+    ///
+    /// High-resolution JPEG Fusion mode where the APP controls the capture
+    /// resolution. Matches five_strikes pcap byte-for-byte.
+    #[must_use]
+    pub fn fusion_preset() -> Self {
+        Self {
+            dynamic_config: true,
+            resolution_width: 1640,
+            resolution_height: 1232,
+            rotation: 0,
+            ev: 0,
+            quality: 80,
+            framerate: 10,
+            streaming_framerate: 1,
+            ringbuffer_pretime_ms: 1000,
+            ringbuffer_posttime_ms: 4000,
+            raw_camera_mode: 0,
+            fusion_camera_mode: false,
+            raw_shutter_speed_max: 0.0,
+            raw_ev_roi_x: -1,
+            raw_ev_roi_y: -1,
+            raw_ev_roi_width: -1,
+            raw_ev_roi_height: -1,
+            raw_x_offset: -1,
+            raw_bin44: false,
+            raw_live_preview_write_interval_ms: -1,
+            raw_y_offset: -1,
+            buffer_sub_sampling_pre_trigger_div: -1,
+            buffer_sub_sampling_post_trigger_div: -1,
+            buffer_sub_sampling_switch_time_offset: -1.0,
+            buffer_sub_sampling_total_buffer_size: -1,
+            buffer_sub_sampling_pre_trigger_buffer_size: -1,
+        }
+    }
+
+    /// Raw Fusion mode preset (640x480, 180fps) — new_firmware pcap (BM17.04).
+    ///
+    /// High-speed raw capture mode where the Pi handles Fusion processing
+    /// internally via `raw_camera_mode=7`. The native app reads this config
+    /// from the PI at boot and re-applies it after the standard warmup phase.
+    #[must_use]
+    pub fn raw_fusion_preset() -> Self {
+        Self {
+            dynamic_config: true,
+            resolution_width: 640,
+            resolution_height: 480,
+            rotation: 0,
+            ev: -5,
+            quality: 0,
+            framerate: 180,
+            streaming_framerate: 0,
+            ringbuffer_pretime_ms: 100,
+            ringbuffer_posttime_ms: 200,
+            raw_camera_mode: 7,
+            fusion_camera_mode: true,
+            raw_shutter_speed_max: 1.0,
+            raw_ev_roi_x: -1,
+            raw_ev_roi_y: -1,
+            raw_ev_roi_width: -1,
+            raw_ev_roi_height: -1,
+            raw_x_offset: 128,
+            raw_bin44: false,
+            raw_live_preview_write_interval_ms: 500,
+            raw_y_offset: -1,
+            buffer_sub_sampling_pre_trigger_div: -1,
+            buffer_sub_sampling_post_trigger_div: -1,
+            buffer_sub_sampling_switch_time_offset: -1.0,
+            buffer_sub_sampling_total_buffer_size: -1,
+            buffer_sub_sampling_pre_trigger_buffer_size: -1,
+        }
+    }
+
+    /// Whether this config uses Fusion mode.
+    ///
+    /// Checks for either high-res Fusion (1640x1232, older firmware) or
+    /// raw Fusion (raw_camera_mode=7, newer firmware BM17.04+).
+    #[must_use]
+    pub fn is_fusion(&self) -> bool {
+        (self.resolution_width == 1640 && self.resolution_height == 1232)
+            || self.raw_camera_mode == 7
+    }
+
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 52 {
             return Err(WireError::payload_too_short("CamConfig", 52, payload.len()));
@@ -173,7 +296,11 @@ impl CamImageAvail {
         if payload[0] == 0x42 {
             // Long form (67 bytes)
             if payload.len() < 67 {
-                return Err(WireError::payload_too_short("CamImageAvail(long)", 67, payload.len()));
+                return Err(WireError::payload_too_short(
+                    "CamImageAvail(long)",
+                    67,
+                    payload.len(),
+                ));
             }
             let streaming_flags = payload[1];
             let fusion_flags = payload[2];

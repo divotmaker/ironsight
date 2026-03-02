@@ -6,13 +6,15 @@
 
 use std::net::SocketAddr;
 use std::process;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ironsight::conn::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
 use ironsight::protocol::config::{MODE_OUTDOOR, ParamData, ParamValue, RadarCal};
-use ironsight::seq::{self, AvrSettings, AvrSync, DspSync, KeepaliveStatus, PiSync};
-use ironsight::{ConnError, Connection, Message};
+use ironsight::seq::{
+    self, Action, AvrSettings, AvrSync, DspSync, PiSync, ShotSequencer,
+};
+use ironsight::{BinaryConnection, ConnError, Message, Sequence};
 
 // ---------------------------------------------------------------------------
 // Unit conversion helpers
@@ -84,19 +86,19 @@ fn default_cam_config() -> CamConfig {
         raw_camera_mode: 0,
         fusion_camera_mode: false,
         raw_shutter_speed_max: 0.0,
-        raw_ev_roi_x: 0,
-        raw_ev_roi_y: 0,
-        raw_ev_roi_width: 0,
-        raw_ev_roi_height: 0,
-        raw_x_offset: 0,
+        raw_ev_roi_x: -1,
+        raw_ev_roi_y: -1,
+        raw_ev_roi_width: -1,
+        raw_ev_roi_height: -1,
+        raw_x_offset: -1,
         raw_bin44: false,
-        raw_live_preview_write_interval_ms: 0,
-        raw_y_offset: 0,
-        buffer_sub_sampling_pre_trigger_div: 1,
-        buffer_sub_sampling_post_trigger_div: 1,
-        buffer_sub_sampling_switch_time_offset: 0.0,
-        buffer_sub_sampling_total_buffer_size: 0,
-        buffer_sub_sampling_pre_trigger_buffer_size: 0,
+        raw_live_preview_write_interval_ms: -1,
+        raw_y_offset: -1,
+        buffer_sub_sampling_pre_trigger_div: -1,
+        buffer_sub_sampling_post_trigger_div: -1,
+        buffer_sub_sampling_switch_time_offset: -1.0,
+        buffer_sub_sampling_total_buffer_size: -1,
+        buffer_sub_sampling_pre_trigger_buffer_size: -1,
     }
 }
 
@@ -129,30 +131,6 @@ fn print_handshake(dsp: &DspSync, avr: &AvrSync, pi: &PiSync) {
     );
 }
 
-fn print_keepalive(status: &KeepaliveStatus) {
-    println!(
-        "[keepalive] tilt={:.1}° roll={:.1}° temp={:.1}°C battery={}%{}",
-        status.avr.tilt,
-        -status.avr.roll,
-        status.dsp.temperature_c(),
-        status.dsp.battery_percent(),
-        if status.dsp.external_power() {
-            " (plugged in)"
-        } else {
-            ""
-        },
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Retry helper
-// ---------------------------------------------------------------------------
-
-/// Returns true for transient errors that should be retried with "...".
-fn is_transient(e: &ConnError) -> bool {
-    matches!(e, ConnError::Timeout { .. } | ConnError::Protocol(_))
-}
-
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -164,18 +142,22 @@ fn main() {
     }
 }
 
+fn send_action(conn: &mut BinaryConnection<std::net::TcpStream>, action: Action) -> Result<(), ConnError> {
+    seq::send_action(conn, action)
+}
+
 fn run() -> Result<(), ConnError> {
     // 1. Connect
     let addr: SocketAddr = DEFAULT_ADDR.parse().unwrap();
     println!("Connecting to {addr}...");
-    let mut conn = Connection::connect_timeout(&addr, Duration::from_secs(5))?;
+    let mut conn = BinaryConnection::connect_timeout(&addr, Duration::from_secs(5))?;
     println!("Connected.");
 
     // Wire-level trace callbacks.
     conn.set_on_send(|cmd, dest| println!("\n>> {:?} [{}]", cmd, cmd.debug_hex(dest)));
     conn.set_on_recv(|env| println!("\n<< {env:?}"));
 
-    // 2. Handshake
+    // 2. Handshake (blocking via drive())
     println!("DSP sync...");
     let dsp = seq::sync_dsp(&mut conn)?;
     println!("AVR sync...");
@@ -197,173 +179,211 @@ fn run() -> Result<(), ConnError> {
     seq::arm(&mut conn)?;
     println!("=== ARMED — waiting for shots ===");
 
-    // 5. Main event loop
-    let recv_timeout = Duration::from_millis(900);
+    // 5. Non-blocking event loop
+    conn.stream_mut()
+        .set_read_timeout(Some(Duration::from_millis(1)))?;
+    let mut last_keepalive = Instant::now();
+    let mut shot: Option<ShotSequencer> = None;
+
     loop {
-        match conn.recv_timeout(recv_timeout) {
-            Ok(env) => {
-                match env.message {
-                    // --- Shot state transitions ---
-                    Message::ShotText(ref st) => {
-                        if st.is_processed() {
-                            // Drive the entire post-shot cycle:
-                            // ack → drain to IDLE → rearm → ARMED.
-                            loop {
-                                match seq::complete_shot(&mut conn, |s| println!("  {s}")) {
-                                    Ok(()) => break,
-                                    Err(ref e) if is_transient(e) => {
-                                        println!("  ... {e}");
-                                        continue;
-                                    }
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                        }
-                    }
-
-                    // --- Flight result (primary) ---
-                    Message::FlightResult(ref r) => {
-                        println!("  Flight result (shot #{}):", r.total);
-                        println!(
-                            "    Ball speed: {:.1} mph  VLA: {:.1}°  HLA: {:.1}°",
-                            ms_to_mph(r.launch_speed),
-                            r.launch_elevation,
-                            r.launch_azimuth,
-                        );
-                        println!(
-                            "    Carry: {:.1} yd  Total: {:.1} yd  Height: {:.1} ft",
-                            m_to_yd(r.carry_distance),
-                            m_to_yd(r.total_distance),
-                            m_to_ft(r.max_height),
-                        );
-                        println!(
-                            "    Backspin: {} rpm  Sidespin: {} rpm",
-                            r.backspin_rpm, r.sidespin_rpm,
-                        );
-                        println!(
-                            "    Club speed: {:.1} mph  Path: {:.1}°  AoA: {:.1}°",
-                            ms_to_mph(r.clubhead_speed),
-                            r.club_strike_direction,
-                            r.club_attack_angle,
-                        );
-                        println!(
-                            "    Face: {:.1}°  Loft: {:.1}°",
-                            r.club_face_angle, r.club_effective_loft,
-                        );
-                    }
-
-                    // --- Flight result v1 (early) ---
-                    Message::FlightResultV1(ref r) => {
-                        println!("  Flight result v1 (shot #{}):", r.total);
-                        println!(
-                            "    Ball: {:.1} mph  Club: {:.1} mph  VLA: {:.1}°  HLA: {:.1}°",
-                            ms_to_mph(r.ball_velocity),
-                            ms_to_mph(r.club_velocity),
-                            r.elevation,
-                            r.azimuth,
-                        );
-                        println!(
-                            "    Dist: {:.1} yd  Height: {:.1} ft  Backspin: {} rpm",
-                            m_to_yd(r.distance),
-                            m_to_ft(r.height),
-                            r.backspin_rpm,
-                        );
-                    }
-
-                    // --- Club result ---
-                    Message::ClubResult(ref r) => {
-                        println!("  Club result:");
-                        println!(
-                            "    Club speed: {:.1} mph (pre) / {:.1} mph (post)  Smash: {:.2}",
-                            ms_to_mph(r.pre_club_speed),
-                            ms_to_mph(r.post_club_speed),
-                            r.smash_factor,
-                        );
-                        println!(
-                            "    Path: {:.1}°  Face: {:.1}°  AoA: {:.1}°  Loft: {:.1}°",
-                            r.strike_direction, r.face_angle, r.attack_angle, r.dynamic_loft,
-                        );
-                        println!(
-                            "    Low point: {:.1} in  Club height: {:.1} in",
-                            m_to_in(r.club_offset),
-                            m_to_in(r.club_height),
-                        );
-                    }
-
-                    // --- Spin result ---
-                    Message::SpinResult(ref r) => {
-                        println!("  Spin result:");
-                        println!(
-                            "    Total spin: {} rpm (PM final)  Axis: {:.1}°  Method: {}",
-                            r.pm_spin_final, r.spin_axis, r.spin_method,
-                        );
-                        println!(
-                            "    AM: {} rpm  PM: {} rpm  Launch: {} rpm  AOD: {} rpm  PLL: {} rpm",
-                            r.am_spin, r.pm_spin, r.launch_spin, r.aod_spin, r.pll_spin,
-                        );
-                    }
-
-                    // --- Speed profile ---
-                    Message::SpeedProfile(ref r) => {
-                        let peak = r.speeds.iter().copied().fold(0.0_f64, f64::max);
-                        println!(
-                            "  Speed profile: {} samples ({}+{})  peak: {:.1} mph",
-                            r.speeds.len(),
-                            r.num_pre,
-                            r.num_post,
-                            ms_to_mph(peak),
-                        );
-                    }
-
-                    // --- Tracking status ---
-                    Message::TrackingStatus(ref r) => {
-                        println!(
-                            "  Tracking: iter={} quality={} prc_count={} trigger_idx={}",
-                            r.processing_iteration,
-                            r.result_quality,
-                            r.prc_tracking_count,
-                            r.trigger_idx,
-                        );
-                    }
-
-                    // --- PRC data ---
-                    Message::PrcData(ref r) => {
-                        println!("  PRC: seq={} points={}", r.sequence, r.points.len());
-                    }
-
-                    // --- Club PRC data ---
-                    Message::ClubPrc(ref r) => {
-                        println!("  Club PRC: points={}", r.points.len());
-                    }
-
-                    // --- Camera image available ---
-                    Message::CamImageAvail(ref r) => {
-                        println!(
-                            "  Camera: streaming={} fusion={} video={}",
-                            r.streaming_available, r.fusion_available, r.video_available,
-                        );
-                    }
-
-                    // --- Config ack (suppressed above) ---
-                    Message::ConfigAck(_) => {}
-
-                    // --- Everything else: debug line is enough ---
-                    _ => {}
+        if let Some(env) = conn.recv()? {
+            // If a shot sequence is active, feed it first.
+            if let Some(ref mut s) = shot {
+                let actions = s.feed(&env);
+                for a in actions {
+                    send_action(&mut conn, a)?;
+                }
+                if s.is_complete() {
+                    let data = shot.take().unwrap().into_result();
+                    print_shot(&data);
+                    continue;
                 }
             }
 
-            Err(ConnError::Timeout { .. }) => match seq::keepalive(&mut conn) {
-                Ok(status) => print_keepalive(&status),
-                Err(ref e) if is_transient(e) => println!("  ... {e}"),
-                Err(e) => return Err(e),
-            },
+            // Handle messages not consumed by the shot sequencer.
+            match &env.message {
+                Message::ShotText(st) if st.is_processed() && shot.is_none() => {
+                    println!("  Shot processed — starting shot sequence...");
+                    let (s, actions) = ShotSequencer::new();
+                    for a in actions {
+                        send_action(&mut conn, a)?;
+                    }
+                    shot = Some(s);
+                }
 
-            Err(ConnError::Disconnected) => {
-                println!("Device disconnected.");
-                return Ok(());
+                // --- Flight result (primary) ---
+                Message::FlightResult(r) => {
+                    println!("  Flight result (shot #{}):", r.total);
+                    println!(
+                        "    Ball speed: {:.1} mph  VLA: {:.1}°  HLA: {:.1}°",
+                        ms_to_mph(r.launch_speed),
+                        r.launch_elevation,
+                        r.launch_azimuth,
+                    );
+                    println!(
+                        "    Carry: {:.1} yd  Total: {:.1} yd  Height: {:.1} ft",
+                        m_to_yd(r.carry_distance),
+                        m_to_yd(r.total_distance),
+                        m_to_ft(r.max_height),
+                    );
+                    println!(
+                        "    Backspin: {} rpm  Sidespin: {} rpm",
+                        r.backspin_rpm, r.sidespin_rpm,
+                    );
+                    println!(
+                        "    Club speed: {:.1} mph  Path: {:.1}°  AoA: {:.1}°",
+                        ms_to_mph(r.clubhead_speed),
+                        r.club_strike_direction,
+                        r.club_attack_angle,
+                    );
+                    println!(
+                        "    Face: {:.1}°  Loft: {:.1}°",
+                        r.club_face_angle, r.club_effective_loft,
+                    );
+                }
+
+                // --- Flight result v1 (early) ---
+                Message::FlightResultV1(r) => {
+                    println!("  Flight result v1 (shot #{}):", r.total);
+                    println!(
+                        "    Ball: {:.1} mph  Club: {:.1} mph  VLA: {:.1}°  HLA: {:.1}°",
+                        ms_to_mph(r.ball_velocity),
+                        ms_to_mph(r.club_velocity),
+                        r.elevation,
+                        r.azimuth,
+                    );
+                    println!(
+                        "    Dist: {:.1} yd  Height: {:.1} ft  Backspin: {} rpm",
+                        m_to_yd(r.distance),
+                        m_to_ft(r.height),
+                        r.backspin_rpm,
+                    );
+                }
+
+                // --- Club result ---
+                Message::ClubResult(r) => {
+                    println!("  Club result:");
+                    println!(
+                        "    Club speed: {:.1} mph (pre) / {:.1} mph (post)  Smash: {:.2}",
+                        ms_to_mph(r.pre_club_speed),
+                        ms_to_mph(r.post_club_speed),
+                        r.smash_factor,
+                    );
+                    println!(
+                        "    Path: {:.1}°  Face: {:.1}°  AoA: {:.1}°  Loft: {:.1}°",
+                        r.strike_direction, r.face_angle, r.attack_angle, r.dynamic_loft,
+                    );
+                    println!(
+                        "    Low point: {:.1} in  Club height: {:.1} in",
+                        m_to_in(r.club_offset),
+                        m_to_in(r.club_height),
+                    );
+                }
+
+                // --- Spin result ---
+                Message::SpinResult(r) => {
+                    println!("  Spin result:");
+                    println!(
+                        "    Total spin: {} rpm (PM final)  Axis: {:.1}°  Method: {}",
+                        r.pm_spin_final, r.spin_axis, r.spin_method,
+                    );
+                    println!(
+                        "    AM: {} rpm  PM: {} rpm  Launch: {} rpm  AOD: {} rpm  PLL: {} rpm",
+                        r.am_spin, r.pm_spin, r.launch_spin, r.aod_spin, r.pll_spin,
+                    );
+                }
+
+                // --- Speed profile ---
+                Message::SpeedProfile(r) => {
+                    let peak = r.speeds.iter().copied().fold(0.0_f64, f64::max);
+                    println!(
+                        "  Speed profile: {} samples ({}+{})  peak: {:.1} mph",
+                        r.speeds.len(),
+                        r.num_pre,
+                        r.num_post,
+                        ms_to_mph(peak),
+                    );
+                }
+
+                // --- Tracking status ---
+                Message::TrackingStatus(r) => {
+                    println!(
+                        "  Tracking: iter={} quality={} prc_count={} trigger_idx={}",
+                        r.processing_iteration,
+                        r.result_quality,
+                        r.prc_tracking_count,
+                        r.trigger_idx,
+                    );
+                }
+
+                // --- PRC data ---
+                Message::PrcData(r) => {
+                    println!("  PRC: seq={} points={}", r.sequence, r.points.len());
+                }
+
+                // --- Club PRC data ---
+                Message::ClubPrc(r) => {
+                    println!("  Club PRC: points={}", r.points.len());
+                }
+
+                // --- Camera image available ---
+                Message::CamImageAvail(r) => {
+                    println!(
+                        "  Camera: streaming={} fusion={} video={}",
+                        r.streaming_available, r.fusion_available, r.video_available,
+                    );
+                }
+
+                // --- DspStatus from keepalive ---
+                Message::DspStatus(s) => {
+                    println!(
+                        "[keepalive] battery={}%{}  temp={:.1}°C",
+                        s.battery_percent(),
+                        if s.external_power() {
+                            " (plugged in)"
+                        } else {
+                            ""
+                        },
+                        s.temperature_c(),
+                    );
+                }
+                Message::AvrStatus(s) => {
+                    println!("[keepalive] tilt={:.1}° roll={:.1}°", s.tilt, -s.roll);
+                }
+
+                // --- Config ack / noise ---
+                Message::ConfigAck(_) | Message::PiStatus(_) => {}
+
+                // --- Everything else: debug line is enough ---
+                _ => {}
             }
+        }
 
-            Err(e) => return Err(e),
+        // Heartbeats always fire — even during shot sequencing.
+        if last_keepalive.elapsed() >= Duration::from_secs(1) {
+            for a in seq::keepalive_actions() {
+                send_action(&mut conn, a)?;
+            }
+            last_keepalive = Instant::now();
         }
     }
+}
+
+fn print_shot(data: &seq::ShotData) {
+    println!("\n  === Shot complete ===");
+    if let Some(ref f) = data.flight {
+        println!(
+            "    Ball: {:.1} mph  Carry: {:.0} yd",
+            ms_to_mph(f.launch_speed),
+            m_to_yd(f.carry_distance),
+        );
+    }
+    if let Some(ref c) = data.club {
+        println!(
+            "    Club: {:.1} mph  Smash: {:.2}",
+            ms_to_mph(c.pre_club_speed),
+            c.smash_factor,
+        );
+    }
+    println!("  === RE-ARMED ===\n");
 }

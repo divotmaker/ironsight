@@ -90,16 +90,23 @@ The `cameraCalibration` and `cameraConfiguration` values shown are defaults.
 When the APP pushes config, it typically zeroes out most fields (GVP uses its
 own stored calibration).
 
-The `ROI_width`/`ROI_height` in `cameraConfiguration` reflect the capture
-resolution. Two configurations have been observed:
+**Important**: The `ROI_width`/`ROI_height` in the APP→GVP CONFIG are **not**
+the capture resolution. The actual capture resolution is set via binary 0x82
+CAM_CONFIG on port 5100. The APP→GVP CONFIG is metadata/hints only.
+
+Observed APP→GVP CONFIG values:
+
+| Pcap | ROI_width | ROI_height | Binary 0x82 mode |
+| ---- | --------- | ---------- | ---------------- |
+| five_strikes (standard) | 0 | 0 | 1024×768 |
+| face_impact_shot_id_4 (Fusion) | 640 | 480 | 1640×1232 |
+
+Observed GVP→APP CONFIG response (to CONFIG_REQUEST):
 
 | Mode | Width | Height | Notes |
 | ---- | ----- | ------ | ----- |
-| Standard | 1024 | 768 | Default |
-| Fusion | 1640 | 1232 | High-res, enables face impact fusion |
-
-These correspond to the binary 0x82 CAM_CONFIG resolution fields on port 5100
-(see WIRE.md).
+| Standard | 1024 | 768 | Default (from five_strikes pcap) |
+| Fusion | 1640 | 1232 | Expected (not directly observed — face_impact pcap did not send CONFIG_REQUEST) |
 
 ### 1.5 STATUS
 
@@ -423,6 +430,47 @@ an availability flag.
 The TRIGGER message's `guid` field is used client-side to populate the E9
 TRACKING_STATUS DTO's `guid` field. If your application needs shot correlation
 IDs, generate and send TRIGGER messages.
+
+### Camera startup sequence
+
+The Pi camera requires a **two-phase startup** observed in the native app
+(five_strikes pcap). Skipping this causes "Failed to parse header.32k" errors
+from the GVP because the Fusion SHM buffer is never allocated.
+
+**Phase A: Standard mode warmup (~14s)**
+
+```
+APP→PI  0x82  CamConfig 1024×768 standard (q=20, fr=20, pre=2000ms, post=1500ms)
+APP→PI  0x83  CamConfigReq (readback)
+APP→PI  0x81  CamState STOP [01 00]
+        ... wait ~5-7s ...
+APP→PI  0x81  CamState START+STREAMING [01 03]
+PI→APP  0x81  CamState [01 00]  ← not ready, retry
+        ... wait ~5-7s ...
+APP→PI  0x81  CamState START+STREAMING [01 03]
+PI→APP  0x81  CamState [01 01]  ← ready
+```
+
+**Phase B: Switch to Fusion**
+
+```
+APP→PI  0x82  CamConfig 1640×1232 Fusion (q=80, fr=20, pre=200ms, post=4000ms)
+APP→PI  0x83  CamConfigReq (readback)
+APP→PI  0x81  CamState STOP [01 00]
+        ... poll CamState START+STREAMING [01 03] until [01 01] ...
+```
+
+CamState commands:
+- `[01 00]` = stop
+- `[01 01]` = start (basic, no streaming)
+- `[01 03]` = start + streaming
+
+CamState responses:
+- `[01 00]` = camera off / not ready
+- `[01 01]` = camera running / ready
+
+Use `CamConfig::standard_preset()` and `CamConfig::fusion_preset()` for the
+two phases. Total warmup is ~20-30 seconds before ARM.
 
 ### Minimal camera setup
 

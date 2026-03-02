@@ -1,17 +1,23 @@
-//! Handshake sequence helpers and operational routines.
+//! Handshake sequences, operational routines, and pollable state machines.
 //!
-//! Free functions that drive multi-step request/response exchanges over a
-//! [`Connection`]. Two layers:
+//! Two layers:
 //!
-//! 1. **Core helpers** — [`recv_msg`] (recv + skip 0xE3 Text) and [`send_recv`]
-//!    (send + recv_msg). These handle the "Text messages can arrive at any time" rule.
-//! 2. **Sequence functions** — one per SEQUENCE.md phase, plus operational helpers
-//!    for keepalive, shot-ack, and re-arm.
+//! 1. **Sequencers** — pollable state machines ([`Sequence`] trait). Each
+//!    sequencer's `feed()` accepts a received [`Envelope`] and returns
+//!    [`Action`]s to send. Callers own the event loop.
+//!
+//! 2. **Blocking functions** — convenience wrappers that call [`drive()`] to
+//!    run a sequencer to completion on a blocking [`Connection`] (TcpStream).
+//!    These preserve the pre-v0.1 API for callers that don't need non-blocking.
+//!
+//! All protocol logic lives in the sequencers. The blocking functions are thin
+//! wrappers.
 
+use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use crate::addr::BusAddr;
-use crate::conn::{ConnError, Connection, Envelope};
+use crate::conn::{BinaryConnection, ConnError, Connection, Envelope};
 use crate::protocol::camera::{CamConfig, CamConfigReq, CamState};
 use crate::protocol::config::{
     AvrConfigCmd, AvrConfigResp, ConfigResp, ModeSet, ParamReadReq, ParamValue, RadarCal,
@@ -20,18 +26,1261 @@ use crate::protocol::handshake::{
     CalDataReq, CalDataResp, CalParamReq, CalParamResp, DevInfoResp, DspQueryResp, NetConfigReq,
     ProdInfoReq, ProdInfoResp, TimeSync,
 };
+use crate::protocol::shot::{ClubPrc, ClubResult, FlightResult, PrcData, SpeedProfile, SpinResult};
 use crate::protocol::status::{AvrStatus, DspStatus, PiStatus, StatusPoll};
 use crate::protocol::{Command, Message};
 
-/// Per-exchange timeout (2s for all operations).
+/// Per-exchange timeout (2s for blocking wrappers).
 pub const TIMEOUT: Duration = Duration::from_secs(2);
 
-// ---------------------------------------------------------------------------
-// Internal: expect! macro
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Action, Sequence trait, drive(), infrastructure
+// ===========================================================================
 
-/// Destructure an [`Envelope`]'s message into a specific [`Message`] variant,
-/// or return `ConnError::Protocol`.
+/// An action returned by a sequencer's `feed()` or `new()`.
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// Send a command to a bus address.
+    Send(Command, BusAddr),
+}
+
+/// Trait implemented by all sequencers.
+///
+/// `feed()` accepts a received message and returns actions to send.
+/// `is_complete()` indicates the sequence is done. Type-specific `finish()`
+/// methods (not in the trait) extract the result.
+pub trait Sequence {
+    /// Process a received message. Returns actions to send (may be empty).
+    fn feed(&mut self, env: &Envelope) -> Vec<Action>;
+
+    /// Is the sequence complete?
+    fn is_complete(&self) -> bool;
+}
+
+/// Send an action on a connection.
+pub fn send_action<S: Read + Write>(
+    conn: &mut BinaryConnection<S>,
+    action: Action,
+) -> Result<(), ConnError> {
+    match action {
+        Action::Send(cmd, dest) => conn.send(&cmd, dest),
+    }
+}
+
+/// Run a sequence to completion on a blocking stream.
+///
+/// Sends initial actions, then loops recv→feed until complete.
+/// The stream must have a read timeout set to pace the loop. The
+/// `deadline` parameter controls the overall timeout for the sequence.
+pub fn drive<S: Read + Write>(
+    conn: &mut BinaryConnection<S>,
+    seq: &mut impl Sequence,
+    actions: Vec<Action>,
+    deadline: Instant,
+) -> Result<(), ConnError> {
+    for a in actions {
+        send_action(conn, a)?;
+    }
+    loop {
+        if Instant::now() >= deadline {
+            return Err(ConnError::Timeout);
+        }
+        if let Some(env) = conn.recv()? {
+            let actions = seq.feed(&env);
+            for a in actions {
+                send_action(conn, a)?;
+            }
+            if seq.is_complete() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Commands for a keepalive poll. Fire-and-forget — responses arrive via recv().
+#[must_use]
+pub fn keepalive_actions() -> Vec<Action> {
+    vec![
+        Action::Send(
+            Command::StatusPoll(StatusPoll { pi_mode: false }),
+            BusAddr::Dsp,
+        ),
+        Action::Send(
+            Command::StatusPoll(StatusPoll { pi_mode: false }),
+            BusAddr::Avr,
+        ),
+        Action::Send(
+            Command::StatusPoll(StatusPoll { pi_mode: true }),
+            BusAddr::Pi,
+        ),
+    ]
+}
+
+// ===========================================================================
+// Message filtering helpers
+// ===========================================================================
+
+/// Messages that all sequencers skip unconditionally.
+fn should_skip(env: &Envelope, expected_src: BusAddr) -> bool {
+    env.src != expected_src
+        || matches!(
+            &env.message,
+            Message::Text(_)
+                | Message::DspDebug(_)
+                | Message::CamState(_)
+                | Message::ConfigNack(_)
+                | Message::Unknown { .. }
+        )
+}
+
+/// Like `should_skip` but also skips ModeAck (for send_recv compatibility).
+fn should_skip_with_mode_ack(env: &Envelope, expected_src: BusAddr) -> bool {
+    should_skip(env, expected_src) || matches!(&env.message, Message::ModeAck(_))
+}
+
+/// Skip messages that arrive before a CalData/CalParam response:
+/// Text, DspDebug, ConfigAck, ConfigNack, Unknown, and wrong-bus.
+fn should_skip_for_cal(env: &Envelope, expected_src: BusAddr) -> bool {
+    env.src != expected_src
+        || matches!(
+            &env.message,
+            Message::Text(_)
+                | Message::DspDebug(_)
+                | Message::ConfigAck(_)
+                | Message::ConfigNack(_)
+                | Message::Unknown { .. }
+        )
+}
+
+// ===========================================================================
+// Phase 1 — DspSequencer
+// ===========================================================================
+
+/// Results from Phase 1 — DSP sync.
+#[derive(Debug, Clone)]
+pub struct DspSync {
+    pub status: DspStatus,
+    pub hw_info: DspQueryResp,
+    pub dev_info: DevInfoResp,
+    pub prod_info: [ProdInfoResp; 3],
+    pub config: ConfigResp,
+}
+
+#[derive(Debug)]
+enum DspStep {
+    WaitStatus,
+    WaitDspQuery,
+    WaitDevInfo,
+    WaitProdInfo0,
+    WaitProdInfo1,
+    WaitProdInfo2,
+    WaitConfig,
+    Done,
+}
+
+/// Pollable state machine for DSP sync (Phase 1).
+pub struct DspSequencer {
+    step: DspStep,
+    status: Option<DspStatus>,
+    hw_info: Option<DspQueryResp>,
+    dev_info: Option<DevInfoResp>,
+    prod_info: Vec<ProdInfoResp>,
+    config: Option<ConfigResp>,
+}
+
+impl DspSequencer {
+    /// Create a new DSP sequencer with initial actions to send.
+    #[must_use]
+    pub fn new() -> (Self, Vec<Action>) {
+        let seq = Self {
+            step: DspStep::WaitStatus,
+            status: None,
+            hw_info: None,
+            dev_info: None,
+            prod_info: Vec::with_capacity(3),
+            config: None,
+        };
+        let actions = vec![Action::Send(
+            Command::StatusPoll(StatusPoll { pi_mode: false }),
+            BusAddr::Dsp,
+        )];
+        (seq, actions)
+    }
+
+    /// Extract the result. Only valid after `is_complete()`.
+    #[must_use]
+    pub fn into_result(self) -> DspSync {
+        let mut pi = self.prod_info;
+        DspSync {
+            status: self.status.unwrap(),
+            hw_info: self.hw_info.unwrap(),
+            dev_info: self.dev_info.unwrap(),
+            prod_info: [pi.remove(0), pi.remove(0), pi.remove(0)],
+            config: self.config.unwrap(),
+        }
+    }
+}
+
+impl Sequence for DspSequencer {
+    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+        if should_skip_with_mode_ack(env, BusAddr::Dsp) {
+            return vec![];
+        }
+        match self.step {
+            DspStep::WaitStatus => {
+                if let Message::DspStatus(ref s) = env.message {
+                    self.status = Some(s.clone());
+                    self.step = DspStep::WaitDspQuery;
+                    return vec![Action::Send(Command::DspQuery, BusAddr::Dsp)];
+                }
+                vec![]
+            }
+            DspStep::WaitDspQuery => {
+                if let Message::DspQueryResp(ref r) = env.message {
+                    self.hw_info = Some(r.clone());
+                    self.step = DspStep::WaitDevInfo;
+                    return vec![Action::Send(Command::DevInfoReq, BusAddr::Dsp)];
+                }
+                vec![]
+            }
+            DspStep::WaitDevInfo => {
+                if let Message::DevInfoResp(ref r) = env.message {
+                    self.dev_info = Some(r.clone());
+                    self.step = DspStep::WaitProdInfo0;
+                    return vec![Action::Send(
+                        Command::ProdInfoReq(ProdInfoReq { sub_query: 0x00 }),
+                        BusAddr::Dsp,
+                    )];
+                }
+                vec![]
+            }
+            DspStep::WaitProdInfo0 => {
+                if let Message::ProdInfoResp(ref r) = env.message {
+                    self.prod_info.push(r.clone());
+                    self.step = DspStep::WaitProdInfo1;
+                    return vec![Action::Send(
+                        Command::ProdInfoReq(ProdInfoReq { sub_query: 0x08 }),
+                        BusAddr::Dsp,
+                    )];
+                }
+                vec![]
+            }
+            DspStep::WaitProdInfo1 => {
+                if let Message::ProdInfoResp(ref r) = env.message {
+                    self.prod_info.push(r.clone());
+                    self.step = DspStep::WaitProdInfo2;
+                    return vec![Action::Send(
+                        Command::ProdInfoReq(ProdInfoReq { sub_query: 0x09 }),
+                        BusAddr::Dsp,
+                    )];
+                }
+                vec![]
+            }
+            DspStep::WaitProdInfo2 => {
+                if let Message::ProdInfoResp(ref r) = env.message {
+                    self.prod_info.push(r.clone());
+                    self.step = DspStep::WaitConfig;
+                    return vec![Action::Send(Command::ConfigQuery, BusAddr::Dsp)];
+                }
+                vec![]
+            }
+            DspStep::WaitConfig => {
+                if let Message::ConfigResp(ref r) = env.message {
+                    self.config = Some(r.clone());
+                    self.step = DspStep::Done;
+                }
+                vec![]
+            }
+            DspStep::Done => vec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.step, DspStep::Done)
+    }
+}
+
+// ===========================================================================
+// Phase 2 — AvrSequencer
+// ===========================================================================
+
+/// Results from Phase 2 — AVR sync.
+#[derive(Debug, Clone)]
+pub struct AvrSync {
+    pub status: AvrStatus,
+    pub dev_info: DevInfoResp,
+    pub config: ConfigResp,
+    pub factory_cal: Option<CalDataResp>,
+    pub if_cal: Option<CalParamResp>,
+    pub avr_config: AvrConfigResp,
+}
+
+#[derive(Debug)]
+enum AvrStep {
+    WaitStatus1,
+    WaitStatus2,
+    WaitDevInfo1,
+    WaitDevInfo2,
+    WaitParam0C,
+    WaitParam0D,
+    WaitConfig,
+    WaitFactoryCal,
+    WaitIfCal,
+    WaitAvrConfig,
+    WaitParam64,
+    WaitTimeSync,
+    Done,
+}
+
+/// Pollable state machine for AVR sync (Phase 2).
+pub struct AvrSequencer {
+    step: AvrStep,
+    status: Option<AvrStatus>,
+    dev_info: Option<DevInfoResp>,
+    config: Option<ConfigResp>,
+    factory_cal: Option<CalDataResp>,
+    if_cal: Option<CalParamResp>,
+    avr_config: Option<AvrConfigResp>,
+    /// Timeout tracking for optional cal responses.
+    cal_deadline: Option<Instant>,
+}
+
+impl AvrSequencer {
+    #[must_use]
+    pub fn new() -> (Self, Vec<Action>) {
+        let seq = Self {
+            step: AvrStep::WaitStatus1,
+            status: None,
+            dev_info: None,
+            config: None,
+            factory_cal: None,
+            if_cal: None,
+            avr_config: None,
+            cal_deadline: None,
+        };
+        let actions = vec![Action::Send(
+            Command::StatusPoll(StatusPoll { pi_mode: false }),
+            BusAddr::Avr,
+        )];
+        (seq, actions)
+    }
+
+    /// Extract the result. Only valid after `is_complete()`.
+    #[must_use]
+    pub fn into_result(self) -> AvrSync {
+        AvrSync {
+            status: self.status.unwrap(),
+            dev_info: self.dev_info.unwrap(),
+            config: self.config.unwrap(),
+            factory_cal: self.factory_cal,
+            if_cal: self.if_cal,
+            avr_config: self.avr_config.unwrap(),
+        }
+    }
+
+    /// Check if a calibration step has timed out (optional responses).
+    /// Call this periodically in the event loop.
+    pub fn check_cal_timeout(&mut self) -> Vec<Action> {
+        if let Some(deadline) = self.cal_deadline {
+            if Instant::now() >= deadline {
+                self.cal_deadline = None;
+                return self.advance_past_cal();
+            }
+        }
+        vec![]
+    }
+
+    /// Skip past the current optional cal step.
+    fn advance_past_cal(&mut self) -> Vec<Action> {
+        match self.step {
+            AvrStep::WaitFactoryCal => {
+                self.step = AvrStep::WaitIfCal;
+                self.cal_deadline = Some(Instant::now() + TIMEOUT);
+                vec![Action::Send(
+                    Command::CalParamReq(CalParamReq),
+                    BusAddr::Avr,
+                )]
+            }
+            AvrStep::WaitIfCal => {
+                self.step = AvrStep::WaitAvrConfig;
+                self.cal_deadline = None;
+                vec![Action::Send(Command::AvrConfigQuery, BusAddr::Avr)]
+            }
+            _ => vec![],
+        }
+    }
+}
+
+impl Sequence for AvrSequencer {
+    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+        // Cal steps use a different skip filter (allow ConfigAck through
+        // so we can skip it, but don't reject it as unexpected).
+        match self.step {
+            AvrStep::WaitFactoryCal | AvrStep::WaitIfCal => {
+                if should_skip_for_cal(env, BusAddr::Avr) {
+                    return vec![];
+                }
+            }
+            _ => {
+                if should_skip_with_mode_ack(env, BusAddr::Avr) {
+                    return vec![];
+                }
+            }
+        }
+
+        match self.step {
+            AvrStep::WaitStatus1 => {
+                if let Message::AvrStatus(ref s) = env.message {
+                    self.status = Some(s.clone());
+                    self.step = AvrStep::WaitStatus2;
+                    return vec![Action::Send(
+                        Command::StatusPoll(StatusPoll { pi_mode: false }),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            AvrStep::WaitStatus2 => {
+                if let Message::AvrStatus(ref s) = env.message {
+                    self.status = Some(s.clone());
+                    self.step = AvrStep::WaitDevInfo1;
+                    return vec![Action::Send(Command::DevInfoReq, BusAddr::Avr)];
+                }
+                vec![]
+            }
+            AvrStep::WaitDevInfo1 => {
+                if let Message::DevInfoResp(ref r) = env.message {
+                    self.dev_info = Some(r.clone());
+                    self.step = AvrStep::WaitDevInfo2;
+                    return vec![Action::Send(Command::DevInfoReq, BusAddr::Avr)];
+                }
+                vec![]
+            }
+            AvrStep::WaitDevInfo2 => {
+                if let Message::DevInfoResp(ref r) = env.message {
+                    self.dev_info = Some(r.clone());
+                    self.step = AvrStep::WaitParam0C;
+                    return vec![Action::Send(
+                        Command::ParamReadReq(ParamReadReq { param_id: 0x0C }),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            AvrStep::WaitParam0C => {
+                if let Message::ParamValue(_) = env.message {
+                    self.step = AvrStep::WaitParam0D;
+                    return vec![Action::Send(
+                        Command::ParamReadReq(ParamReadReq { param_id: 0x0D }),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            AvrStep::WaitParam0D => {
+                if let Message::ParamValue(_) = env.message {
+                    self.step = AvrStep::WaitConfig;
+                    return vec![Action::Send(Command::ConfigQuery, BusAddr::Avr)];
+                }
+                vec![]
+            }
+            AvrStep::WaitConfig => {
+                if let Message::ConfigResp(ref r) = env.message {
+                    self.config = Some(r.clone());
+                    self.step = AvrStep::WaitFactoryCal;
+                    self.cal_deadline = Some(Instant::now() + TIMEOUT);
+                    return vec![Action::Send(
+                        Command::CalDataReq(CalDataReq {
+                            sub_cmd: 0x03,
+                            payload: CalDataReq::encode_factory(),
+                        }),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            AvrStep::WaitFactoryCal => {
+                if let Message::CalDataResp(ref r) = env.message {
+                    self.factory_cal = Some(r.clone());
+                    self.step = AvrStep::WaitIfCal;
+                    self.cal_deadline = Some(Instant::now() + TIMEOUT);
+                    return vec![Action::Send(
+                        Command::CalParamReq(CalParamReq),
+                        BusAddr::Avr,
+                    )];
+                }
+                // ConfigAck is expected here (skip it silently)
+                vec![]
+            }
+            AvrStep::WaitIfCal => {
+                if let Message::CalParamResp(ref r) = env.message {
+                    self.if_cal = Some(r.clone());
+                    self.step = AvrStep::WaitAvrConfig;
+                    self.cal_deadline = None;
+                    return vec![Action::Send(Command::AvrConfigQuery, BusAddr::Avr)];
+                }
+                // ConfigAck is expected here (skip it silently)
+                vec![]
+            }
+            AvrStep::WaitAvrConfig => {
+                if let Message::AvrConfigResp(ref r) = env.message {
+                    self.avr_config = Some(r.clone());
+                    self.step = AvrStep::WaitParam64;
+                    return vec![Action::Send(
+                        Command::ParamReadReq(ParamReadReq { param_id: 0x64 }),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            AvrStep::WaitParam64 => {
+                if let Message::ParamValue(_) = env.message {
+                    let epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as u32;
+                    self.step = AvrStep::WaitTimeSync;
+                    return vec![Action::Send(
+                        Command::TimeSync(TimeSync {
+                            epoch,
+                            session: 0x00,
+                            tail: [0x00, 0x01],
+                        }),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            AvrStep::WaitTimeSync => {
+                if let Message::TimeSync(_) = env.message {
+                    self.step = AvrStep::Done;
+                }
+                vec![]
+            }
+            AvrStep::Done => vec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.step, AvrStep::Done)
+    }
+}
+
+// ===========================================================================
+// Phase 3 — PiSequencer
+// ===========================================================================
+
+/// Results from Phase 3 — PI sync.
+#[derive(Debug, Clone)]
+pub struct PiSync {
+    pub dev_info: DevInfoResp,
+    pub cam_config: CamConfig,
+    pub ssid: String,
+    pub password: String,
+}
+
+#[derive(Debug)]
+enum PiStep {
+    WaitStatus,
+    WaitDevInfo,
+    WaitParam0A,
+    WaitCamConfig1,
+    WaitCamConfig2,
+    WaitNetConfig,
+    WaitNetConfigPw,
+    /// Waiting for batch of ParamReadReq responses.
+    WaitParams { ids: Vec<u8>, idx: usize },
+    Done,
+}
+
+/// Pollable state machine for PI sync (Phase 3).
+pub struct PiSequencer {
+    step: PiStep,
+    dev_info: Option<DevInfoResp>,
+    cam_config: Option<CamConfig>,
+    ssid: String,
+    password: String,
+}
+
+impl PiSequencer {
+    #[must_use]
+    pub fn new() -> (Self, Vec<Action>) {
+        let seq = Self {
+            step: PiStep::WaitStatus,
+            dev_info: None,
+            cam_config: None,
+            ssid: String::new(),
+            password: String::new(),
+        };
+        let actions = vec![Action::Send(
+            Command::StatusPoll(StatusPoll { pi_mode: true }),
+            BusAddr::Pi,
+        )];
+        (seq, actions)
+    }
+
+    #[must_use]
+    pub fn into_result(self) -> PiSync {
+        PiSync {
+            dev_info: self.dev_info.unwrap(),
+            cam_config: self.cam_config.unwrap(),
+            ssid: self.ssid,
+            password: self.password,
+        }
+    }
+}
+
+impl Sequence for PiSequencer {
+    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+        if should_skip_with_mode_ack(env, BusAddr::Pi) {
+            return vec![];
+        }
+        match self.step {
+            PiStep::WaitStatus => {
+                if let Message::PiStatus(_) = env.message {
+                    self.step = PiStep::WaitDevInfo;
+                    return vec![Action::Send(Command::DevInfoReq, BusAddr::Pi)];
+                }
+                vec![]
+            }
+            PiStep::WaitDevInfo => {
+                if let Message::DevInfoResp(ref r) = env.message {
+                    self.dev_info = Some(r.clone());
+                    self.step = PiStep::WaitParam0A;
+                    return vec![Action::Send(
+                        Command::ParamReadReq(ParamReadReq { param_id: 0x0A }),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            PiStep::WaitParam0A => {
+                if let Message::ParamValue(_) = env.message {
+                    self.step = PiStep::WaitCamConfig1;
+                    return vec![Action::Send(
+                        Command::CamConfigReq(CamConfigReq),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            PiStep::WaitCamConfig1 => {
+                if let Message::CamConfig(_) = env.message {
+                    self.step = PiStep::WaitCamConfig2;
+                    return vec![Action::Send(
+                        Command::CamConfigReq(CamConfigReq),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            PiStep::WaitCamConfig2 => {
+                if let Message::CamConfig(ref c) = env.message {
+                    self.cam_config = Some(c.clone());
+                    self.step = PiStep::WaitNetConfig;
+                    return vec![Action::Send(
+                        Command::NetConfigReq(NetConfigReq {
+                            query_password: false,
+                        }),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            PiStep::WaitNetConfig => {
+                if let Message::NetConfigResp(_) = env.message {
+                    self.step = PiStep::WaitNetConfigPw;
+                    return vec![Action::Send(
+                        Command::NetConfigReq(NetConfigReq {
+                            query_password: true,
+                        }),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            PiStep::WaitNetConfigPw => {
+                if let Message::NetConfigResp(ref r) = env.message {
+                    let mut parts = r.text.splitn(2, '\0');
+                    self.ssid = parts.next().unwrap_or("").to_string();
+                    self.password = parts.next().unwrap_or("").to_string();
+                    // Start the param read batches
+                    let ids = vec![
+                        0x01, 0x07, 0x08, 0x09, 0x06, 0x0B, 0x03, 0x04, 0x05,
+                    ];
+                    self.step = PiStep::WaitParams { ids, idx: 0 };
+                    return vec![Action::Send(
+                        Command::ParamReadReq(ParamReadReq { param_id: 0x01 }),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            PiStep::WaitParams {
+                ref ids,
+                ref mut idx,
+            } => {
+                if let Message::ParamValue(_) = env.message {
+                    *idx += 1;
+                    if *idx >= ids.len() {
+                        self.step = PiStep::Done;
+                        return vec![];
+                    }
+                    let next_id = ids[*idx];
+                    return vec![Action::Send(
+                        Command::ParamReadReq(ParamReadReq {
+                            param_id: next_id,
+                        }),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            PiStep::Done => vec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.step, PiStep::Done)
+    }
+}
+
+// ===========================================================================
+// Phase 4 — AvrConfigSequencer
+// ===========================================================================
+
+/// Settings for Phase 4 — AVR configuration.
+#[derive(Debug, Clone)]
+pub struct AvrSettings {
+    /// Detection mode commsIndex (see `config::MODE_*` constants).
+    pub mode: u8,
+    /// BF parameter writes (ball type, tee height, track%, etc.).
+    pub params: Vec<ParamValue>,
+    /// Radar calibration values.
+    pub radar_cal: RadarCal,
+}
+
+#[derive(Debug)]
+enum AvrConfigStep {
+    /// Send next param, wait for ConfigAck.
+    WaitParamAck { param_idx: usize },
+    /// Wait for B0 commit ConfigAck after param write.
+    WaitParamCommitAck { param_idx: usize },
+    /// Wait for ModeSet echo.
+    WaitModeEcho,
+    /// Wait for B0 commit after ModeSet.
+    WaitModeCommitAck,
+    /// Wait for RadarCal echo.
+    WaitRadarCalEcho,
+    /// Wait for B0 commit after RadarCal.
+    WaitRadarCalCommitAck,
+    Done,
+}
+
+/// Pollable state machine for AVR configuration (Phase 4).
+pub struct AvrConfigSequencer {
+    step: AvrConfigStep,
+    settings: AvrSettings,
+}
+
+impl AvrConfigSequencer {
+    #[must_use]
+    pub fn new(settings: AvrSettings) -> (Self, Vec<Action>) {
+        let first_action = if settings.params.is_empty() {
+            // No params — jump straight to ModeSet.
+            Action::Send(
+                Command::ModeSet(ModeSet {
+                    mode: settings.mode,
+                }),
+                BusAddr::Avr,
+            )
+        } else {
+            Action::Send(
+                Command::ParamValue(settings.params[0].clone()),
+                BusAddr::Avr,
+            )
+        };
+        let first_step = if settings.params.is_empty() {
+            AvrConfigStep::WaitModeEcho
+        } else {
+            AvrConfigStep::WaitParamAck { param_idx: 0 }
+        };
+        let seq = Self {
+            step: first_step,
+            settings,
+        };
+        (seq, vec![first_action])
+    }
+}
+
+impl Sequence for AvrConfigSequencer {
+    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+        if should_skip_with_mode_ack(env, BusAddr::Avr) {
+            return vec![];
+        }
+        let b0_commit = Command::AvrConfigCmd(AvrConfigCmd { arm: false });
+
+        match self.step {
+            AvrConfigStep::WaitParamAck { param_idx } => {
+                if let Message::ConfigAck(_) = env.message {
+                    self.step = AvrConfigStep::WaitParamCommitAck { param_idx };
+                    return vec![Action::Send(b0_commit, BusAddr::Avr)];
+                }
+                vec![]
+            }
+            AvrConfigStep::WaitParamCommitAck { param_idx } => {
+                if let Message::ConfigAck(_) = env.message {
+                    let next_idx = param_idx + 1;
+                    if next_idx < self.settings.params.len() {
+                        self.step = AvrConfigStep::WaitParamAck {
+                            param_idx: next_idx,
+                        };
+                        return vec![Action::Send(
+                            Command::ParamValue(self.settings.params[next_idx].clone()),
+                            BusAddr::Avr,
+                        )];
+                    }
+                    // All params done — ModeSet
+                    self.step = AvrConfigStep::WaitModeEcho;
+                    return vec![Action::Send(
+                        Command::ModeSet(ModeSet {
+                            mode: self.settings.mode,
+                        }),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            AvrConfigStep::WaitModeEcho => {
+                if let Message::ModeSet(_) = env.message {
+                    self.step = AvrConfigStep::WaitModeCommitAck;
+                    return vec![Action::Send(b0_commit, BusAddr::Avr)];
+                }
+                vec![]
+            }
+            AvrConfigStep::WaitModeCommitAck => {
+                if let Message::ConfigAck(_) = env.message {
+                    self.step = AvrConfigStep::WaitRadarCalEcho;
+                    return vec![Action::Send(
+                        Command::RadarCal(self.settings.radar_cal.clone()),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            AvrConfigStep::WaitRadarCalEcho => {
+                if let Message::RadarCal(_) = env.message {
+                    self.step = AvrConfigStep::WaitRadarCalCommitAck;
+                    return vec![Action::Send(b0_commit, BusAddr::Avr)];
+                }
+                vec![]
+            }
+            AvrConfigStep::WaitRadarCalCommitAck => {
+                if let Message::ConfigAck(_) = env.message {
+                    self.step = AvrConfigStep::Done;
+                }
+                vec![]
+            }
+            AvrConfigStep::Done => vec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.step, AvrConfigStep::Done)
+    }
+}
+
+// ===========================================================================
+// Phase 5 — CameraConfigSequencer
+// ===========================================================================
+
+#[derive(Debug)]
+enum CamConfigStep {
+    WaitConfigAck,
+    WaitReadback,
+    WaitCamStateAck,
+    WaitParamAck,
+    Done,
+}
+
+/// Pollable state machine for camera configuration (Phase 5).
+pub struct CameraConfigSequencer {
+    step: CamConfigStep,
+}
+
+impl CameraConfigSequencer {
+    #[must_use]
+    pub fn new(config: &CamConfig) -> (Self, Vec<Action>) {
+        let seq = Self {
+            step: CamConfigStep::WaitConfigAck,
+        };
+        let actions = vec![Action::Send(
+            Command::CamConfig(config.clone()),
+            BusAddr::Pi,
+        )];
+        (seq, actions)
+    }
+}
+
+impl Sequence for CameraConfigSequencer {
+    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+        if should_skip_with_mode_ack(env, BusAddr::Pi) {
+            return vec![];
+        }
+        match self.step {
+            CamConfigStep::WaitConfigAck => {
+                if let Message::ConfigAck(_) = env.message {
+                    self.step = CamConfigStep::WaitReadback;
+                    return vec![Action::Send(
+                        Command::CamConfigReq(CamConfigReq),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            CamConfigStep::WaitReadback => {
+                if let Message::CamConfig(_) = env.message {
+                    self.step = CamConfigStep::WaitCamStateAck;
+                    return vec![Action::Send(
+                        Command::CamState(CamState { state: 0x01 }),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            CamConfigStep::WaitCamStateAck => {
+                if let Message::ConfigAck(_) = env.message {
+                    self.step = CamConfigStep::WaitParamAck;
+                    return vec![Action::Send(
+                        Command::ParamValue(ParamValue {
+                            param_id: 0x02,
+                            value: crate::protocol::config::ParamData::Int24(10),
+                        }),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            CamConfigStep::WaitParamAck => {
+                if let Message::ConfigAck(_) = env.message {
+                    self.step = CamConfigStep::Done;
+                }
+                vec![]
+            }
+            CamConfigStep::Done => vec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.step, CamConfigStep::Done)
+    }
+}
+
+// ===========================================================================
+// Phase 6 — ArmSequencer
+// ===========================================================================
+
+#[derive(Debug)]
+enum ArmStep {
+    WaitDspStatus,
+    WaitArmAck,
+    WaitPiStatus,
+    WaitArmedText,
+    Done,
+}
+
+/// Pollable state machine for the ARM phase (Phase 6).
+pub struct ArmSequencer {
+    step: ArmStep,
+}
+
+impl ArmSequencer {
+    #[must_use]
+    pub fn new() -> (Self, Vec<Action>) {
+        let seq = Self {
+            step: ArmStep::WaitDspStatus,
+        };
+        let actions = vec![Action::Send(
+            Command::StatusPoll(StatusPoll { pi_mode: false }),
+            BusAddr::Dsp,
+        )];
+        (seq, actions)
+    }
+}
+
+impl Sequence for ArmSequencer {
+    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+        match self.step {
+            ArmStep::WaitDspStatus => {
+                // Accept DspStatus from DSP (skip noise from other buses)
+                if env.src != BusAddr::Dsp {
+                    return vec![];
+                }
+                if matches!(
+                    &env.message,
+                    Message::Text(_)
+                        | Message::DspDebug(_)
+                        | Message::CamState(_)
+                        | Message::ConfigNack(_)
+                        | Message::ModeAck(_)
+                        | Message::Unknown { .. }
+                ) {
+                    return vec![];
+                }
+                if let Message::DspStatus(_) = env.message {
+                    self.step = ArmStep::WaitArmAck;
+                    return vec![Action::Send(
+                        Command::AvrConfigCmd(AvrConfigCmd { arm: true }),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            ArmStep::WaitArmAck => {
+                if should_skip_with_mode_ack(env, BusAddr::Avr) {
+                    return vec![];
+                }
+                if let Message::ConfigAck(_) = env.message {
+                    self.step = ArmStep::WaitPiStatus;
+                    return vec![Action::Send(
+                        Command::StatusPoll(StatusPoll { pi_mode: true }),
+                        BusAddr::Pi,
+                    )];
+                }
+                vec![]
+            }
+            ArmStep::WaitPiStatus => {
+                if should_skip_with_mode_ack(env, BusAddr::Pi) {
+                    return vec![];
+                }
+                if let Message::PiStatus(_) = env.message {
+                    self.step = ArmStep::WaitArmedText;
+                }
+                vec![]
+            }
+            ArmStep::WaitArmedText => {
+                // Accept ARMED text from any bus (E3 Text)
+                if let Message::Text(ref text) = env.message
+                    && text.text.contains("ARMED")
+                    && !text.text.contains("CANCELLED")
+                {
+                    self.step = ArmStep::Done;
+                }
+                vec![]
+            }
+            ArmStep::Done => vec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.step, ArmStep::Done)
+    }
+}
+
+// ===========================================================================
+// ShotSequencer
+// ===========================================================================
+
+/// Shot data collected during the post-shot drain phase.
+///
+/// After the device signals "PROCESSED", shot result messages arrive before
+/// "IDLE". This struct captures those messages.
+#[derive(Debug, Clone, Default)]
+pub struct ShotData {
+    /// Primary ball flight result (0xD4).
+    pub flight: Option<FlightResult>,
+    /// Club head measurements (0xED).
+    pub club: Option<ClubResult>,
+    /// Spin measurement data (0xEF).
+    pub spin: Option<SpinResult>,
+    /// Club speed profile (0xD9).
+    pub speed_profile: Option<SpeedProfile>,
+    /// Ball radar tracking points (0xEC), one per page.
+    pub prc: Vec<PrcData>,
+    /// Club radar tracking points (0xEE), one per page.
+    pub club_prc: Vec<ClubPrc>,
+}
+
+#[derive(Debug)]
+enum ShotStep {
+    /// Draining shot data until IDLE.
+    Draining,
+    /// Waiting for ModeAck + ConfigResp after ConfigQuery.
+    WaitingForConfigAckResp { got_mode_ack: bool, got_config_resp: bool },
+    /// Waiting for ClubResult after ShotResultReq.
+    WaitingForClubResult,
+    /// Waiting for ConfigAck after B0 ARM.
+    WaitingForArmAck,
+    /// Waiting for "ARMED" text.
+    WaitingForArmed,
+    Done,
+}
+
+/// Pollable state machine for post-shot handling.
+///
+/// Created after receiving E5 "PROCESSED". Drives: ack → drain to IDLE →
+/// ConfigQuery → ShotResultReq → ARM → wait ARMED.
+pub struct ShotSequencer {
+    step: ShotStep,
+    data: ShotData,
+}
+
+impl ShotSequencer {
+    /// Create a new shot sequencer. Returns initial actions (ShotDataAck ×2).
+    #[must_use]
+    pub fn new() -> (Self, Vec<Action>) {
+        let seq = Self {
+            step: ShotStep::Draining,
+            data: ShotData::default(),
+        };
+        let actions = vec![
+            Action::Send(Command::ShotDataAck, BusAddr::Avr),
+            Action::Send(Command::ShotDataAck, BusAddr::Avr),
+        ];
+        (seq, actions)
+    }
+
+    /// Extract the accumulated shot data. Only valid after `is_complete()`.
+    #[must_use]
+    pub fn into_result(self) -> ShotData {
+        self.data
+    }
+
+    /// Borrow the shot data accumulated so far (e.g. to read flight/club
+    /// results during draining, before the sequence is complete).
+    pub fn data(&self) -> &ShotData {
+        &self.data
+    }
+}
+
+impl Sequence for ShotSequencer {
+    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+        match self.step {
+            ShotStep::Draining => {
+                match &env.message {
+                    Message::ShotText(st) if st.is_idle() => {
+                        self.step = ShotStep::WaitingForConfigAckResp {
+                            got_mode_ack: false,
+                            got_config_resp: false,
+                        };
+                        return vec![Action::Send(Command::ConfigQuery, BusAddr::Avr)];
+                    }
+                    Message::FlightResult(r) => self.data.flight = Some(r.clone()),
+                    Message::ClubResult(r) => self.data.club = Some(r.clone()),
+                    Message::SpinResult(r) => self.data.spin = Some(r.clone()),
+                    Message::SpeedProfile(r) => self.data.speed_profile = Some(r.clone()),
+                    Message::PrcData(r) => self.data.prc.push(r.clone()),
+                    Message::ClubPrc(r) => self.data.club_prc.push(r.clone()),
+                    _ => {}
+                }
+                vec![]
+            }
+            ShotStep::WaitingForConfigAckResp {
+                ref mut got_mode_ack,
+                ref mut got_config_resp,
+            } => {
+                match &env.message {
+                    Message::ModeAck(_) => *got_mode_ack = true,
+                    Message::ConfigResp(_) => *got_config_resp = true,
+                    _ => {}
+                }
+                if *got_mode_ack && *got_config_resp {
+                    self.step = ShotStep::WaitingForClubResult;
+                    return vec![Action::Send(Command::ShotResultReq, BusAddr::Avr)];
+                }
+                vec![]
+            }
+            ShotStep::WaitingForClubResult => {
+                if let Message::ClubResult(_) = env.message {
+                    self.step = ShotStep::WaitingForArmAck;
+                    return vec![Action::Send(
+                        Command::AvrConfigCmd(AvrConfigCmd { arm: true }),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            ShotStep::WaitingForArmAck => {
+                if should_skip_with_mode_ack(env, BusAddr::Avr) {
+                    return vec![];
+                }
+                if let Message::ConfigAck(_) = env.message {
+                    self.step = ShotStep::WaitingForArmed;
+                }
+                vec![]
+            }
+            ShotStep::WaitingForArmed => {
+                if let Message::Text(ref text) = env.message
+                    && text.text.contains("ARMED")
+                    && !text.text.contains("CANCELLED")
+                {
+                    self.step = ShotStep::Done;
+                }
+                vec![]
+            }
+            ShotStep::Done => vec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.step, ShotStep::Done)
+    }
+}
+
+// ===========================================================================
+// Blocking convenience wrappers (preserve pre-v0.1 API)
+// ===========================================================================
+
+/// Receive the next message, silently skipping 0xE3 Text debug logs.
+///
+/// Uses deadline tracking so Text messages don't extend the timeout.
+pub fn recv_msg(conn: &mut Connection, timeout: Duration) -> Result<Envelope, ConnError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ConnError::Timeout);
+        }
+        let env = conn.recv_timeout(remaining)?;
+        if matches!(env.message, Message::Text(_) | Message::DspDebug(_)) {
+            continue;
+        }
+        return Ok(env);
+    }
+}
+
+/// Send a command to `dest`, then receive the next non-Text response from that bus.
+pub fn send_recv(
+    conn: &mut Connection,
+    cmd: &Command,
+    dest: BusAddr,
+    timeout: Duration,
+) -> Result<Envelope, ConnError> {
+    conn.send(cmd, dest)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ConnError::Timeout);
+        }
+        let env = conn.recv_timeout(remaining)?;
+        if env.src != dest {
+            continue;
+        }
+        match &env.message {
+            Message::Text(_)
+            | Message::DspDebug(_)
+            | Message::CamState(_)
+            | Message::ModeAck(_)
+            | Message::ConfigNack(_)
+            | Message::Unknown { .. } => continue,
+            _ => {}
+        }
+        return Ok(env);
+    }
+}
+
+/// Destructure an Envelope's message or return ConnError::Protocol.
 macro_rules! expect {
     ($env:expr, $pat:path) => {
         match $env.message {
@@ -54,575 +1303,84 @@ macro_rules! expect {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Core helpers
-// ---------------------------------------------------------------------------
-
-/// Receive the next message, silently skipping 0xE3 Text debug logs.
-///
-/// Uses deadline tracking so Text messages don't extend the timeout.
-pub fn recv_msg(conn: &mut Connection, timeout: Duration) -> Result<Envelope, ConnError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ConnError::Timeout { timeout });
-        }
-        let env = conn.recv_timeout(remaining)?;
-        if matches!(env.message, Message::Text(_) | Message::DspDebug(_)) {
-            continue;
-        }
-        return Ok(env);
-    }
-}
-
-/// Send a command to `dest`, then receive the next non-Text response from that bus.
-///
-/// Messages from other bus sources (e.g. late PI responses during AVR config)
-/// are silently consumed so they don't cause protocol mismatches.
-pub fn send_recv(
-    conn: &mut Connection,
-    cmd: &Command,
-    dest: BusAddr,
-    timeout: Duration,
-) -> Result<Envelope, ConnError> {
-    conn.send(cmd, dest)?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ConnError::Timeout { timeout });
-        }
-        let env = conn.recv_timeout(remaining)?;
-        // Skip wrong-bus messages.
-        if env.src != dest {
-            continue;
-        }
-        // Skip: Text/DspDebug logs, unsolicited CamState/ModeAck/ConfigNack, Unknown.
-        match &env.message {
-            Message::Text(_)
-            | Message::DspDebug(_)
-            | Message::CamState(_)
-            | Message::ModeAck(_)
-            | Message::ConfigNack(_)
-            | Message::Unknown { .. } => continue,
-            _ => {}
-        }
-        return Ok(env);
-    }
-}
-
-/// Receive the next message matching `extract`, skipping Text, ConfigAck,
-/// Unknown, and messages from unexpected buses.
-///
-/// Some commands (e.g. CalDataReq, CalParamReq) may produce an intermediate
-/// ConfigAck before the actual response. This helper consumes those silently.
-fn recv_skip_ack<T>(
-    conn: &mut Connection,
-    from: BusAddr,
-    timeout: Duration,
-    extract: impl Fn(Message) -> Option<T>,
-) -> Result<T, ConnError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ConnError::Timeout { timeout });
-        }
-        let env = conn.recv_timeout(remaining)?;
-        if matches!(
-            env.message,
-            Message::Text(_) | Message::DspDebug(_) | Message::ConfigAck(_) | Message::ConfigNack(_) | Message::Unknown { .. }
-        ) || env.src != from
-        {
-            continue;
-        }
-        return extract(env.message)
-            .ok_or_else(|| ConnError::Protocol("unexpected message".into()));
-    }
-}
-
-/// Receive messages until `pred` returns true, skipping everything else.
-/// Returns `Ok(())` on match, `Err(Timeout)` if deadline expires.
-fn drain_until(
-    conn: &mut Connection,
-    timeout: Duration,
-    pred: impl Fn(&Message) -> bool,
-) -> Result<(), ConnError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ConnError::Timeout { timeout });
-        }
-        match conn.recv_timeout(remaining) {
-            Ok(env) if pred(&env.message) => return Ok(()),
-            Ok(_) => continue,
-            Err(ConnError::Timeout { .. }) => return Err(ConnError::Timeout { timeout }),
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Phase 1 — DSP Sync (SEQUENCE.md §2.1)
-// ---------------------------------------------------------------------------
-
-/// Results from Phase 1 — DSP sync.
-#[derive(Debug, Clone)]
-pub struct DspSync {
-    pub status: DspStatus,
-    pub hw_info: DspQueryResp,
-    pub dev_info: DevInfoResp,
-    pub prod_info: [ProdInfoResp; 3],
-    pub config: ConfigResp,
-}
-
-/// Phase 1: Query DSP for status, hardware info, device info, product info,
-/// and radar configuration.
+/// Phase 1: Query DSP (blocking wrapper).
 pub fn sync_dsp(conn: &mut Connection) -> Result<DspSync, ConnError> {
-    let t = TIMEOUT;
-
-    // StatusPoll → DSP
-    let env = send_recv(
-        conn,
-        &Command::StatusPoll(StatusPoll { pi_mode: false }),
-        BusAddr::Dsp,
-        t,
-    )?;
-    let status = expect!(env, Message::DspStatus)?;
-
-    // DspQuery → DSP
-    let env = send_recv(conn, &Command::DspQuery, BusAddr::Dsp, t)?;
-    let hw_info = expect!(env, Message::DspQueryResp)?;
-
-    // DevInfoReq → DSP
-    let env = send_recv(conn, &Command::DevInfoReq, BusAddr::Dsp, t)?;
-    let dev_info = expect!(env, Message::DevInfoResp)?;
-
-    // ProdInfoReq ×3 (sub-queries 0x00, 0x08, 0x09)
-    let mut prod_info_vec = Vec::with_capacity(3);
-    for sub in [0x00, 0x08, 0x09] {
-        let env = send_recv(
-            conn,
-            &Command::ProdInfoReq(ProdInfoReq { sub_query: sub }),
-            BusAddr::Dsp,
-            t,
-        )?;
-        prod_info_vec.push(expect!(env, Message::ProdInfoResp)?);
-    }
-
-    // ConfigQuery → DSP
-    let env = send_recv(conn, &Command::ConfigQuery, BusAddr::Dsp, t)?;
-    let config = expect!(env, Message::ConfigResp)?;
-
-    Ok(DspSync {
-        status,
-        hw_info,
-        dev_info,
-        prod_info: [
-            prod_info_vec.remove(0),
-            prod_info_vec.remove(0),
-            prod_info_vec.remove(0),
-        ],
-        config,
-    })
+    conn.stream_mut()
+        .set_read_timeout(Some(Duration::from_millis(100)))?;
+    let (mut seq, actions) = DspSequencer::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    drive(conn, &mut seq, actions, deadline)?;
+    Ok(seq.into_result())
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2 — AVR Sync (SEQUENCE.md §2.2)
-// ---------------------------------------------------------------------------
-
-/// Results from Phase 2 — AVR sync.
-#[derive(Debug, Clone)]
-pub struct AvrSync {
-    pub status: AvrStatus,
-    pub dev_info: DevInfoResp,
-    pub config: ConfigResp,
-    pub factory_cal: Option<CalDataResp>,
-    pub if_cal: Option<CalParamResp>,
-    pub avr_config: AvrConfigResp,
-}
-
-/// Phase 2: Query AVR for status, device info, parameters, radar config,
-/// factory calibration, IF calibration, AVR config, and time sync.
+/// Phase 2: Query AVR (blocking wrapper).
 pub fn sync_avr(conn: &mut Connection) -> Result<AvrSync, ConnError> {
-    let t = TIMEOUT;
+    conn.stream_mut()
+        .set_read_timeout(Some(Duration::from_millis(100)))?;
+    let (mut seq, actions) = AvrSequencer::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
 
-    // StatusPoll ×2 → AVR (keep last)
-    let mut status = None;
-    for _ in 0..2 {
-        let env = send_recv(
-            conn,
-            &Command::StatusPoll(StatusPoll { pi_mode: false }),
-            BusAddr::Avr,
-            t,
-        )?;
-        status = Some(expect!(env, Message::AvrStatus)?);
+    // AvrSequencer has optional cal steps that can timeout
+    for a in actions {
+        send_action(conn, a)?;
     }
-    let status = status.unwrap();
-
-    // DevInfoReq ×2 → AVR (keep last)
-    let mut dev_info = None;
-    for _ in 0..2 {
-        let env = send_recv(conn, &Command::DevInfoReq, BusAddr::Avr, t)?;
-        dev_info = Some(expect!(env, Message::DevInfoResp)?);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(ConnError::Timeout);
+        }
+        // Check cal timeouts
+        let timeout_actions = seq.check_cal_timeout();
+        for a in timeout_actions {
+            send_action(conn, a)?;
+        }
+        if let Some(env) = conn.recv()? {
+            let actions = seq.feed(&env);
+            for a in actions {
+                send_action(conn, a)?;
+            }
+            if seq.is_complete() {
+                return Ok(seq.into_result());
+            }
+        }
     }
-    let dev_info = dev_info.unwrap();
-
-    // ParamReadReq ×2 → AVR (HW/FW version, consume BF responses)
-    for param_id in [0x0C, 0x0D] {
-        let env = send_recv(
-            conn,
-            &Command::ParamReadReq(ParamReadReq { param_id }),
-            BusAddr::Avr,
-            t,
-        )?;
-        // Consume BF response
-        let _ = expect!(env, Message::ParamValue)?;
-    }
-
-    // ConfigQuery → AVR
-    let env = send_recv(conn, &Command::ConfigQuery, BusAddr::Avr, t)?;
-    let config = expect!(env, Message::ConfigResp)?;
-
-    // CalDataReq (factory, sub-cmd 0x03) → AVR
-    // Device may respond with ConfigAck before CalDataResp.
-    conn.send(
-        &Command::CalDataReq(CalDataReq {
-            sub_cmd: 0x03,
-            payload: CalDataReq::encode_factory(),
-        }),
-        BusAddr::Avr,
-    )?;
-    let factory_cal = match recv_skip_ack(conn, BusAddr::Avr, t, |m| match m {
-        Message::CalDataResp(inner) => Some(inner),
-        _ => None,
-    }) {
-        Ok(resp) => Some(resp),
-        Err(ConnError::Timeout { .. }) => None,
-        Err(e) => return Err(e),
-    };
-
-    // CalParamReq → AVR
-    // Device responds with Text + ConfigAck + CalParamResp (confirmed from pcap).
-    // May respond with ConfigNack(0x94) if device is in a stale state; CalParamResp
-    // is constant factory data and not used downstream, so treat as optional.
-    conn.send(&Command::CalParamReq(CalParamReq), BusAddr::Avr)?;
-    let if_cal = match recv_skip_ack(conn, BusAddr::Avr, t, |m| match m {
-        Message::CalParamResp(inner) => Some(inner),
-        _ => None,
-    }) {
-        Ok(resp) => Some(resp),
-        Err(ConnError::Timeout { .. }) => None,
-        Err(e) => return Err(e),
-    };
-
-    // AvrConfigQuery → AVR
-    let env = send_recv(conn, &Command::AvrConfigQuery, BusAddr::Avr, t)?;
-    let avr_config = expect!(env, Message::AvrConfigResp)?;
-
-    // Final ParamReadReq → AVR (consume response)
-    let env = send_recv(
-        conn,
-        &Command::ParamReadReq(ParamReadReq { param_id: 0x64 }),
-        BusAddr::Avr,
-        t,
-    )?;
-    let _ = expect!(env, Message::ParamValue)?;
-
-    // TimeSync → AVR
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32;
-    let env = send_recv(
-        conn,
-        &Command::TimeSync(TimeSync {
-            epoch,
-            session: 0x00,
-            tail: [0x00, 0x01],
-        }),
-        BusAddr::Avr,
-        t,
-    )?;
-    // Consume echo
-    let _ = expect!(env, Message::TimeSync)?;
-
-    Ok(AvrSync {
-        status,
-        dev_info,
-        config,
-        factory_cal,
-        if_cal,
-        avr_config,
-    })
 }
 
-// ---------------------------------------------------------------------------
-// Phase 3 — PI Sync (SEQUENCE.md §2.3)
-// ---------------------------------------------------------------------------
-
-/// Results from Phase 3 — PI sync.
-#[derive(Debug, Clone)]
-pub struct PiSync {
-    pub dev_info: DevInfoResp,
-    pub cam_config: CamConfig,
-    pub ssid: String,
-    pub password: String,
-}
-
-/// Phase 3: Query PI for status, device info, parameters, camera config,
-/// and network credentials.
-///
-/// Skips sensor activation (0x90) and WiFi scan (0x87) per §7.1.
+/// Phase 3: Query PI (blocking wrapper).
 pub fn sync_pi(conn: &mut Connection) -> Result<PiSync, ConnError> {
-    let t = TIMEOUT;
-
-    // StatusPoll(pi=true) → PI
-    let env = send_recv(
-        conn,
-        &Command::StatusPoll(StatusPoll { pi_mode: true }),
-        BusAddr::Pi,
-        t,
-    )?;
-    let _ = expect!(env, Message::PiStatus)?;
-
-    // DevInfoReq → PI
-    let env = send_recv(conn, &Command::DevInfoReq, BusAddr::Pi, t)?;
-    let dev_info = expect!(env, Message::DevInfoResp)?;
-
-    // ParamReadReq 0x0A → PI (first capability flag, sent before CamConfig)
-    let env = send_recv(
-        conn,
-        &Command::ParamReadReq(ParamReadReq { param_id: 0x0A }),
-        BusAddr::Pi,
-        t,
-    )?;
-    let _ = expect!(env, Message::ParamValue)?;
-
-    // CamConfigReq ×2 → PI (keep last)
-    let mut cam_config = None;
-    for _ in 0..2 {
-        let env = send_recv(
-            conn,
-            &Command::CamConfigReq(CamConfigReq),
-            BusAddr::Pi,
-            t,
-        )?;
-        cam_config = Some(expect!(env, Message::CamConfig)?);
-    }
-    let cam_config = cam_config.unwrap();
-
-    // NetConfigReq (SSID) → PI — response has IP/mask but empty text slots
-    let env = send_recv(
-        conn,
-        &Command::NetConfigReq(NetConfigReq {
-            query_password: false,
-        }),
-        BusAddr::Pi,
-        t,
-    )?;
-    let _ = expect!(env, Message::NetConfigResp)?;
-
-    // NetConfigReq (password) → PI — response has both SSID and password
-    let env = send_recv(
-        conn,
-        &Command::NetConfigReq(NetConfigReq {
-            query_password: true,
-        }),
-        BusAddr::Pi,
-        t,
-    )?;
-    let pw_resp = expect!(env, Message::NetConfigResp)?;
-    let mut parts = pw_resp.text.splitn(2, '\0');
-    let ssid = parts.next().unwrap_or("").to_string();
-    let password = parts.next().unwrap_or("").to_string();
-
-    // ParamReadReq → PI (capability flags, split into pcap-sized batches)
-    for param_id in [0x01, 0x07, 0x08, 0x09] {
-        let env = send_recv(
-            conn,
-            &Command::ParamReadReq(ParamReadReq { param_id }),
-            BusAddr::Pi,
-            t,
-        )?;
-        let _ = expect!(env, Message::ParamValue)?;
-    }
-    // Second batch (pcap has WiFi scan + sensor activation between these)
-    for param_id in [0x06, 0x0B, 0x03, 0x04, 0x05] {
-        let env = send_recv(
-            conn,
-            &Command::ParamReadReq(ParamReadReq { param_id }),
-            BusAddr::Pi,
-            t,
-        )?;
-        let _ = expect!(env, Message::ParamValue)?;
-    }
-
-    Ok(PiSync {
-        dev_info,
-        cam_config,
-        ssid,
-        password,
-    })
+    conn.stream_mut()
+        .set_read_timeout(Some(Duration::from_millis(100)))?;
+    let (mut seq, actions) = PiSequencer::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    drive(conn, &mut seq, actions, deadline)?;
+    Ok(seq.into_result())
 }
 
-// ---------------------------------------------------------------------------
-// Phase 4 — Post-Sync AVR Configuration (SEQUENCE.md §2.4)
-// ---------------------------------------------------------------------------
-
-/// Settings for Phase 4 — AVR configuration.
-#[derive(Debug, Clone)]
-pub struct AvrSettings {
-    /// Detection mode commsIndex (see `config::MODE_*` constants).
-    pub mode: u8,
-    /// BF parameter writes (ball type, tee height, track%, etc.).
-    pub params: Vec<ParamValue>,
-    /// Radar calibration values.
-    pub radar_cal: RadarCal,
-}
-
-/// Phase 4: Write AVR parameters, set detection mode, radar calibration, arm config.
-///
-/// Every command is followed by B0 `[01 00]` config commit → ConfigAck,
-/// matching the pattern observed in pcap and the working Python script.
+/// Phase 4: Write AVR parameters, set detection mode, radar calibration (blocking wrapper).
 pub fn configure_avr(conn: &mut Connection, settings: &AvrSettings) -> Result<(), ConnError> {
-    let t = TIMEOUT;
-    let b0_commit = Command::AvrConfigCmd(AvrConfigCmd { arm: false });
-
-    // BF param writes, each followed by B0 commit
-    for param in &settings.params {
-        let env = send_recv(
-            conn,
-            &Command::ParamValue(param.clone()),
-            BusAddr::Avr,
-            t,
-        )?;
-        let _ = expect!(env, Message::ConfigAck)?;
-        let env = send_recv(conn, &b0_commit, BusAddr::Avr, t)?;
-        let _ = expect!(env, Message::ConfigAck)?;
-    }
-
-    // A5 mode set → echo, then B0 commit
-    let env = send_recv(
-        conn,
-        &Command::ModeSet(ModeSet {
-            mode: settings.mode,
-        }),
-        BusAddr::Avr,
-        t,
-    )?;
-    let _ = expect!(env, Message::ModeSet)?;
-    let env = send_recv(conn, &b0_commit, BusAddr::Avr, t)?;
-    let _ = expect!(env, Message::ConfigAck)?;
-
-    // A4 radar cal → echo, then B0 commit
-    let env = send_recv(
-        conn,
-        &Command::RadarCal(settings.radar_cal.clone()),
-        BusAddr::Avr,
-        t,
-    )?;
-    let _ = expect!(env, Message::RadarCal)?;
-    let env = send_recv(conn, &b0_commit, BusAddr::Avr, t)?;
-    let _ = expect!(env, Message::ConfigAck)?;
-
-    Ok(())
+    conn.stream_mut()
+        .set_read_timeout(Some(Duration::from_millis(100)))?;
+    let (mut seq, actions) = AvrConfigSequencer::new(settings.clone());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    drive(conn, &mut seq, actions, deadline)
 }
 
-// ---------------------------------------------------------------------------
-// Phase 5 — Camera Configuration (SEQUENCE.md §2.5)
-// ---------------------------------------------------------------------------
-
-/// Phase 5: Push camera config, start camera, set PI keepalive param.
+/// Phase 5: Push camera config, start camera, set PI keepalive param (blocking wrapper).
 pub fn configure_camera(conn: &mut Connection, config: &CamConfig) -> Result<(), ConnError> {
-    let t = TIMEOUT;
-
-    // Push camera config → 0x95 ack
-    let env = send_recv(
-        conn,
-        &Command::CamConfig(config.clone()),
-        BusAddr::Pi,
-        t,
-    )?;
-    let _ = expect!(env, Message::ConfigAck)?;
-
-    // CamConfigReq → readback (consume)
-    let env = send_recv(
-        conn,
-        &Command::CamConfigReq(CamConfigReq),
-        BusAddr::Pi,
-        t,
-    )?;
-    let _ = expect!(env, Message::CamConfig)?;
-
-    // CamState start → PI responds with ConfigAck (+ CamState echo, skipped by send_recv).
-    let env = send_recv(
-        conn,
-        &Command::CamState(CamState { state: 0x01 }),
-        BusAddr::Pi,
-        t,
-    )?;
-    let _ = expect!(env, Message::ConfigAck)?;
-
-    // BF param write (0x02 = 10, PI keepalive interval) → 0x95 ack
-    let env = send_recv(
-        conn,
-        &Command::ParamValue(ParamValue {
-            param_id: 0x02,
-            value: crate::protocol::config::ParamData::Int24(10),
-        }),
-        BusAddr::Pi,
-        t,
-    )?;
-    let _ = expect!(env, Message::ConfigAck)?;
-
-    Ok(())
+    conn.stream_mut()
+        .set_read_timeout(Some(Duration::from_millis(100)))?;
+    let (mut seq, actions) = CameraConfigSequencer::new(config);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    drive(conn, &mut seq, actions, deadline)
 }
 
-// ---------------------------------------------------------------------------
-// Phase 6 — ARM (SEQUENCE.md §2.6)
-// ---------------------------------------------------------------------------
-
-/// Phase 6: Final status checks, arm the radar, wait for "ARMED" text.
+/// Phase 6: Final status checks, arm the radar, wait for "ARMED" (blocking wrapper).
 pub fn arm(conn: &mut Connection) -> Result<(), ConnError> {
-    let t = TIMEOUT;
-
-    // Final DSP status poll
-    let env = send_recv(
-        conn,
-        &Command::StatusPoll(StatusPoll { pi_mode: false }),
-        BusAddr::Dsp,
-        t,
-    )?;
-    let _ = expect!(env, Message::DspStatus)?;
-
-    // B0 [01 01] ARM → 0x95 ack
-    let env = send_recv(
-        conn,
-        &Command::AvrConfigCmd(AvrConfigCmd { arm: true }),
-        BusAddr::Avr,
-        t,
-    )?;
-    let _ = expect!(env, Message::ConfigAck)?;
-
-    // PI status poll
-    let env = send_recv(
-        conn,
-        &Command::StatusPoll(StatusPoll { pi_mode: true }),
-        BusAddr::Pi,
-        t,
-    )?;
-    let _ = expect!(env, Message::PiStatus)?;
-
-    // Wait for "ARMED" text
-    wait_for_armed(conn, TIMEOUT)
+    conn.stream_mut()
+        .set_read_timeout(Some(Duration::from_millis(100)))?;
+    let (mut seq, actions) = ArmSequencer::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    drive(conn, &mut seq, actions, deadline)
 }
-
-// ---------------------------------------------------------------------------
-// Operational helpers
-// ---------------------------------------------------------------------------
 
 /// Status from all three nodes, collected during a keepalive poll.
 #[derive(Debug, Clone)]
@@ -632,7 +1390,7 @@ pub struct KeepaliveStatus {
     pub pi: PiStatus,
 }
 
-/// Poll DSP → AVR → PI sequentially. Returns all three statuses.
+/// Poll DSP → AVR → PI sequentially (blocking wrapper).
 pub fn keepalive(conn: &mut Connection) -> Result<KeepaliveStatus, ConnError> {
     let t = TIMEOUT;
 
@@ -663,107 +1421,20 @@ pub fn keepalive(conn: &mut Connection) -> Result<KeepaliveStatus, ConnError> {
     Ok(KeepaliveStatus { dsp, avr, pi })
 }
 
-/// Handle the entire post-shot cycle: ack → drain → rearm → ARMED.
+/// Handle the entire post-shot cycle (blocking wrapper).
 ///
-/// Called after receiving E5 "PROCESSED". Drives the device through:
-///   1. ShotDataAck ×2 (best-effort, don't require E9 responses)
-///   2. Drain all remaining shot data until E5 "IDLE" arrives
-///   3. ConfigQuery → consume B1 + A0
-///   4. ShotResultReq → consume duplicate ED
-///   5. B0 ARM → wait for "ARMED"
-///
-/// All intermediate messages (PrcData, ClubPrc, TrackingStatus, etc.) are
-/// silently consumed. The `log` callback is invoked for notable events.
+/// Called after receiving E5 "PROCESSED". Drives: ack → drain to IDLE →
+/// ConfigQuery → ShotResultReq → ARM → wait ARMED.
 pub fn complete_shot(
     conn: &mut Connection,
     log: impl Fn(&str),
-) -> Result<(), ConnError> {
-    let t = TIMEOUT;
-
-    // 1. Send ShotDataAck ×2 (best-effort).
-    //    Don't block waiting for E9 — just fire and let the drain phase
-    //    consume whatever comes back.
-    for _ in 0..2 {
-        conn.send(&Command::ShotDataAck, BusAddr::Avr)?;
-    }
-
-    // 2. Drain until we see "IDLE".
-    //    Everything else (E9, PRC, ClubPrc, Text, etc.) is consumed.
+) -> Result<ShotData, ConnError> {
+    conn.stream_mut()
+        .set_read_timeout(Some(Duration::from_millis(100)))?;
     log("waiting for IDLE...");
-    loop {
-        // Use a generous per-message timeout — the device is processing.
-        let env = conn.recv_timeout(t)?;
-        if let Message::ShotText(ref st) = env.message {
-            if st.is_idle() {
-                log("IDLE");
-                break;
-            }
-        }
-    }
-
-    // 3. ConfigQuery → AVR: expect B1 ModeAck + A0 ConfigResp (either order).
-    conn.send(&Command::ConfigQuery, BusAddr::Avr)?;
-    {
-        let deadline = Instant::now() + t;
-        let mut got_mode_ack = false;
-        let mut got_config_resp = false;
-        while !got_mode_ack || !got_config_resp {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break; // Best-effort — proceed to arm.
-            }
-            match conn.recv_timeout(remaining) {
-                Ok(env) => match env.message {
-                    Message::ModeAck(_) => got_mode_ack = true,
-                    Message::ConfigResp(_) => got_config_resp = true,
-                    _ => continue,
-                },
-                Err(ConnError::Timeout { .. }) => break,
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    // 4. ShotResultReq → AVR: triggers duplicate ED (byte-identical).
-    conn.send(&Command::ShotResultReq, BusAddr::Avr)?;
-    let _ = drain_until(conn, t, |m| matches!(m, Message::ClubResult(_)));
-
-    // 5. ARM.
-    let env = send_recv(
-        conn,
-        &Command::AvrConfigCmd(AvrConfigCmd { arm: true }),
-        BusAddr::Avr,
-        t,
-    )?;
-    let _ = expect!(env, Message::ConfigAck)?;
-
-    wait_for_armed(conn, t)?;
+    let (mut seq, actions) = ShotSequencer::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    drive(conn, &mut seq, actions, deadline)?;
     log("RE-ARMED");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
-
-/// Wait for an E3 text message containing "ARMED" (but not "CANCELLED").
-///
-/// Consumes all messages until the condition is met or timeout expires.
-/// Text messages are not skipped here — we need to inspect them.
-fn wait_for_armed(conn: &mut Connection, timeout: Duration) -> Result<(), ConnError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ConnError::Timeout { timeout });
-        }
-        let env = conn.recv_timeout(remaining)?;
-        if let Message::Text(ref text) = env.message
-            && text.text.contains("ARMED")
-            && !text.text.contains("CANCELLED")
-        {
-            return Ok(());
-        }
-        // Consume other messages (E3 logs, status, etc.)
-    }
+    Ok(seq.into_result())
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ironsight"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -13,7 +13,9 @@ exclude = ["docs/"]
 
 [features]
 serde = ["dep:serde"]
+gvp = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }

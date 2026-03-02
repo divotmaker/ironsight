@@ -1,7 +1,8 @@
-//! TCP connection to a Mevo+ device on port 5100.
+//! Binary protocol connection to a Mevo+ device on port 5100.
 //!
-//! Handles TCP I/O, frame splitting, and message encode/decode.
-//! No application logic — callers drive timing and sequencing.
+//! Handles frame splitting, message encode/decode, and I/O over any
+//! `Read + Write` stream. No application logic — callers drive timing
+//! and sequencing.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -45,13 +46,13 @@ impl fmt::Debug for Envelope {
 /// Errors from connection operations.
 #[derive(Debug)]
 pub enum ConnError {
-    /// TCP I/O error.
+    /// I/O error from the underlying stream.
     Io(io::Error),
     /// Wire protocol decode error.
     Wire(WireError),
-    /// `recv_timeout` exceeded without a complete frame.
-    Timeout { timeout: Duration },
-    /// TCP stream closed by peer.
+    /// No complete frame available (stream returned `WouldBlock`/`TimedOut`).
+    Timeout,
+    /// Stream closed by peer (read returned 0 bytes).
     Disconnected,
     /// Protocol violation (unexpected message type during a sequence).
     Protocol(String),
@@ -62,9 +63,7 @@ impl std::fmt::Display for ConnError {
         match self {
             ConnError::Io(e) => write!(f, "I/O error: {e}"),
             ConnError::Wire(e) => write!(f, "wire error: {e}"),
-            ConnError::Timeout { timeout } => {
-                write!(f, "recv timed out after {timeout:?}")
-            }
+            ConnError::Timeout => write!(f, "recv timed out"),
             ConnError::Disconnected => write!(f, "connection closed by device"),
             ConnError::Protocol(msg) => write!(f, "protocol error: {msg}"),
         }
@@ -76,7 +75,7 @@ impl std::error::Error for ConnError {
         match self {
             ConnError::Io(e) => Some(e),
             ConnError::Wire(e) => Some(e),
-            ConnError::Timeout { .. } | ConnError::Disconnected | ConnError::Protocol(_) => None,
+            ConnError::Timeout | ConnError::Disconnected | ConnError::Protocol(_) => None,
         }
     }
 }
@@ -93,54 +92,48 @@ impl From<WireError> for ConnError {
     }
 }
 
-/// TCP connection to a Mevo+ device on port 5100.
+/// Binary protocol connection to a Mevo+ device.
 ///
-/// Synchronous, single-threaded. Callers drive timing via `recv_timeout()`.
+/// Generic over `S: Read + Write` so callers can use any stream type.
+/// For non-blocking usage, configure the stream's read timeout externally
+/// and call [`recv()`](Self::recv) — it returns `Ok(None)` on
+/// `WouldBlock`/`TimedOut` instead of blocking.
 ///
-/// # Example
+/// # Example (TcpStream)
 ///
 /// ```no_run
 /// use std::time::Duration;
-/// use ironsight::{Connection, ConnError};
+/// use ironsight::{BinaryConnection, ConnError};
 ///
-/// let mut conn = Connection::connect(ironsight::conn::DEFAULT_ADDR)?;
+/// let mut conn = BinaryConnection::connect(ironsight::conn::DEFAULT_ADDR)?;
+/// conn.stream_mut().set_read_timeout(Some(Duration::from_millis(100)))?;
 /// loop {
-///     match conn.recv_timeout(Duration::from_secs(1)) {
-///         Ok(env) => println!("{:?}", env.message),
-///         Err(ConnError::Timeout { .. }) => { /* send keepalive */ }
-///         Err(e) => return Err(e),
+///     match conn.recv()? {
+///         Some(env) => println!("{:?}", env.message),
+///         None => { /* send keepalive */ }
 ///     }
 /// }
 /// # Ok::<(), ConnError>(())
 /// ```
-pub struct Connection {
-    stream: TcpStream,
+pub struct BinaryConnection<S: Read + Write> {
+    stream: S,
     splitter: FrameSplitter,
     read_buf: [u8; 4096],
-    /// Frames split from TCP stream but not yet consumed by `recv()`.
+    /// Frames split from the stream but not yet consumed by `recv()`.
     pending: Vec<Vec<u8>>,
     /// Called at the top of `send()` with the command and destination.
+    #[allow(clippy::type_complexity)]
     on_send: Option<Box<dyn FnMut(&Command, BusAddr)>>,
-    /// Called after each successful frame decode in `recv_inner()`.
+    /// Called after each successful frame decode in `recv()`.
+    #[allow(clippy::type_complexity)]
     on_recv: Option<Box<dyn FnMut(&Envelope)>>,
 }
 
-impl Connection {
-    /// Connect to a Mevo+ device with the system default timeout.
-    pub fn connect(addr: impl ToSocketAddrs) -> Result<Self, ConnError> {
-        let stream = TcpStream::connect(addr)?;
-        Ok(Self::from_stream(stream))
-    }
+// -- Generic methods (any Read + Write stream) --------------------------------
 
-    /// Connect with an explicit timeout.
-    pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> Result<Self, ConnError> {
-        let stream = TcpStream::connect_timeout(addr, timeout)?;
-        Ok(Self::from_stream(stream))
-    }
-
-    fn from_stream(stream: TcpStream) -> Self {
-        // Small frames (5-250B) — disable Nagle to avoid latency.
-        let _ = stream.set_nodelay(true);
+impl<S: Read + Write> BinaryConnection<S> {
+    /// Wrap any `Read + Write` stream as a binary protocol connection.
+    pub fn new(stream: S) -> Self {
         Self {
             stream,
             splitter: FrameSplitter::new(),
@@ -149,6 +142,16 @@ impl Connection {
             on_send: None,
             on_recv: None,
         }
+    }
+
+    /// Borrow the underlying stream (e.g. to query peer address).
+    pub fn stream(&self) -> &S {
+        &self.stream
+    }
+
+    /// Mutably borrow the underlying stream (e.g. to set read timeout).
+    pub fn stream_mut(&mut self) -> &mut S {
+        &mut self.stream
     }
 
     /// Register a callback invoked at the top of every [`send()`](Self::send) call.
@@ -178,27 +181,88 @@ impl Connection {
         Ok(())
     }
 
-    /// Block until a complete frame arrives and decode it.
-    pub fn recv(&mut self) -> Result<Envelope, ConnError> {
-        // Clear any read timeout so we block indefinitely.
-        self.stream.set_read_timeout(None)?;
-        self.recv_inner()
+    /// Try to receive the next complete frame.
+    ///
+    /// - `Ok(Some(env))` — decoded message.
+    /// - `Ok(None)` — no data available (`WouldBlock`/`TimedOut` from stream).
+    /// - `Err(Disconnected)` — stream closed by peer.
+    /// - `Err(Wire|Io)` — decode or I/O error.
+    ///
+    /// The stream's read timeout controls whether this blocks or returns
+    /// `Ok(None)` immediately. Set the timeout on the stream before calling.
+    pub fn recv(&mut self) -> Result<Option<Envelope>, ConnError> {
+        loop {
+            // Drain pending frames first.
+            if let Some(wire) = self.pending.pop() {
+                let env = Self::decode_wire(&wire)?;
+                if let Some(cb) = self.on_recv.as_mut() {
+                    cb(&env);
+                }
+                return Ok(Some(env));
+            }
+
+            // Read from stream.
+            match self.stream.read(&mut self.read_buf) {
+                Ok(0) => return Err(ConnError::Disconnected),
+                Ok(n) => {
+                    let mut frames = self.splitter.feed(&self.read_buf[..n]);
+                    if let Some(first) = frames.pop() {
+                        // Stash extras (in arrival order — frames was built
+                        // left-to-right, pop takes from the end, so reverse).
+                        frames.reverse();
+                        self.pending.extend(frames);
+                        let env = Self::decode_wire(&first)?;
+                        if let Some(cb) = self.on_recv.as_mut() {
+                            cb(&env);
+                        }
+                        return Ok(Some(env));
+                    }
+                    // No complete frame yet — loop for more data.
+                }
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(ConnError::Io(e)),
+            }
+        }
     }
 
-    /// Block up to `timeout` for a complete frame.
-    ///
-    /// Returns `ConnError::Timeout` if no complete frame arrives in time.
-    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Envelope, ConnError> {
-        self.stream.set_read_timeout(Some(timeout))?;
-        match self.recv_inner() {
-            Err(ConnError::Io(ref e))
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                Err(ConnError::Timeout { timeout })
-            }
-            other => other,
-        }
+    // -- Internal -------------------------------------------------------------
+
+    fn decode_wire(wire: &[u8]) -> Result<Envelope, ConnError> {
+        let frame = RawFrame::parse(wire)?;
+        let src = frame.src;
+        let type_id = frame.type_id;
+        let raw = frame.payload.clone();
+        let message =
+            Message::decode(&frame).map_err(|e| ConnError::Wire(e.with_raw(&raw)))?;
+        Ok(Envelope {
+            src,
+            type_id,
+            raw,
+            message,
+        })
+    }
+}
+
+// -- TcpStream convenience methods --------------------------------------------
+
+impl BinaryConnection<TcpStream> {
+    /// Connect to a Mevo+ device with the system default timeout.
+    pub fn connect(addr: impl ToSocketAddrs) -> Result<Self, ConnError> {
+        let stream = TcpStream::connect(addr)?;
+        let _ = stream.set_nodelay(true);
+        Ok(Self::new(stream))
+    }
+
+    /// Connect with an explicit timeout.
+    pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> Result<Self, ConnError> {
+        let stream = TcpStream::connect_timeout(addr, timeout)?;
+        let _ = stream.set_nodelay(true);
+        Ok(Self::new(stream))
     }
 
     /// The peer address of the underlying TCP connection.
@@ -212,50 +276,21 @@ impl Connection {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Internal
-    // -----------------------------------------------------------------------
-
-    fn recv_inner(&mut self) -> Result<Envelope, ConnError> {
-        loop {
-            // Drain pending frames first.
-            if let Some(wire) = self.pending.pop() {
-                let env = self.decode_wire(&wire)?;
-                if let Some(cb) = self.on_recv.as_mut() {
-                    cb(&env);
-                }
-                return Ok(env);
-            }
-
-            // Read from TCP.
-            let n = self.stream.read(&mut self.read_buf)?;
-            if n == 0 {
-                return Err(ConnError::Disconnected);
-            }
-
-            let mut frames = self.splitter.feed(&self.read_buf[..n]);
-            if let Some(first) = frames.pop() {
-                // Stash extras (in arrival order — frames was built left-to-right,
-                // pop takes from the end, so reverse before extending pending).
-                frames.reverse();
-                self.pending.extend(frames);
-                let env = self.decode_wire(&first)?;
-                if let Some(cb) = self.on_recv.as_mut() {
-                    cb(&env);
-                }
-                return Ok(env);
-            }
-            // No complete frame yet — loop for more TCP data.
+    /// Block up to `timeout` for a complete frame.
+    ///
+    /// Returns `ConnError::Timeout` if no complete frame arrives in time.
+    ///
+    /// This is a convenience wrapper for callers that prefer the old
+    /// timeout-per-call style. Prefer setting the stream read timeout
+    /// once and using [`recv()`](Self::recv) directly.
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Envelope, ConnError> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        match self.recv()? {
+            Some(env) => Ok(env),
+            None => Err(ConnError::Timeout),
         }
     }
-
-    fn decode_wire(&self, wire: &[u8]) -> Result<Envelope, ConnError> {
-        let frame = RawFrame::parse(wire)?;
-        let src = frame.src;
-        let type_id = frame.type_id;
-        let raw = frame.payload.clone();
-        let message = Message::decode(&frame)
-            .map_err(|e| ConnError::Wire(e.with_raw(&raw)))?;
-        Ok(Envelope { src, type_id, raw, message })
-    }
 }
+
+/// Type alias for backwards compatibility.
+pub type Connection = BinaryConnection<TcpStream>;
