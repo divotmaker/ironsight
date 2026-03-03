@@ -40,16 +40,21 @@ jobs:
         with:
           ref: main
 
-      - name: Set version from tag
+      - name: Bump to next patch version
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          MAJOR="${VERSION%%.*}"
+          REST="${VERSION#*.}"
+          MINOR="${REST%%.*}"
+          PATCH="${REST#*.}"
+          NEXT_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          sed -i "s/^version = \".*\"/version = \"${NEXT_VERSION}\"/" Cargo.toml
+          echo "NEXT_VERSION=${NEXT_VERSION}" >> "$GITHUB_ENV"
 
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml
-          git commit -m "chore: bump version to ${VERSION}"
+          git commit -m "chore: prepare for next release (${NEXT_VERSION})"
           git push
