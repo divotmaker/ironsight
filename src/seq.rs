@@ -756,12 +756,16 @@ pub struct AvrSettings {
     pub mode: u8,
     /// BF parameter writes (ball type, tee height, track%, etc.).
     pub params: Vec<ParamValue>,
-    /// Radar calibration values.
-    pub radar_cal: RadarCal,
+    /// Radar calibration values. Optional — skip during mode changes
+    /// (the FS Golf app only sends RadarCal on initial configuration
+    /// or in the pre-disarm phase, never during the configure phase).
+    pub radar_cal: Option<RadarCal>,
 }
 
 #[derive(Debug)]
 enum AvrConfigStep {
+    /// Wait for leading B0[01 00] config-gate ACK before first param.
+    WaitInitGateAck,
     /// Send next param, wait for ConfigAck.
     WaitParamAck { param_idx: usize },
     /// Wait for B0 commit ConfigAck after param write.
@@ -786,30 +790,19 @@ pub struct AvrConfigSequencer {
 impl AvrConfigSequencer {
     #[must_use]
     pub fn new(settings: AvrSettings) -> (Self, Vec<Action>) {
-        let first_action = if settings.params.is_empty() {
-            // No params — jump straight to ModeSet.
-            Action::Send(
-                Command::ModeSet(ModeSet {
-                    mode: settings.mode,
-                }),
-                BusAddr::Avr,
-            )
-        } else {
-            Action::Send(
-                Command::ParamValue(settings.params[0].clone()),
-                BusAddr::Avr,
-            )
-        };
-        let first_step = if settings.params.is_empty() {
-            AvrConfigStep::WaitModeEcho
-        } else {
-            AvrConfigStep::WaitParamAck { param_idx: 0 }
-        };
+        // Send a leading B0[01 00] config-gate before any params.
+        // The FS Golf app always opens the configure phase with this command;
+        // after disarm the device needs it to enter config mode before arm
+        // will be accepted.
         let seq = Self {
-            step: first_step,
+            step: AvrConfigStep::WaitInitGateAck,
             settings,
         };
-        (seq, vec![first_action])
+        let actions = vec![Action::Send(
+            Command::AvrConfigCmd(AvrConfigCmd { arm: false }),
+            BusAddr::Avr,
+        )];
+        (seq, actions)
     }
 }
 
@@ -821,6 +814,26 @@ impl Sequence for AvrConfigSequencer {
         let b0_commit = Command::AvrConfigCmd(AvrConfigCmd { arm: false });
 
         match self.step {
+            AvrConfigStep::WaitInitGateAck => {
+                if let Message::ConfigAck(_) = env.message {
+                    if self.settings.params.is_empty() {
+                        // No params — jump straight to ModeSet.
+                        self.step = AvrConfigStep::WaitModeEcho;
+                        return vec![Action::Send(
+                            Command::ModeSet(ModeSet {
+                                mode: self.settings.mode,
+                            }),
+                            BusAddr::Avr,
+                        )];
+                    }
+                    self.step = AvrConfigStep::WaitParamAck { param_idx: 0 };
+                    return vec![Action::Send(
+                        Command::ParamValue(self.settings.params[0].clone()),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
             AvrConfigStep::WaitParamAck { param_idx } => {
                 if let Message::ConfigAck(_) = env.message {
                     self.step = AvrConfigStep::WaitParamCommitAck { param_idx };
@@ -860,11 +873,15 @@ impl Sequence for AvrConfigSequencer {
             }
             AvrConfigStep::WaitModeCommitAck => {
                 if let Message::ConfigAck(_) = env.message {
-                    self.step = AvrConfigStep::WaitRadarCalEcho;
-                    return vec![Action::Send(
-                        Command::RadarCal(self.settings.radar_cal.clone()),
-                        BusAddr::Avr,
-                    )];
+                    if let Some(ref cal) = self.settings.radar_cal {
+                        self.step = AvrConfigStep::WaitRadarCalEcho;
+                        return vec![Action::Send(
+                            Command::RadarCal(cal.clone()),
+                            BusAddr::Avr,
+                        )];
+                    }
+                    // No RadarCal — skip to done (mode changes don't need it).
+                    self.step = AvrConfigStep::Done;
                 }
                 vec![]
             }
@@ -977,21 +994,147 @@ impl Sequence for CameraConfigSequencer {
 }
 
 // ===========================================================================
+// Phase 5.5 — DisarmSequencer
+// ===========================================================================
+
+#[derive(Debug)]
+enum DisarmStep {
+    /// Wait for ConfigAck from the B0[01 00] (arm=false) command.
+    WaitAck,
+    /// Wait for the device to fully process the disarm: either
+    /// ModeAck (0xB1 MODE_RESET) or Text("ARMED CANCELLED").
+    WaitModeReset,
+    /// Wait for device to report idle state ("System State 5").
+    /// The device emits this 0.5-3ms after "ARMED CANCELLED" — it signals
+    /// the disarm transition is fully complete.
+    WaitStateIdle,
+    Done,
+}
+
+/// Pollable state machine for explicit disarm before a mode change.
+///
+/// Sends `AvrConfigCmd(arm=false)` and waits for ConfigAck + ModeAck/ARMED
+/// CANCELLED + "System State 5". Must run before `AvrConfigSequencer` on
+/// re-configure while the device is armed, so the device is fully idle
+/// before new config commands arrive.
+pub struct DisarmSequencer {
+    step: DisarmStep,
+}
+
+impl DisarmSequencer {
+    #[must_use]
+    pub fn new() -> (Self, Vec<Action>) {
+        let seq = Self {
+            step: DisarmStep::WaitAck,
+        };
+        let actions = vec![Action::Send(
+            Command::AvrConfigCmd(AvrConfigCmd { arm: false }),
+            BusAddr::Avr,
+        )];
+        (seq, actions)
+    }
+}
+
+impl Sequence for DisarmSequencer {
+    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+        match self.step {
+            DisarmStep::WaitAck => {
+                if env.src != BusAddr::Avr {
+                    return vec![];
+                }
+                // Skip noise (same as other sequencers but NOT ModeAck)
+                if matches!(
+                    &env.message,
+                    Message::Text(_)
+                        | Message::DspDebug(_)
+                        | Message::CamState(_)
+                        | Message::Unknown { .. }
+                ) {
+                    return vec![];
+                }
+                if let Message::ConfigAck(_) = env.message {
+                    self.step = DisarmStep::WaitModeReset;
+                }
+                vec![]
+            }
+            DisarmStep::WaitModeReset => {
+                // Accept MODE_RESET (ModeAck 0xB1) or "ARMED CANCELLED" text
+                // from any bus — the device sends these asynchronously.
+                if let Message::ModeAck(_) = env.message {
+                    self.step = DisarmStep::WaitStateIdle;
+                    return vec![];
+                }
+                if let Message::Text(ref t) = env.message {
+                    if t.text.contains("ARMED CANCELLED") {
+                        self.step = DisarmStep::WaitStateIdle;
+                    }
+                }
+                vec![]
+            }
+            DisarmStep::WaitStateIdle => {
+                // Wait for the DSP to report idle state. This arrives 0.5-3ms
+                // after "ARMED CANCELLED" and signals the device has fully
+                // completed the disarm transition.
+                if let Message::Text(ref t) = env.message {
+                    if t.text.contains("System State") {
+                        self.step = DisarmStep::Done;
+                    }
+                }
+                // Also accept ModeAck as completion — on some firmware
+                // versions MODE_RESET arrives after ARMED CANCELLED and
+                // after System State, so it serves as a final "done" signal.
+                if let Message::ModeAck(_) = env.message {
+                    self.step = DisarmStep::Done;
+                }
+                vec![]
+            }
+            DisarmStep::Done => vec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.step, DisarmStep::Done)
+    }
+}
+
+// ===========================================================================
 // Phase 6 — ArmSequencer
 // ===========================================================================
 
 #[derive(Debug)]
 enum ArmStep {
     WaitDspStatus,
+    WaitAvrStatus,
     WaitArmAck,
-    WaitPiStatus,
-    WaitArmedText,
+    /// After ConfigAck, wait for both PiStatus and "ARMED" text.
+    /// On older firmware PiStatus arrives first; on BM17.04 (Jan 2026)
+    /// the "ARMED DetectionMode=N" text arrives before PiStatus.
+    WaitPiAndArmed { got_pi: bool, got_armed: bool },
     Done,
 }
 
 /// Pollable state machine for the ARM phase (Phase 6).
+///
+/// Sequence (from pcap):
+///   1. StatusPoll → DSP  → wait DspStatus
+///   2. StatusPoll → AVR  → wait AvrStatus
+///   3. AvrConfigCmd(arm=true) → AVR → wait ConfigAck
+///   4. StatusPoll → PI   → wait PiStatus + wait "ARMED" text (any order)
+///
+/// After ConfigAck, the sequencer waits for both PiStatus and "ARMED"
+/// text to arrive. These arrive in different orders depending on firmware
+/// version: older firmware sends PiStatus first, BM17.04 (Jan 2026)
+/// sends the "ARMED DetectionMode=N" text before PiStatus.
+///
+/// On ConfigNack (0x94), the sequencer restarts from step 1. The device
+/// may reject ARM for up to ~30 seconds after a full configuration
+/// (params + RadarCal). The FS Golf app uses different param IDs and
+/// gets zero ConfigNack on ARM. Mode-only configuration (no params,
+/// no RadarCal) still produces ConfigNack retries but typically fewer.
+/// The overall operation timeout (set by the caller) limits retries.
 pub struct ArmSequencer {
     step: ArmStep,
+    retries: u16,
 }
 
 impl ArmSequencer {
@@ -999,12 +1142,19 @@ impl ArmSequencer {
     pub fn new() -> (Self, Vec<Action>) {
         let seq = Self {
             step: ArmStep::WaitDspStatus,
+            retries: 0,
         };
         let actions = vec![Action::Send(
             Command::StatusPoll(StatusPoll { pi_mode: false }),
             BusAddr::Dsp,
         )];
         (seq, actions)
+    }
+
+    /// Number of ConfigNack retries so far.
+    #[must_use]
+    pub fn retries(&self) -> u16 {
+        self.retries
     }
 }
 
@@ -1028,6 +1178,22 @@ impl Sequence for ArmSequencer {
                     return vec![];
                 }
                 if let Message::DspStatus(_) = env.message {
+                    // Poll AVR status before arming. The device requires
+                    // this step to transition the AVR into a state that
+                    // accepts the arm command (confirmed via pcap).
+                    self.step = ArmStep::WaitAvrStatus;
+                    return vec![Action::Send(
+                        Command::StatusPoll(StatusPoll { pi_mode: false }),
+                        BusAddr::Avr,
+                    )];
+                }
+                vec![]
+            }
+            ArmStep::WaitAvrStatus => {
+                if should_skip_with_mode_ack(env, BusAddr::Avr) {
+                    return vec![];
+                }
+                if let Message::AvrStatus(_) = env.message {
                     self.step = ArmStep::WaitArmAck;
                     return vec![Action::Send(
                         Command::AvrConfigCmd(AvrConfigCmd { arm: true }),
@@ -1037,11 +1203,36 @@ impl Sequence for ArmSequencer {
                 vec![]
             }
             ArmStep::WaitArmAck => {
-                if should_skip_with_mode_ack(env, BusAddr::Avr) {
+                // Don't use should_skip here — we need to see ConfigNack.
+                if env.src != BusAddr::Avr {
                     return vec![];
                 }
+                if matches!(
+                    &env.message,
+                    Message::Text(_)
+                        | Message::DspDebug(_)
+                        | Message::CamState(_)
+                        | Message::ModeAck(_)
+                        | Message::Unknown { .. }
+                ) {
+                    return vec![];
+                }
+                if let Message::ConfigNack(_) = env.message {
+                    // Device rejected ARM — retry from the top.
+                    // Retries may continue for up to ~30s after full
+                    // configuration. Use retries() to monitor progress.
+                    self.retries += 1;
+                    self.step = ArmStep::WaitDspStatus;
+                    return vec![Action::Send(
+                        Command::StatusPoll(StatusPoll { pi_mode: false }),
+                        BusAddr::Dsp,
+                    )];
+                }
                 if let Message::ConfigAck(_) = env.message {
-                    self.step = ArmStep::WaitPiStatus;
+                    self.step = ArmStep::WaitPiAndArmed {
+                        got_pi: false,
+                        got_armed: false,
+                    };
                     return vec![Action::Send(
                         Command::StatusPoll(StatusPoll { pi_mode: true }),
                         BusAddr::Pi,
@@ -1049,21 +1240,23 @@ impl Sequence for ArmSequencer {
                 }
                 vec![]
             }
-            ArmStep::WaitPiStatus => {
-                if should_skip_with_mode_ack(env, BusAddr::Pi) {
-                    return vec![];
-                }
+            ArmStep::WaitPiAndArmed {
+                ref mut got_pi,
+                ref mut got_armed,
+            } => {
+                // Collect both PiStatus and "ARMED" text in any order.
+                // Firmware BM17.04 sends ARMED text before PiStatus;
+                // older firmware sends PiStatus first.
                 if let Message::PiStatus(_) = env.message {
-                    self.step = ArmStep::WaitArmedText;
+                    *got_pi = true;
                 }
-                vec![]
-            }
-            ArmStep::WaitArmedText => {
-                // Accept ARMED text from any bus (E3 Text)
                 if let Message::Text(ref text) = env.message
                     && text.text.contains("ARMED")
                     && !text.text.contains("CANCELLED")
                 {
+                    *got_armed = true;
+                }
+                if *got_pi && *got_armed {
                     self.step = ArmStep::Done;
                 }
                 vec![]
@@ -1123,6 +1316,11 @@ enum ShotStep {
 pub struct ShotSequencer {
     step: ShotStep,
     data: ShotData,
+    /// ModeAck often arrives during the drain phase (before IDLE) as part of
+    /// the device's natural shot-completion flow. If we see it there, carry
+    /// it forward so WaitingForConfigAckResp doesn't block on a ModeAck that
+    /// already happened.
+    saw_mode_ack_during_drain: bool,
 }
 
 impl ShotSequencer {
@@ -1132,6 +1330,7 @@ impl ShotSequencer {
         let seq = Self {
             step: ShotStep::Draining,
             data: ShotData::default(),
+            saw_mode_ack_during_drain: false,
         };
         let actions = vec![
             Action::Send(Command::ShotDataAck, BusAddr::Avr),
@@ -1160,7 +1359,7 @@ impl Sequence for ShotSequencer {
                 match &env.message {
                     Message::ShotText(st) if st.is_idle() => {
                         self.step = ShotStep::WaitingForConfigAckResp {
-                            got_mode_ack: false,
+                            got_mode_ack: self.saw_mode_ack_during_drain,
                             got_config_resp: false,
                         };
                         return vec![Action::Send(Command::ConfigQuery, BusAddr::Avr)];
@@ -1171,6 +1370,10 @@ impl Sequence for ShotSequencer {
                     Message::SpeedProfile(r) => self.data.speed_profile = Some(r.clone()),
                     Message::PrcData(r) => self.data.prc.push(r.clone()),
                     Message::ClubPrc(r) => self.data.club_prc.push(r.clone()),
+                    // ModeAck often arrives before IDLE as part of the device's
+                    // shot-completion flow (System State 5 → ModeAck). Capture
+                    // it so we don't block waiting for it after ConfigQuery.
+                    Message::ModeAck(_) => self.saw_mode_ack_during_drain = true,
                     _ => {}
                 }
                 vec![]

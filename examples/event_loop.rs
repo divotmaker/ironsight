@@ -62,10 +62,10 @@ fn default_avr_settings() -> AvrSettings {
                 value: ParamData::Float40(0.0381),
             },
         ],
-        radar_cal: RadarCal {
+        radar_cal: Some(RadarCal {
             range_mm: 2743, // 9 feet
             height_mm: 25,  // floor(1.0 inches * 25.4) = 25
-        },
+        }),
     }
 }
 
@@ -169,10 +169,14 @@ fn run() -> Result<(), ConnError> {
 
     // 3. Configure
     let settings = default_avr_settings();
-    println!(
-        "Configuring... mode=Outdoor ball=RCT range={}mm height={}mm",
-        settings.radar_cal.range_mm, settings.radar_cal.height_mm,
-    );
+    if let Some(ref cal) = settings.radar_cal {
+        println!(
+            "Configuring... mode=Outdoor ball=RCT range={}mm height={}mm",
+            cal.range_mm, cal.height_mm,
+        );
+    } else {
+        println!("Configuring... mode=Outdoor ball=RCT (no radar cal)");
+    }
     seq::configure_avr(&mut conn, &settings)?;
     seq::configure_camera(&mut conn, &default_cam_config())?;
 

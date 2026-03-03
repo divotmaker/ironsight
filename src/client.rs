@@ -21,8 +21,8 @@ use crate::protocol::status::{AvrStatus, DspStatus, PiStatus};
 use crate::protocol::Message;
 use crate::seq::{
     self, Action, ArmSequencer, AvrConfigSequencer, AvrSequencer, AvrSettings,
-    AvrSync, CameraConfigSequencer, DspSequencer, DspSync, PiSequencer, PiSync, Sequence,
-    ShotData, ShotSequencer,
+    AvrSync, CameraConfigSequencer, DisarmSequencer, DspSequencer, DspSync, PiSequencer,
+    PiSync, Sequence, ShotData, ShotSequencer,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,6 +34,8 @@ use crate::seq::{
 pub enum BinaryEvent {
     /// Three-phase handshake (DSP + AVR + PI sync) complete.
     Handshake(HandshakeOutcome),
+    /// Device disarmed (explicit disarm before re-configure).
+    Disarmed,
     /// AVR config + camera config applied.
     Configured,
     /// Device armed, ready for shots.
@@ -42,6 +44,10 @@ pub enum BinaryEvent {
     Trigger,
     /// Shot data collected and device re-armed.
     Shot(Box<ShotData>),
+    /// Keepalive round-trip complete. Contains the latest cached status
+    /// from DSP/AVR/PI responses. Useful for staleness detection and
+    /// telemetry updates.
+    Keepalive(StatusSnapshot),
     /// Any message not consumed by the active operation.
     Message(Envelope),
 }
@@ -69,7 +75,8 @@ pub struct StatusSnapshot {
 /// Operation waiting in the FIFO queue.
 enum QueuedOp {
     Handshake,
-    Configure(AvrSettings, CamConfig),
+    ConfigureAvr(AvrSettings),
+    ConfigureCam(CamConfig),
     Arm,
     Keepalive,
 }
@@ -82,6 +89,7 @@ enum ActiveOp {
         dsp: Option<DspSync>,
         avr: Option<AvrSync>,
     },
+    Disarm(DisarmSequencer),
     Configure(ConfigurePhase),
     Arm(ArmSequencer),
     Shot(Box<ShotSequencer>),
@@ -95,9 +103,9 @@ enum HandshakePhase {
     Pi(PiSequencer),
 }
 
-/// Configure runs 2 sequencers in series.
+/// Single-phase configure operations (AVR or camera, independently).
 enum ConfigurePhase {
-    Avr(AvrConfigSequencer, CamConfig),
+    Avr(AvrConfigSequencer),
     Camera(CameraConfigSequencer),
 }
 
@@ -174,7 +182,8 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
 ///     match client.poll()? {
 ///         Some(BinaryEvent::Handshake(h)) => {
 ///             println!("Connected to {}", h.pi.ssid);
-///             // client.configure(settings, cam_config);
+///             // client.configure_avr(settings);
+///             // client.configure_cam(cam_config);
 ///         }
 ///         Some(event) => println!("{event:?}"),
 ///         None => {}
@@ -246,10 +255,12 @@ impl<S: Read + Write> BinaryClient<S> {
         if let Some(deadline) = self.op_deadline {
             if Instant::now() >= deadline {
                 if matches!(self.active, Some(ActiveOp::Keepalive(_))) {
-                    // Keepalive timeout is non-fatal.
+                    // Keepalive timeout is non-fatal. Update last_keepalive
+                    // so we don't immediately re-queue another one.
                     self.active = None;
                     self.op_deadline = None;
                     self.keepalive_queued = false;
+                    self.last_keepalive = Instant::now();
                 } else {
                     return Err(ConnError::Timeout);
                 }
@@ -336,9 +347,21 @@ impl<S: Read + Write> BinaryClient<S> {
         self.queue.push_back(QueuedOp::Handshake);
     }
 
-    /// Enqueue AVR configuration followed by camera configuration.
-    pub fn configure(&mut self, avr: AvrSettings, cam: CamConfig) {
-        self.queue.push_back(QueuedOp::Configure(avr, cam));
+    /// Enqueue AVR configuration (mode, radar cal, parameters).
+    ///
+    /// If the device is armed when this operation starts executing, an
+    /// explicit disarm is automatically prepended so the MODE_RESET
+    /// completes before new config commands are sent.
+    /// Emits [`BinaryEvent::Disarmed`] then [`BinaryEvent::Configured`].
+    pub fn configure_avr(&mut self, avr: AvrSettings) {
+        self.queue.push_back(QueuedOp::ConfigureAvr(avr));
+    }
+
+    /// Enqueue camera configuration.
+    ///
+    /// Emits [`BinaryEvent::Configured`] on completion.
+    pub fn configure_cam(&mut self, cam: CamConfig) {
+        self.queue.push_back(QueuedOp::ConfigureCam(cam));
     }
 
     /// Enqueue arming the device.
@@ -400,12 +423,29 @@ impl<S: Read + Write> BinaryClient<S> {
                     avr: None,
                 });
             }
-            QueuedOp::Configure(avr_settings, cam_config) => {
-                let (seq, actions) = AvrConfigSequencer::new(avr_settings);
+            QueuedOp::ConfigureAvr(avr_settings) => {
+                if self.armed {
+                    // Device is armed — disarm first, then re-queue configure.
+                    self.queue.push_front(QueuedOp::ConfigureAvr(avr_settings));
+                    let (seq, actions) = DisarmSequencer::new();
+                    for a in actions {
+                        seq::send_action(&mut self.conn, a)?;
+                    }
+                    self.active = Some(ActiveOp::Disarm(seq));
+                } else {
+                    let (seq, actions) = AvrConfigSequencer::new(avr_settings);
+                    for a in actions {
+                        seq::send_action(&mut self.conn, a)?;
+                    }
+                    self.active = Some(ActiveOp::Configure(ConfigurePhase::Avr(seq)));
+                }
+            }
+            QueuedOp::ConfigureCam(cam_config) => {
+                let (cam_seq, actions) = CameraConfigSequencer::new(&cam_config);
                 for a in actions {
                     seq::send_action(&mut self.conn, a)?;
                 }
-                self.active = Some(ActiveOp::Configure(ConfigurePhase::Avr(seq, cam_config)));
+                self.active = Some(ActiveOp::Configure(ConfigurePhase::Camera(cam_seq)));
             }
             QueuedOp::Arm => {
                 let (seq, actions) = ArmSequencer::new();
@@ -453,20 +493,31 @@ impl<S: Read + Write> BinaryClient<S> {
                     Ok(None)
                 }
             }
+            ActiveOp::Disarm(seq) => {
+                let actions = seq.feed(env);
+                for a in actions {
+                    seq::send_action(conn, a)?;
+                }
+                if seq.is_complete() {
+                    Ok(Some(Completion::Done))
+                } else {
+                    Ok(None)
+                }
+            }
             ActiveOp::Configure(config_phase) => {
                 let actions = match config_phase {
-                    ConfigurePhase::Avr(seq, _) => seq.feed(env),
+                    ConfigurePhase::Avr(seq) => seq.feed(env),
                     ConfigurePhase::Camera(seq) => seq.feed(env),
                 };
                 for a in actions {
                     seq::send_action(conn, a)?;
                 }
                 let complete = match config_phase {
-                    ConfigurePhase::Avr(seq, _) => seq.is_complete(),
+                    ConfigurePhase::Avr(seq) => seq.is_complete(),
                     ConfigurePhase::Camera(seq) => seq.is_complete(),
                 };
                 if complete {
-                    Ok(Some(Completion::PhaseComplete))
+                    Ok(Some(Completion::Done))
                 } else {
                     Ok(None)
                 }
@@ -558,29 +609,19 @@ impl<S: Read + Write> BinaryClient<S> {
                         avr: avr.expect("AvrSync missing after handshake"),
                         pi: pi_result,
                     };
+                    // Detect if device was armed from a prior session.
+                    // DspStatus state 6 = armed. This ensures the next
+                    // configure_avr will auto-disarm.
+                    if outcome.dsp.status.state() == 6 {
+                        self.armed = true;
+                    }
                     self.device = Some(outcome.clone());
                     self.active = None;
                     self.op_deadline = None;
                     Ok(Some(BinaryEvent::Handshake(outcome)))
                 }
             },
-            ActiveOp::Configure(config_phase) => match config_phase {
-                ConfigurePhase::Avr(_, cam_config) => {
-                    let (cam_seq, actions) = CameraConfigSequencer::new(&cam_config);
-                    for a in actions {
-                        seq::send_action(&mut self.conn, a)?;
-                    }
-                    self.op_deadline = Some(Instant::now() + self.op_timeout);
-                    self.active = Some(ActiveOp::Configure(ConfigurePhase::Camera(cam_seq)));
-                    Ok(None)
-                }
-                ConfigurePhase::Camera(_) => {
-                    self.active = None;
-                    self.op_deadline = None;
-                    Ok(Some(BinaryEvent::Configured))
-                }
-            },
-            // Single-phase ops should use finish_op, not advance_phase
+            // Only Handshake is multi-phase now.
             _ => unreachable!("advance_phase called on single-phase op"),
         }
     }
@@ -591,6 +632,12 @@ impl<S: Read + Write> BinaryClient<S> {
         self.op_deadline = None;
 
         match active {
+            ActiveOp::Disarm(_) => {
+                self.armed = false;
+                self.keepalive_enabled = false;
+                Ok(Some(BinaryEvent::Disarmed))
+            }
+            ActiveOp::Configure(_) => Ok(Some(BinaryEvent::Configured)),
             ActiveOp::Arm(_) => {
                 self.armed = true;
                 self.keepalive_enabled = true;
@@ -605,13 +652,14 @@ impl<S: Read + Write> BinaryClient<S> {
             ActiveOp::Keepalive(_) => {
                 self.keepalive_queued = false;
                 self.last_keepalive = Instant::now();
+                let snapshot = self.status.clone();
                 // Start next queued op immediately if available.
                 if let Some(queued) = self.queue.pop_front() {
                     self.start_op(queued)?;
                 }
-                Ok(None)
+                Ok(Some(BinaryEvent::Keepalive(snapshot)))
             }
-            // Multi-phase ops should use advance_phase, not finish_op
+            // Only Handshake is multi-phase (uses advance_phase).
             _ => unreachable!("finish_op called on multi-phase op"),
         }
     }

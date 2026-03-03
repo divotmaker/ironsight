@@ -177,7 +177,10 @@ Final camera and PI configuration after AVR config completes.
 | AVR&rarr;APP | 0xE3 | "ClubTrigger Disabled" | Club trigger state |
 | AVR&rarr;APP | 0xE3 | "Arm Epoch ... delay = N us" | Arm timing |
 
-Wait for the 0xE3 text containing "ARMED" as confirmation the device is ready.
+Wait for **both** PiStatus and 0xE3 text containing "ARMED" as confirmation the
+device is ready. These arrive in **either order** depending on firmware version:
+older firmware sends PiStatus first, BM17.04 (Jan 2026) sends the ARMED text
+before PiStatus.
 
 ### 2.7 Timing Summary
 
@@ -264,11 +267,11 @@ device stops responding to all messages (including keepalive).
 ```
                                                         ┌─ drain all messages
 On E5 "PROCESSED":                                      │  (EC, EE, E9, text,
-  APP→AVR  0x69  ×2         ShotDataAck (fire-and-forget)│   etc.) while waiting
-  ... drain ...             consume all remaining data ──┘   for IDLE
+  APP→AVR  0x69  ×2         ShotDataAck (fire-and-forget)│   B1, etc.) while
+  ... drain ...             consume all remaining data ──┘   waiting for IDLE
 On E5 "IDLE":
   APP→AVR  0x21             ConfigQuery
-  AVR→APP  B1 + A0          ModeAck + ConfigResp (either order)
+  AVR→APP  [B1 +] A0        ConfigResp [+ ModeAck if not during drain]
   APP→AVR  0x6D             ShotResultReq (optional)
   AVR→APP  0xED             duplicate ClubResult (discard)
   APP→AVR  0xB0  [01 01]   ★ RE-ARM
@@ -284,8 +287,12 @@ On E5 "IDLE":
 - **Drain phase**: After sending both 0x69s, consume all messages until "IDLE"
   arrives. Everything received (E9, EC, EE, Text, ConfigAck, CamImageAvail)
   can be safely discarded.
-- **B1 + A0 ordering**: After ConfigQuery (0x21), ModeAck (B1) and ConfigResp
-  (A0) arrive in **either order**. Wait for both.
+- **ModeAck (B1) timing**: ModeAck arrives as part of the device's natural
+  shot-completion flow ("System State 5" &rarr; ModeAck), typically **before**
+  "IDLE". A client that waits for ModeAck only after sending ConfigQuery will
+  deadlock. Capture ModeAck during the drain phase and carry it forward.
+  If ModeAck did not arrive during drain, it may still arrive after ConfigQuery
+  (either before or after ConfigResp).
 - **ShotResultReq (0x6D)**: Best-effort — triggers a duplicate ED. If the device
   doesn't respond, proceed to arm anyway.
 - **Device hangs without re-arm**: If the client does not complete the re-arm
@@ -302,6 +309,7 @@ AVR→APP  0xE9   TRACKING_STATUS ×2     retransmissions
 APP→AVR  0xEC   request (4B) ×N        PRC re-fetch (optional)
 AVR→APP  0xEC   response (244B) ×N     identical data
 DSP→APP  0xE3   "System State 5"       DSP state transition
+AVR→APP  0xB1   MODE_RESET             ModeAck (before IDLE!)
 AVR→APP  0xE5   "IDLE"                 ← triggers rearm
 APP→AVR  0x21   CONFIG_QUERY
 AVR→APP  0xB1 + 0xA0                   (either order)
@@ -401,8 +409,9 @@ After receiving shot results, the minimum required to keep the device cycling.
 **This must be driven as one continuous operation** — see &sect;4.2 for details.
 
 1. On E5 "PROCESSED": send 0x69 (SHOT_DATA_ACK) &times;2 (fire-and-forget)
-2. Drain all messages until E5 "IDLE" (discard everything)
-3. Send 0x21 (CONFIG_QUERY), collect B1 + A0 (either order, best-effort)
+2. Drain all messages until E5 "IDLE" (note: B1 ModeAck typically arrives during
+   this phase — capture it, don't discard)
+3. Send 0x21 (CONFIG_QUERY), collect A0 ConfigResp (+ B1 if not seen during drain)
 4. Send 0x6D (SHOT_RESULT_REQ), drain to ED (best-effort, skip on timeout)
 5. Re-arm: send B0 `[01 01]`, wait for 0x95 ConfigAck
 6. Wait for E3 "ARMED"

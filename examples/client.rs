@@ -43,7 +43,8 @@ fn run() -> Result<(), ironsight::ConnError> {
 
     // Enqueue the full startup sequence.
     client.handshake();
-    client.configure(default_avr_settings(), default_cam_config());
+    client.configure_avr(default_avr_settings());
+    client.configure_cam(default_cam_config());
     client.arm();
 
     println!("Starting poll loop...");
@@ -103,7 +104,10 @@ fn run() -> Result<(), ironsight::ConnError> {
                     }
                     println!("  === RE-ARMED ===");
                 }
-                BinaryEvent::Message(_) => {
+                BinaryEvent::Disarmed => {
+                    println!("\n=== Disarmed ===");
+                }
+                BinaryEvent::Keepalive(_) | BinaryEvent::Message(_) => {
                     // on_recv callback already printed it
                 }
             }
@@ -128,10 +132,10 @@ fn default_avr_settings() -> AvrSettings {
                 value: ParamData::Float40(0.0381),
             },
         ],
-        radar_cal: RadarCal {
+        radar_cal: Some(RadarCal {
             range_mm: 2743,
             height_mm: 25,
-        },
+        }),
     }
 }
 

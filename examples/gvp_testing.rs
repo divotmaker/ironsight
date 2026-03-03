@@ -585,10 +585,10 @@ fn run() -> Result<(), ConnError> {
                 value: ParamData::Float40(0.0381),
             },
         ],
-        radar_cal: RadarCal {
+        radar_cal: Some(RadarCal {
             range_mm: 2134,
             height_mm: 25,
-        },
+        }),
     };
 
     println!("\nConfiguring AVR...");
@@ -620,7 +620,10 @@ fn run() -> Result<(), ConnError> {
         .map_err(|e| ConnError::Io(std::io::Error::other(format!("GVP: {e}"))))?;
     println!("[gvp] Connected.");
 
-    let range_m = f64::from(settings.radar_cal.range_mm) / 1000.0;
+    let range_m = settings
+        .radar_cal
+        .as_ref()
+        .map_or(2.743, |cal| f64::from(cal.range_mm) / 1000.0);
     let mut shot_count = 0u32;
     let mut shot_guid = String::new();
     let mut pending_club: Option<ClubResult> = None;
@@ -772,7 +775,10 @@ fn run() -> Result<(), ConnError> {
                     }
                 }
 
-                BinaryEvent::Configured | BinaryEvent::Handshake(_) => {}
+                BinaryEvent::Configured
+                | BinaryEvent::Disarmed
+                | BinaryEvent::Handshake(_)
+                | BinaryEvent::Keepalive(_) => {}
             }
         }
 

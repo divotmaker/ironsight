@@ -131,7 +131,8 @@ let conn = BinaryConnection::connect("192.168.2.1:5100")?;
 let mut client = BinaryClient::from_tcp(conn)?;
 
 client.handshake();
-client.configure(avr_settings, cam_config);
+client.configure_avr(avr_settings);
+client.configure_cam(cam_config);
 client.arm();
 
 loop {

@@ -16,6 +16,6 @@ pub use error::WireError;
 pub use frame::{FrameSplitter, RawFrame};
 pub use protocol::{Command, Message};
 pub use seq::{
-    Action, ArmSequencer, AvrConfigSequencer, AvrSequencer, CameraConfigSequencer, DspSequencer,
-    PiSequencer, Sequence, ShotSequencer,
+    Action, ArmSequencer, AvrConfigSequencer, AvrSequencer, CameraConfigSequencer,
+    DisarmSequencer, DspSequencer, PiSequencer, Sequence, ShotSequencer,
 };
