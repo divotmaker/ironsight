@@ -20,9 +20,9 @@ use crate::protocol::camera::CamConfig;
 use crate::protocol::status::{AvrStatus, DspStatus, PiStatus};
 use crate::protocol::Message;
 use crate::seq::{
-    self, Action, ArmSequencer, AvrConfigSequencer, AvrSequencer, AvrSettings,
-    AvrSync, CameraConfigSequencer, DisarmSequencer, DspSequencer, DspSync, PiSequencer,
-    PiSync, Sequence, ShotData, ShotSequencer,
+    self, Action, ArmSequencer, AvrConfigSequencer, AvrSequencer, AvrSettings, AvrSync,
+    CameraConfigSequencer, DisarmSequencer, DspSequencer, DspSync, PiSequencer, PiSync, Sequence,
+    ShotData, ShotDatum, ShotSequencer,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,8 +42,15 @@ pub enum BinaryEvent {
     Armed,
     /// Ball detected (`ShotText` "BALL TRIGGER").
     Trigger,
-    /// Shot data collected and device re-armed.
-    Shot(Box<ShotData>),
+    /// Individual shot data yielded during the shot lifecycle (between
+    /// `Trigger` and `ShotComplete`). React to these for real-time
+    /// processing — e.g. start ball flight simulation on `Flight`,
+    /// display club data on `Club`.
+    ShotDatum(ShotDatum),
+    /// Shot processing complete, device re-armed. Carries the full
+    /// accumulated [`ShotData`] for convenience. Non-streaming callers
+    /// can ignore `ShotDatum` events and use this exclusively.
+    ShotComplete(Box<ShotData>),
     /// Keepalive round-trip complete. Contains the latest cached status
     /// from DSP/AVR/PI responses. Useful for staleness detection and
     /// telemetry updates.
@@ -210,6 +217,10 @@ pub struct BinaryClient<S: Read + Write> {
     status: StatusSnapshot,
     device: Option<HandshakeOutcome>,
     armed: bool,
+    /// True between `Trigger` and `ShotComplete`. During this window,
+    /// pre-PROCESSED messages (E8) are intercepted and yielded as
+    /// `ShotDatum` events instead of passing through as `Message`.
+    shot_in_progress: bool,
 }
 
 impl<S: Read + Write> BinaryClient<S> {
@@ -237,6 +248,7 @@ impl<S: Read + Write> BinaryClient<S> {
             status: StatusSnapshot::default(),
             device: None,
             armed: false,
+            shot_in_progress: false,
         }
     }
 
@@ -309,19 +321,19 @@ impl<S: Read + Write> BinaryClient<S> {
 
         // 7. Feed active operation.
         if let Some(ref mut active) = self.active {
-            let event = Self::feed_active(active, &env, &mut self.conn)?;
-
-            if let Some(completion) = event {
-                return self.handle_completion(completion);
+            match Self::feed_active(active, &env, &mut self.conn)? {
+                FeedResult::Consumed => return Ok(None),
+                FeedResult::Intermediate(event) => return Ok(Some(event)),
+                FeedResult::PhaseComplete => return self.advance_phase(),
+                FeedResult::Done => return self.finish_op(),
             }
-
-            // Active op consumed the message (didn't complete).
-            return Ok(None);
         }
 
         // 8. No active op — shot auto-detection.
         if let Message::ShotText(ref st) = env.message {
             if st.is_trigger() {
+                self.shot_in_progress = true;
+                self.armed = false;
                 return Ok(Some(BinaryEvent::Trigger));
             }
             if st.is_processed() {
@@ -331,12 +343,20 @@ impl<S: Read + Write> BinaryClient<S> {
                 }
                 self.active = Some(ActiveOp::Shot(Box::new(seq)));
                 self.op_deadline = Some(Instant::now() + self.op_timeout);
-                self.armed = false;
                 return Ok(None);
             }
         }
 
-        // 9. Unhandled message passthrough.
+        // 9. Pre-PROCESSED shot data (E8 arrives between TRIGGER and PROCESSED).
+        if self.shot_in_progress {
+            if let Message::FlightResultV1(ref e8) = env.message {
+                return Ok(Some(BinaryEvent::ShotDatum(ShotDatum::FlightV1(
+                    e8.clone(),
+                ))));
+            }
+        }
+
+        // 10. Unhandled message passthrough.
         Ok(Some(BinaryEvent::Message(env)))
     }
 
@@ -471,7 +491,7 @@ impl<S: Read + Write> BinaryClient<S> {
         active: &mut ActiveOp,
         env: &Envelope,
         conn: &mut BinaryConnection<S>,
-    ) -> Result<Option<Completion>, ConnError> {
+    ) -> Result<FeedResult, ConnError> {
         match active {
             ActiveOp::Handshake { phase, .. } => {
                 let actions = match &mut **phase {
@@ -488,9 +508,9 @@ impl<S: Read + Write> BinaryClient<S> {
                     HandshakePhase::Pi(seq) => seq.is_complete(),
                 };
                 if complete {
-                    Ok(Some(Completion::PhaseComplete))
+                    Ok(FeedResult::PhaseComplete)
                 } else {
-                    Ok(None)
+                    Ok(FeedResult::Consumed)
                 }
             }
             ActiveOp::Disarm(seq) => {
@@ -499,9 +519,9 @@ impl<S: Read + Write> BinaryClient<S> {
                     seq::send_action(conn, a)?;
                 }
                 if seq.is_complete() {
-                    Ok(Some(Completion::Done))
+                    Ok(FeedResult::Done)
                 } else {
-                    Ok(None)
+                    Ok(FeedResult::Consumed)
                 }
             }
             ActiveOp::Configure(config_phase) => {
@@ -517,9 +537,9 @@ impl<S: Read + Write> BinaryClient<S> {
                     ConfigurePhase::Camera(seq) => seq.is_complete(),
                 };
                 if complete {
-                    Ok(Some(Completion::Done))
+                    Ok(FeedResult::Done)
                 } else {
-                    Ok(None)
+                    Ok(FeedResult::Consumed)
                 }
             }
             ActiveOp::Arm(seq) => {
@@ -528,9 +548,9 @@ impl<S: Read + Write> BinaryClient<S> {
                     seq::send_action(conn, a)?;
                 }
                 if seq.is_complete() {
-                    Ok(Some(Completion::Done))
+                    Ok(FeedResult::Done)
                 } else {
-                    Ok(None)
+                    Ok(FeedResult::Consumed)
                 }
             }
             ActiveOp::Shot(seq) => {
@@ -539,9 +559,11 @@ impl<S: Read + Write> BinaryClient<S> {
                     seq::send_action(conn, a)?;
                 }
                 if seq.is_complete() {
-                    Ok(Some(Completion::Done))
+                    Ok(FeedResult::Done)
+                } else if let Some(datum) = seq.take_pending() {
+                    Ok(FeedResult::Intermediate(BinaryEvent::ShotDatum(datum)))
                 } else {
-                    Ok(None)
+                    Ok(FeedResult::Consumed)
                 }
             }
             ActiveOp::Keepalive(seq) => {
@@ -550,20 +572,11 @@ impl<S: Read + Write> BinaryClient<S> {
                     seq::send_action(conn, a)?;
                 }
                 if seq.is_complete() {
-                    Ok(Some(Completion::Done))
+                    Ok(FeedResult::Done)
                 } else {
-                    Ok(None)
+                    Ok(FeedResult::Consumed)
                 }
             }
-        }
-    }
-
-    // -- Internal: handle operation/phase completion ------------------------
-
-    fn handle_completion(&mut self, completion: Completion) -> Result<Option<BinaryEvent>, ConnError> {
-        match completion {
-            Completion::PhaseComplete => self.advance_phase(),
-            Completion::Done => self.finish_op(),
         }
     }
 
@@ -646,8 +659,9 @@ impl<S: Read + Write> BinaryClient<S> {
             }
             ActiveOp::Shot(seq) => {
                 self.armed = true;
+                self.shot_in_progress = false;
                 self.last_keepalive = Instant::now();
-                Ok(Some(BinaryEvent::Shot(Box::new(seq.into_result()))))
+                Ok(Some(BinaryEvent::ShotComplete(Box::new(seq.into_result()))))
             }
             ActiveOp::Keepalive(_) => {
                 self.keepalive_queued = false;
@@ -666,7 +680,11 @@ impl<S: Read + Write> BinaryClient<S> {
 }
 
 /// Internal signal from feed_active to the poll loop.
-enum Completion {
+enum FeedResult {
+    /// Message consumed, nothing to emit.
+    Consumed,
+    /// Emit this event but keep the active op running.
+    Intermediate(BinaryEvent),
     /// A phase within a multi-phase op finished (advance to next phase).
     PhaseComplete,
     /// The entire operation finished.

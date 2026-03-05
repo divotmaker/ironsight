@@ -17,5 +17,5 @@ pub use frame::{FrameSplitter, RawFrame};
 pub use protocol::{Command, Message};
 pub use seq::{
     Action, ArmSequencer, AvrConfigSequencer, AvrSequencer, CameraConfigSequencer,
-    DisarmSequencer, DspSequencer, PiSequencer, Sequence, ShotSequencer,
+    DisarmSequencer, DspSequencer, PiSequencer, Sequence, ShotDatum, ShotSequencer,
 };

@@ -26,7 +26,9 @@ use crate::protocol::handshake::{
     CalDataReq, CalDataResp, CalParamReq, CalParamResp, DevInfoResp, DspQueryResp, NetConfigReq,
     ProdInfoReq, ProdInfoResp, TimeSync,
 };
-use crate::protocol::shot::{ClubPrc, ClubResult, FlightResult, PrcData, SpeedProfile, SpinResult};
+use crate::protocol::shot::{
+    ClubPrc, ClubResult, FlightResult, FlightResultV1, PrcData, SpeedProfile, SpinResult,
+};
 use crate::protocol::status::{AvrStatus, DspStatus, PiStatus, StatusPoll};
 use crate::protocol::{Command, Message};
 
@@ -1294,6 +1296,25 @@ pub struct ShotData {
     pub club_prc: Vec<ClubPrc>,
 }
 
+/// A piece of shot data yielded during the shot lifecycle, between
+/// `BinaryEvent::Trigger` and `BinaryEvent::ShotComplete`.
+///
+/// Each variant wraps the corresponding protocol type. Only the four
+/// data types relevant for real-time shot processing are included;
+/// diagnostic data (`SpeedProfile`, `PrcData`, `ClubPrc`) is available
+/// in the accumulated [`ShotData`] via [`ShotSequencer::into_result()`].
+#[derive(Debug, Clone)]
+pub enum ShotDatum {
+    /// Primary ball flight (0xD4). Arrives during drain (post-PROCESSED).
+    Flight(FlightResult),
+    /// Partial/early ball flight (0xE8). Arrives pre-PROCESSED.
+    FlightV1(FlightResultV1),
+    /// Club head measurements (0xED). Arrives during drain.
+    Club(ClubResult),
+    /// Spin data (0xEF). Arrives during drain.
+    Spin(SpinResult),
+}
+
 #[derive(Debug)]
 enum ShotStep {
     /// Draining shot data until IDLE.
@@ -1321,6 +1342,9 @@ pub struct ShotSequencer {
     /// it forward so WaitingForConfigAckResp doesn't block on a ModeAck that
     /// already happened.
     saw_mode_ack_during_drain: bool,
+    /// Latest shot data message to yield to the caller. Set during drain
+    /// when D4/ED/EF arrive; taken by `BinaryClient` after each `feed()`.
+    pending: Option<ShotDatum>,
 }
 
 impl ShotSequencer {
@@ -1331,6 +1355,7 @@ impl ShotSequencer {
             step: ShotStep::Draining,
             data: ShotData::default(),
             saw_mode_ack_during_drain: false,
+            pending: None,
         };
         let actions = vec![
             Action::Send(Command::ShotDataAck, BusAddr::Avr),
@@ -1350,6 +1375,12 @@ impl ShotSequencer {
     pub fn data(&self) -> &ShotData {
         &self.data
     }
+
+    /// Take the pending shot datum (if any). Called by `BinaryClient` after
+    /// each `feed()` to yield individual data messages as they arrive.
+    pub fn take_pending(&mut self) -> Option<ShotDatum> {
+        self.pending.take()
+    }
 }
 
 impl Sequence for ShotSequencer {
@@ -1364,9 +1395,18 @@ impl Sequence for ShotSequencer {
                         };
                         return vec![Action::Send(Command::ConfigQuery, BusAddr::Avr)];
                     }
-                    Message::FlightResult(r) => self.data.flight = Some(r.clone()),
-                    Message::ClubResult(r) => self.data.club = Some(r.clone()),
-                    Message::SpinResult(r) => self.data.spin = Some(r.clone()),
+                    Message::FlightResult(r) => {
+                        self.data.flight = Some(r.clone());
+                        self.pending = Some(ShotDatum::Flight(r.clone()));
+                    }
+                    Message::ClubResult(r) => {
+                        self.data.club = Some(r.clone());
+                        self.pending = Some(ShotDatum::Club(r.clone()));
+                    }
+                    Message::SpinResult(r) => {
+                        self.data.spin = Some(r.clone());
+                        self.pending = Some(ShotDatum::Spin(r.clone()));
+                    }
                     Message::SpeedProfile(r) => self.data.speed_profile = Some(r.clone()),
                     Message::PrcData(r) => self.data.prc.push(r.clone()),
                     Message::ClubPrc(r) => self.data.club_prc.push(r.clone()),
