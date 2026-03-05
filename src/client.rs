@@ -323,7 +323,7 @@ impl<S: Read + Write> BinaryClient<S> {
         if let Some(ref mut active) = self.active {
             match Self::feed_active(active, &env, &mut self.conn)? {
                 FeedResult::Consumed => return Ok(None),
-                FeedResult::Intermediate(event) => return Ok(Some(event)),
+                FeedResult::Intermediate(event) => return Ok(Some(*event)),
                 FeedResult::PhaseComplete => return self.advance_phase(),
                 FeedResult::Done => return self.finish_op(),
             }
@@ -561,7 +561,7 @@ impl<S: Read + Write> BinaryClient<S> {
                 if seq.is_complete() {
                     Ok(FeedResult::Done)
                 } else if let Some(datum) = seq.take_pending() {
-                    Ok(FeedResult::Intermediate(BinaryEvent::ShotDatum(datum)))
+                    Ok(FeedResult::Intermediate(Box::new(BinaryEvent::ShotDatum(datum))))
                 } else {
                     Ok(FeedResult::Consumed)
                 }
@@ -684,7 +684,7 @@ enum FeedResult {
     /// Message consumed, nothing to emit.
     Consumed,
     /// Emit this event but keep the active op running.
-    Intermediate(BinaryEvent),
+    Intermediate(Box<BinaryEvent>),
     /// A phase within a multi-phase op finished (advance to next phase).
     PhaseComplete,
     /// The entire operation finished.

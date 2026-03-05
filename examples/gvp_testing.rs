@@ -655,7 +655,7 @@ fn run() -> Result<(), ConnError> {
                     let _ = gvp.send_config(&GvpConfig::fusion());
                 }
 
-                BinaryEvent::Shot(data) => {
+                BinaryEvent::ShotComplete(data) => {
                     // Send trajectory hints if not already sent from pre-PROCESSED data.
                     if !hints_sent {
                         if let Some(ref flight) = data.flight {
@@ -778,6 +778,7 @@ fn run() -> Result<(), ConnError> {
                 BinaryEvent::Configured
                 | BinaryEvent::Disarmed
                 | BinaryEvent::Handshake(_)
+                | BinaryEvent::ShotDatum(_)
                 | BinaryEvent::Keepalive(_) => {}
             }
         }

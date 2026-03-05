@@ -76,7 +76,7 @@ fn run() -> Result<(), ironsight::ConnError> {
                 BinaryEvent::Trigger => {
                     println!("\n  ** BALL TRIGGER **");
                 }
-                BinaryEvent::Shot(data) => {
+                BinaryEvent::ShotComplete(data) => {
                     println!("\n  === Shot complete ===");
                     if let Some(ref f) = data.flight {
                         println!(
@@ -107,7 +107,9 @@ fn run() -> Result<(), ironsight::ConnError> {
                 BinaryEvent::Disarmed => {
                     println!("\n=== Disarmed ===");
                 }
-                BinaryEvent::Keepalive(_) | BinaryEvent::Message(_) => {
+                BinaryEvent::ShotDatum(_)
+                | BinaryEvent::Keepalive(_)
+                | BinaryEvent::Message(_) => {
                     // on_recv callback already printed it
                 }
             }
