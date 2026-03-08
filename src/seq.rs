@@ -1319,8 +1319,6 @@ pub enum ShotDatum {
 enum ShotStep {
     /// Draining shot data until IDLE.
     Draining,
-    /// Waiting for ModeAck + ConfigResp after ConfigQuery.
-    WaitingForConfigAckResp { got_mode_ack: bool, got_config_resp: bool },
     /// Waiting for ClubResult after ShotResultReq.
     WaitingForClubResult,
     /// Waiting for ConfigAck after B0 ARM.
@@ -1333,15 +1331,17 @@ enum ShotStep {
 /// Pollable state machine for post-shot handling.
 ///
 /// Created after receiving E5 "PROCESSED". Drives: ack → drain to IDLE →
-/// ConfigQuery → ShotResultReq → ARM → wait ARMED.
+/// ShotResultReq → ARM → wait ARMED.
+///
+/// The drain phase collects shot data (D4/ED/EF/etc.) and passively absorbs
+/// ModeAck (0xB1) and ConfigResp (0xA0) messages that arrive as part of the
+/// device's natural shot-completion flow. Neither message gates progression —
+/// Gen1 sends both after a ConfigQuery (0x21), but Gen2 firmware skips the
+/// ConfigQuery/ConfigResp exchange entirely. By not requiring either message,
+/// the sequencer works identically across firmware generations.
 pub struct ShotSequencer {
     step: ShotStep,
     data: ShotData,
-    /// ModeAck often arrives during the drain phase (before IDLE) as part of
-    /// the device's natural shot-completion flow. If we see it there, carry
-    /// it forward so WaitingForConfigAckResp doesn't block on a ModeAck that
-    /// already happened.
-    saw_mode_ack_during_drain: bool,
     /// Latest shot data message to yield to the caller. Set during drain
     /// when D4/ED/EF arrive; taken by `BinaryClient` after each `feed()`.
     pending: Option<ShotDatum>,
@@ -1354,7 +1354,6 @@ impl ShotSequencer {
         let seq = Self {
             step: ShotStep::Draining,
             data: ShotData::default(),
-            saw_mode_ack_during_drain: false,
             pending: None,
         };
         let actions = vec![
@@ -1389,11 +1388,16 @@ impl Sequence for ShotSequencer {
             ShotStep::Draining => {
                 match &env.message {
                     Message::ShotText(st) if st.is_idle() => {
-                        self.step = ShotStep::WaitingForConfigAckResp {
-                            got_mode_ack: self.saw_mode_ack_during_drain,
-                            got_config_resp: false,
-                        };
-                        return vec![Action::Send(Command::ConfigQuery, BusAddr::Avr)];
+                        // After IDLE, go straight to requesting final results.
+                        // Gen1 FS Golf sends 0x21 ConfigQuery here and waits
+                        // for B1 ModeAck + A0 ConfigResp before proceeding,
+                        // but Gen2 firmware skips that exchange entirely. The
+                        // ConfigQuery is informational (re-reads radar params
+                        // we already have) and not required for re-arming.
+                        // ModeAck arrives naturally during the device's
+                        // shot-completion flow and is absorbed passively.
+                        self.step = ShotStep::WaitingForClubResult;
+                        return vec![Action::Send(Command::ShotResultReq, BusAddr::Avr)];
                     }
                     Message::FlightResult(r) => {
                         self.data.flight = Some(r.clone());
@@ -1410,26 +1414,7 @@ impl Sequence for ShotSequencer {
                     Message::SpeedProfile(r) => self.data.speed_profile = Some(r.clone()),
                     Message::PrcData(r) => self.data.prc.push(r.clone()),
                     Message::ClubPrc(r) => self.data.club_prc.push(r.clone()),
-                    // ModeAck often arrives before IDLE as part of the device's
-                    // shot-completion flow (System State 5 → ModeAck). Capture
-                    // it so we don't block waiting for it after ConfigQuery.
-                    Message::ModeAck(_) => self.saw_mode_ack_during_drain = true,
                     _ => {}
-                }
-                vec![]
-            }
-            ShotStep::WaitingForConfigAckResp {
-                ref mut got_mode_ack,
-                ref mut got_config_resp,
-            } => {
-                match &env.message {
-                    Message::ModeAck(_) => *got_mode_ack = true,
-                    Message::ConfigResp(_) => *got_config_resp = true,
-                    _ => {}
-                }
-                if *got_mode_ack && *got_config_resp {
-                    self.step = ShotStep::WaitingForClubResult;
-                    return vec![Action::Send(Command::ShotResultReq, BusAddr::Avr)];
                 }
                 vec![]
             }
