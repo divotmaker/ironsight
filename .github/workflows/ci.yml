@@ -3,13 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-    tags:
-      - "v*.*.*"
   pull_request:
     branches: [main]
-
-permissions:
-  contents: write
 
 jobs:
   test:
@@ -18,43 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.94
-        with:
-          components: clippy
-
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy
-        run: cargo clippy --all-targets --features gvp
+        run: cargo clippy --all-targets --features gvp,frp
 
       - name: Run tests
-        run: cargo test --lib --features gvp
-
-  version-bump:
-    name: Version bump
-    needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-
-      - name: Bump to next patch version
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          MAJOR="${VERSION%%.*}"
-          REST="${VERSION#*.}"
-          MINOR="${REST%%.*}"
-          PATCH="${REST#*.}"
-          NEXT_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
-          sed -i "s/^version = \".*\"/version = \"${NEXT_VERSION}\"/" Cargo.toml
-          echo "NEXT_VERSION=${NEXT_VERSION}" >> "$GITHUB_ENV"
-
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml
-          git commit -m "chore: prepare for next release (${NEXT_VERSION})"
-          git push
+        run: cargo test --lib --features gvp,frp

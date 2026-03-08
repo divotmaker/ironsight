@@ -4,6 +4,8 @@ pub mod codec;
 pub mod conn;
 pub mod error;
 pub mod frame;
+#[cfg(feature = "frp")]
+pub mod frp;
 #[cfg(feature = "gvp")]
 pub mod gvp;
 pub mod protocol;

@@ -14,10 +14,13 @@ clients share the same `poll()` pattern:
   handshake, configuration, arming, keepalives, and shot detection.
 - **`GvpClient`** — GVP camera protocol (TCP port 1258, `gvp` feature). Handles
   trigger, trajectory hints, and ball tracker results.
+- **`FrpServer`** — [Flight Relay Protocol](https://github.com/flightrelay/spec)
+  device server (`frp` feature). Bridges `BinaryClient` shot data to any FRP
+  controller over WebSocket (port 5880).
 
-Both are generic over any `Read + Write` stream. Blocking convenience wrappers
-and low-level sequencer state machines are also available. No async runtime or
-heavyweight dependencies.
+Both clients are generic over any `Read + Write` stream. Blocking convenience
+wrappers and low-level sequencer state machines are also available. No async
+runtime or heavyweight dependencies.
 
 ## Legal Basis — DMCA Section 1201(f)
 
@@ -153,12 +156,33 @@ exposes the underlying pollable state machines. Each sequencer has `feed()`
 function runs any sequencer to completion on a blocking stream. See
 [`examples/event_loop.rs`](examples/event_loop.rs).
 
+### FRP device server
+
+The `frp` feature adds an FRP device server that makes the Mevo+ appear as a
+standard [FlightRelay](https://github.com/flightrelay/spec) device. Any FRP
+controller (flighthook, dashboards, etc.) can connect over WebSocket and receive
+shot data without knowing anything about the Mevo+ binary protocol.
+
+A standalone binary is included:
+
+```sh
+# Connect to Mevo+ at default address, serve FRP on port 5880
+cargo run --features frp --bin ironsight-frp
+
+# Custom addresses
+cargo run --features frp --bin ironsight-frp -- 192.168.2.1:5100 0.0.0.0:5880
+```
+
+Pre-built binaries for Linux and Windows are attached to each
+[GitHub release](https://github.com/divotmaker/ironsight/releases).
+
 ## Dependencies
 
 Minimal by design:
 
 - **`thiserror`** — error enum derives
-- **`serde`** (optional, behind `serde` feature) — serialization support
-- **`serde_json`** (optional, behind `gvp` feature) — camera protocol support
+- **`serde`** (optional, `serde` feature) — serialization support
+- **`serde_json`** (optional, `gvp` feature) — camera protocol support
+- **`flightrelay`** (optional, `frp` feature) — FRP WebSocket server
 
 No async runtime. No logging framework. Standard library TCP only.

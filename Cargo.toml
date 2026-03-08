@@ -2,7 +2,7 @@
 name = "ironsight"
 version = "0.0.12"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 description = "Client library for the FlightScope Mevo+ / Mevo Gen2 binary protocol"
 repository = "https://github.com/divotmaker/ironsight"
@@ -14,8 +14,15 @@ exclude = ["docs/"]
 [features]
 serde = ["dep:serde"]
 gvp = ["dep:serde", "dep:serde_json"]
+frp = ["dep:flightrelay"]
 
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+flightrelay = { version = "0.1", features = ["server"], optional = true }
+
+[[bin]]
+name = "ironsight-frp"
+path = "src/bin/ironsight-frp.rs"
+required-features = ["frp"]
