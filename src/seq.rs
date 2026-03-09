@@ -383,11 +383,11 @@ impl AvrSequencer {
     /// Check if a calibration step has timed out (optional responses).
     /// Call this periodically in the event loop.
     pub fn check_cal_timeout(&mut self) -> Vec<Action> {
-        if let Some(deadline) = self.cal_deadline {
-            if Instant::now() >= deadline {
-                self.cal_deadline = None;
-                return self.advance_past_cal();
-            }
+        if let Some(deadline) = self.cal_deadline
+            && Instant::now() >= deadline
+        {
+            self.cal_deadline = None;
+            return self.advance_past_cal();
         }
         vec![]
     }
@@ -1066,10 +1066,10 @@ impl Sequence for DisarmSequencer {
                     self.step = DisarmStep::WaitStateIdle;
                     return vec![];
                 }
-                if let Message::Text(ref t) = env.message {
-                    if t.text.contains("ARMED CANCELLED") {
-                        self.step = DisarmStep::WaitStateIdle;
-                    }
+                if let Message::Text(ref t) = env.message
+                    && t.text.contains("ARMED CANCELLED")
+                {
+                    self.step = DisarmStep::WaitStateIdle;
                 }
                 vec![]
             }
@@ -1077,10 +1077,10 @@ impl Sequence for DisarmSequencer {
                 // Wait for the DSP to report idle state. This arrives 0.5-3ms
                 // after "ARMED CANCELLED" and signals the device has fully
                 // completed the disarm transition.
-                if let Message::Text(ref t) = env.message {
-                    if t.text.contains("System State") {
-                        self.step = DisarmStep::Done;
-                    }
+                if let Message::Text(ref t) = env.message
+                    && t.text.contains("System State")
+                {
+                    self.step = DisarmStep::Done;
                 }
                 // Also accept ModeAck as completion — on some firmware
                 // versions MODE_RESET arrives after ARMED CANCELLED and
@@ -1402,14 +1402,14 @@ impl ShotSequencer {
         if !matches!(self.step, ShotStep::Draining) {
             return vec![];
         }
-        if let Some(deadline) = self.drain_deadline {
-            if Instant::now() >= deadline {
-                self.step = ShotStep::WaitingForArmAck;
-                return vec![Action::Send(
-                    Command::AvrConfigCmd(AvrConfigCmd { arm: true }),
-                    BusAddr::Avr,
-                )];
-            }
+        if let Some(deadline) = self.drain_deadline
+            && Instant::now() >= deadline
+        {
+            self.step = ShotStep::WaitingForArmAck;
+            return vec![Action::Send(
+                Command::AvrConfigCmd(AvrConfigCmd { arm: true }),
+                BusAddr::Avr,
+            )];
         }
         vec![]
     }

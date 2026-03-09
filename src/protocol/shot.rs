@@ -670,7 +670,7 @@ impl PrcData {
         let sub_count = payload[3] as usize;
 
         // Version 4: stride 60, (header - 3) % 60 == 0
-        let stride = if header >= 3 && (header - 3) % 60 == 0 {
+        let stride = if header >= 3 && (header - 3).is_multiple_of(60) {
             60
         } else {
             // Unsupported version, store as empty

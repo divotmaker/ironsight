@@ -264,35 +264,35 @@ impl<S: Read + Write> BinaryClient<S> {
     /// or operation timeout (except keepalive timeouts, which are non-fatal).
     pub fn poll(&mut self) -> Result<Option<BinaryEvent>, ConnError> {
         // 1. Check operation deadline.
-        if let Some(deadline) = self.op_deadline {
-            if Instant::now() >= deadline {
-                if matches!(self.active, Some(ActiveOp::Keepalive(_))) {
-                    // Keepalive timeout is non-fatal. Update last_keepalive
-                    // so we don't immediately re-queue another one.
-                    self.active = None;
-                    self.op_deadline = None;
-                    self.keepalive_queued = false;
-                    self.last_keepalive = Instant::now();
-                } else {
-                    return Err(ConnError::Timeout);
-                }
+        if let Some(deadline) = self.op_deadline
+            && Instant::now() >= deadline
+        {
+            if matches!(self.active, Some(ActiveOp::Keepalive(_))) {
+                // Keepalive timeout is non-fatal. Update last_keepalive
+                // so we don't immediately re-queue another one.
+                self.active = None;
+                self.op_deadline = None;
+                self.keepalive_queued = false;
+                self.last_keepalive = Instant::now();
+            } else {
+                return Err(ConnError::Timeout);
             }
         }
 
         // 2. Start next queued operation if idle.
-        if self.active.is_none() {
-            if let Some(queued) = self.queue.pop_front() {
-                self.start_op(queued)?;
-            }
+        if self.active.is_none()
+            && let Some(queued) = self.queue.pop_front()
+        {
+            self.start_op(queued)?;
         }
 
         // 3. AvrSequencer cal timeout check.
-        if let Some(ActiveOp::Handshake { ref mut phase, .. }) = self.active {
-            if let HandshakePhase::Avr(ref mut avr) = **phase {
-                let timeout_actions = avr.check_cal_timeout();
-                for a in timeout_actions {
-                    seq::send_action(&mut self.conn, a)?;
-                }
+        if let Some(ActiveOp::Handshake { ref mut phase, .. }) = self.active
+            && let HandshakePhase::Avr(ref mut avr) = **phase
+        {
+            let timeout_actions = avr.check_cal_timeout();
+            for a in timeout_actions {
+                seq::send_action(&mut self.conn, a)?;
             }
         }
 
@@ -382,12 +382,12 @@ impl<S: Read + Write> BinaryClient<S> {
         }
 
         // 10. Pre-PROCESSED shot data (E8 arrives between TRIGGER and PROCESSED).
-        if self.shot_in_progress {
-            if let Message::FlightResultV1(ref e8) = env.message {
-                return Ok(Some(BinaryEvent::ShotDatum(ShotDatum::FlightV1(
-                    e8.clone(),
-                ))));
-            }
+        if self.shot_in_progress
+            && let Message::FlightResultV1(ref e8) = env.message
+        {
+            return Ok(Some(BinaryEvent::ShotDatum(ShotDatum::FlightV1(
+                e8.clone(),
+            ))));
         }
 
         // 11. Unhandled message passthrough.

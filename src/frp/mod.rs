@@ -185,21 +185,21 @@ impl FrpServer {
             BinaryEvent::ShotComplete(data) => {
                 let mut events = Vec::new();
                 // Send any data not already sent via ShotDatum
-                if let Some(ref flight) = data.flight {
-                    if let Some(ref key) = self.current_key {
-                        events.push(FrpEvent::BallFlight {
-                            key: key.clone(),
-                            ball: convert::ball_flight(flight),
-                        });
-                    }
+                if let Some(ref flight) = data.flight
+                    && let Some(ref key) = self.current_key
+                {
+                    events.push(FrpEvent::BallFlight {
+                        key: key.clone(),
+                        ball: convert::ball_flight(flight),
+                    });
                 }
-                if let Some(ref club) = data.club {
-                    if let Some(ref key) = self.current_key {
-                        events.push(FrpEvent::ClubPath {
-                            key: key.clone(),
-                            club: convert::club_data(club),
-                        });
-                    }
+                if let Some(ref club) = data.club
+                    && let Some(ref key) = self.current_key
+                {
+                    events.push(FrpEvent::ClubPath {
+                        key: key.clone(),
+                        club: convert::club_data(club),
+                    });
                 }
                 if let Some(ref key) = self.current_key.take() {
                     events.push(FrpEvent::ShotFinished { key: key.clone() });
