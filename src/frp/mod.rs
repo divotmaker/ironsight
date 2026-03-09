@@ -103,9 +103,9 @@ impl FrpServer {
     pub fn check_controller(&mut self) -> Option<DetectionMode> {
         let conn = self.conn.as_mut()?;
         match conn.try_recv() {
-            Ok(Some(FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode }))) => {
-                Some(mode)
-            }
+            Ok(Some(FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+                mode, ..
+            }))) => mode,
             Err(flightrelay::FrpError::Closed) => {
                 self.conn = None;
                 None
@@ -147,7 +147,7 @@ impl FrpServer {
 
         let env = FrpEnvelope {
             device: self.device.clone(),
-            event: FrpEvent::DeviceInfo {
+            event: FrpEvent::DeviceTelemetry {
                 manufacturer: Some("FlightScope".to_owned()),
                 model: Some(model.to_owned()),
                 firmware: Some(handshake.dsp.dev_info.text.clone()),

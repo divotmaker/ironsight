@@ -20,7 +20,7 @@ frp = ["dep:flightrelay"]
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-flightrelay = { version = "0.1", features = ["server"], optional = true }
+flightrelay = { version = "0.1.7", features = ["server"], optional = true }
 
 [[bin]]
 name = "ironsight-frp"
