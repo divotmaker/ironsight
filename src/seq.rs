@@ -1328,6 +1328,12 @@ enum ShotStep {
     Done,
 }
 
+/// Duration to wait for IDLE after receiving flight data during drain.
+/// If the device doesn't send IDLE within this window (firmware bug on
+/// some Gen1 Mevo+ units), proceed directly to ARM without the redundant
+/// ShotResultReq — ClubResult already arrives during the drain phase.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Pollable state machine for post-shot handling.
 ///
 /// Created after receiving E5 "PROCESSED". Drives: ack → drain to IDLE →
@@ -1345,6 +1351,9 @@ pub struct ShotSequencer {
     /// Latest shot data message to yield to the caller. Set during drain
     /// when D4/ED/EF arrive; taken by `BinaryClient` after each `feed()`.
     pending: Option<ShotDatum>,
+    /// Deadline for drain phase. Set when FlightResult (D4) arrives.
+    /// If IDLE hasn't arrived by this time, skip directly to ARM.
+    drain_deadline: Option<Instant>,
 }
 
 impl ShotSequencer {
@@ -1355,6 +1364,7 @@ impl ShotSequencer {
             step: ShotStep::Draining,
             data: ShotData::default(),
             pending: None,
+            drain_deadline: None,
         };
         let actions = vec![
             Action::Send(Command::ShotDataAck, BusAddr::Avr),
@@ -1380,6 +1390,29 @@ impl ShotSequencer {
     pub fn take_pending(&mut self) -> Option<ShotDatum> {
         self.pending.take()
     }
+
+    /// Check if the drain phase has timed out waiting for IDLE.
+    ///
+    /// Some Gen1 Mevo+ firmware intermittently omits the IDLE message
+    /// after shot processing, leaving the sequencer stuck in Draining.
+    /// When the drain deadline expires, skip the redundant ShotResultReq
+    /// (ClubResult already accumulated during drain) and proceed directly
+    /// to ARM.
+    pub fn check_drain_timeout(&mut self) -> Vec<Action> {
+        if !matches!(self.step, ShotStep::Draining) {
+            return vec![];
+        }
+        if let Some(deadline) = self.drain_deadline {
+            if Instant::now() >= deadline {
+                self.step = ShotStep::WaitingForArmAck;
+                return vec![Action::Send(
+                    Command::AvrConfigCmd(AvrConfigCmd { arm: true }),
+                    BusAddr::Avr,
+                )];
+            }
+        }
+        vec![]
+    }
 }
 
 impl Sequence for ShotSequencer {
@@ -1402,6 +1435,9 @@ impl Sequence for ShotSequencer {
                     Message::FlightResult(r) => {
                         self.data.flight = Some(r.clone());
                         self.pending = Some(ShotDatum::Flight(r.clone()));
+                        if self.drain_deadline.is_none() {
+                            self.drain_deadline = Some(Instant::now() + DRAIN_TIMEOUT);
+                        }
                     }
                     Message::ClubResult(r) => {
                         self.data.club = Some(r.clone());

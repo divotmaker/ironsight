@@ -296,9 +296,20 @@ impl<S: Read + Write> BinaryClient<S> {
             }
         }
 
-        // 4. Auto-queue keepalive.
+        // 3b. Shot drain timeout — if IDLE never arrives after shot data,
+        //     skip ShotResultReq and proceed directly to ARM.
+        if let Some(ActiveOp::Shot(ref mut seq)) = self.active {
+            let timeout_actions = seq.check_drain_timeout();
+            for a in timeout_actions {
+                seq::send_action(&mut self.conn, a)?;
+            }
+        }
+
+        // 4. Auto-queue keepalive (suppress while shot is in progress —
+        //    BALL TRIGGER has fired but PROCESSED hasn't arrived yet).
         if self.keepalive_enabled
             && !self.keepalive_queued
+            && !self.shot_in_progress
             && self.last_keepalive.elapsed() >= self.keepalive_interval
         {
             self.queue.push_back(QueuedOp::Keepalive);
@@ -320,16 +331,35 @@ impl<S: Read + Write> BinaryClient<S> {
         }
 
         // 7. Feed active operation.
+        //
+        //    Keepalive gets special handling: only status responses
+        //    (DspStatus/AvrStatus/PiStatus) are fed to it. All other
+        //    messages skip the keepalive and fall through to shot
+        //    auto-detection (step 9). This mirrors FS Golf's native
+        //    getResponse() which only consumes messages matching the
+        //    expected response type. Without this, unsolicited shot
+        //    messages (BALL TRIGGER, PROCESSED, E8, etc.) that arrive
+        //    while a keepalive is in-flight would be silently consumed
+        //    and the shot would never be detected.
         if let Some(ref mut active) = self.active {
-            match Self::feed_active(active, &env, &mut self.conn)? {
-                FeedResult::Consumed => return Ok(None),
-                FeedResult::Intermediate(event) => return Ok(Some(*event)),
-                FeedResult::PhaseComplete => return self.advance_phase(),
-                FeedResult::Done => return self.finish_op(),
+            let dominated = matches!(active, ActiveOp::Keepalive(_))
+                && !matches!(
+                    (&env.message, env.src),
+                    (Message::DspStatus(_), BusAddr::Dsp)
+                        | (Message::AvrStatus(_), BusAddr::Avr)
+                        | (Message::PiStatus(_), BusAddr::Pi)
+                );
+            if !dominated {
+                match Self::feed_active(active, &env, &mut self.conn)? {
+                    FeedResult::Consumed => return Ok(None),
+                    FeedResult::Intermediate(event) => return Ok(Some(*event)),
+                    FeedResult::PhaseComplete => return self.advance_phase(),
+                    FeedResult::Done => return self.finish_op(),
+                }
             }
         }
 
-        // 8. No active op — shot auto-detection.
+        // 9. No active op — shot auto-detection.
         if let Message::ShotText(ref st) = env.message {
             if st.is_trigger() {
                 self.shot_in_progress = true;
@@ -341,13 +371,17 @@ impl<S: Read + Write> BinaryClient<S> {
                 for a in actions {
                     seq::send_action(&mut self.conn, a)?;
                 }
+                // May overwrite an in-flight keepalive that was
+                // dominated — reset its queued flag so future
+                // keepalives aren't permanently suppressed.
+                self.keepalive_queued = false;
                 self.active = Some(ActiveOp::Shot(Box::new(seq)));
                 self.op_deadline = Some(Instant::now() + self.op_timeout);
                 return Ok(None);
             }
         }
 
-        // 9. Pre-PROCESSED shot data (E8 arrives between TRIGGER and PROCESSED).
+        // 10. Pre-PROCESSED shot data (E8 arrives between TRIGGER and PROCESSED).
         if self.shot_in_progress {
             if let Message::FlightResultV1(ref e8) = env.message {
                 return Ok(Some(BinaryEvent::ShotDatum(ShotDatum::FlightV1(
@@ -356,7 +390,7 @@ impl<S: Read + Write> BinaryClient<S> {
             }
         }
 
-        // 10. Unhandled message passthrough.
+        // 11. Unhandled message passthrough.
         Ok(Some(BinaryEvent::Message(env)))
     }
 
