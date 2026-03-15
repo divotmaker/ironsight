@@ -1,5 +1,9 @@
 # ironsight
 
+[![CI](https://github.com/divotmaker/ironsight/actions/workflows/ci.yml/badge.svg)](https://github.com/divotmaker/ironsight/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/ironsight.svg)](https://crates.io/crates/ironsight)
+[![docs.rs](https://docs.rs/ironsight/badge.svg)](https://docs.rs/ironsight)
+
 ## Disclaimer
 
 This project is not affiliated with or endorsed by FlightScope (Pty) Ltd.
