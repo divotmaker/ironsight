@@ -8,9 +8,11 @@ use crate::protocol::shot::{ClubResult, FlightResult};
 /// Convert a [`FlightResult`] (0xD4) to an FRP [`BallFlight`].
 #[must_use]
 pub fn ball_flight(f: &FlightResult) -> BallFlight {
+    // Wire sign convention (DSP) is opposite FRP for azimuth and sidespin.
+    // Wire: neg=right, neg=slice(RH). FRP: pos=right, pos=slice(RH).
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(f.launch_speed)),
-        launch_azimuth: Some(f.launch_azimuth),
+        launch_azimuth: Some(-f.launch_azimuth),
         launch_elevation: Some(f.launch_elevation),
         carry_distance: Some(Distance::Meters(f.carry_distance)),
         total_distance: if f.total_distance != 0.0 {
@@ -26,22 +28,24 @@ pub fn ball_flight(f: &FlightResult) -> BallFlight {
         max_height: Some(Distance::Meters(f.max_height)),
         flight_time: Some(f.flight_time),
         backspin_rpm: Some(f.backspin_rpm),
-        sidespin_rpm: Some(f.sidespin_rpm),
+        sidespin_rpm: Some(-f.sidespin_rpm),
     }
 }
 
 /// Convert a [`ClubResult`] (0xED) to FRP [`ClubData`].
 #[must_use]
 pub fn club_data(c: &ClubResult) -> ClubData {
+    // Wire sign convention (DSP) is opposite FRP for path, face angle,
+    // and swing plane horizontal. DSP→PC negation per PROTOCOL.md §4.3.3.
     ClubData {
         club_speed: Some(Velocity::MetersPerSecond(c.pre_club_speed)),
         club_speed_post: Some(Velocity::MetersPerSecond(c.post_club_speed)),
-        path: Some(c.strike_direction),
+        path: Some(-c.strike_direction),
         attack_angle: Some(c.attack_angle),
-        face_angle: Some(c.face_angle),
+        face_angle: Some(-c.face_angle),
         dynamic_loft: Some(c.dynamic_loft),
         smash_factor: Some(c.smash_factor),
-        swing_plane_horizontal: Some(c.swing_plane_horizontal),
+        swing_plane_horizontal: Some(-c.swing_plane_horizontal),
         swing_plane_vertical: Some(c.swing_plane_vertical),
         club_offset: Some(Distance::Meters(c.club_offset)),
         club_height: Some(Distance::Meters(c.club_height)),
@@ -91,7 +95,8 @@ mod tests {
         assert_eq!(ball.launch_speed, Some(Velocity::MetersPerSecond(67.2)));
         assert_eq!(ball.carry_distance, Some(Distance::Meters(180.5)));
         assert_eq!(ball.backspin_rpm, Some(3200));
-        assert_eq!(ball.sidespin_rpm, Some(-450));
+        assert_eq!(ball.launch_azimuth, Some(1.3)); // wire -1.3 (neg=right) → FRP +1.3
+        assert_eq!(ball.sidespin_rpm, Some(450)); // wire -450 (neg=slice) → FRP +450
         // total_distance is 0.0 → None
         assert_eq!(ball.total_distance, None);
     }
@@ -124,7 +129,8 @@ mod tests {
 
         let data = club_data(&club);
         assert_eq!(data.club_speed, Some(Velocity::MetersPerSecond(42.1)));
-        assert_eq!(data.path, Some(-2.1));
+        assert_eq!(data.path, Some(2.1)); // wire -2.1 negated → FRP +2.1
+        assert_eq!(data.face_angle, Some(-1.2)); // wire +1.2 negated → FRP -1.2
         assert_eq!(data.smash_factor, Some(1.50));
     }
 }
