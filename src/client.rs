@@ -164,6 +164,12 @@ const DEFAULT_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Maximum time between TRIGGER and PROCESSED before we give up on the
+/// shot and resume keepalives. Without this, a lost PROCESSED message
+/// permanently suppresses keepalives (shot_in_progress stuck true),
+/// which prevents staleness detection from firing.
+const TRIGGER_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // BinaryClient
 // ---------------------------------------------------------------------------
@@ -221,6 +227,9 @@ pub struct BinaryClient<S: Read + Write> {
     /// pre-PROCESSED messages (E8) are intercepted and yielded as
     /// `ShotDatum` events instead of passing through as `Message`.
     shot_in_progress: bool,
+    /// When `shot_in_progress` was set. Used by the trigger watchdog to
+    /// detect a missing PROCESSED and resume keepalives.
+    trigger_time: Option<Instant>,
 }
 
 impl<S: Read + Write> BinaryClient<S> {
@@ -249,6 +258,7 @@ impl<S: Read + Write> BinaryClient<S> {
             device: None,
             armed: false,
             shot_in_progress: false,
+            trigger_time: None,
         }
     }
 
@@ -303,6 +313,18 @@ impl<S: Read + Write> BinaryClient<S> {
             for a in timeout_actions {
                 seq::send_action(&mut self.conn, a)?;
             }
+        }
+
+        // 3c. Trigger watchdog — if TRIGGER fired but PROCESSED never
+        //     arrived, the session is bad. Return Timeout to force
+        //     reconnect rather than leaving keepalives suppressed.
+        if self.shot_in_progress
+            && !matches!(self.active, Some(ActiveOp::Shot(_)))
+            && self
+                .trigger_time
+                .is_some_and(|t| t.elapsed() >= TRIGGER_TIMEOUT)
+        {
+            return Err(ConnError::Timeout);
         }
 
         // 4. Auto-queue keepalive (suppress while shot is in progress —
@@ -363,10 +385,12 @@ impl<S: Read + Write> BinaryClient<S> {
         if let Message::ShotText(ref st) = env.message {
             if st.is_trigger() {
                 self.shot_in_progress = true;
+                self.trigger_time = Some(Instant::now());
                 self.armed = false;
                 return Ok(Some(BinaryEvent::Trigger));
             }
             if st.is_processed() {
+                self.trigger_time = None;
                 let (seq, actions) = ShotSequencer::new();
                 for a in actions {
                     seq::send_action(&mut self.conn, a)?;
@@ -694,6 +718,7 @@ impl<S: Read + Write> BinaryClient<S> {
             ActiveOp::Shot(seq) => {
                 self.armed = true;
                 self.shot_in_progress = false;
+                self.trigger_time = None;
                 self.last_keepalive = Instant::now();
                 Ok(Some(BinaryEvent::ShotComplete(Box::new(seq.into_result()))))
             }
