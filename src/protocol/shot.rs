@@ -79,7 +79,11 @@ pub struct FlightResult {
 impl FlightResult {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 157 {
-            return Err(WireError::payload_too_short("FlightResult", 157, payload.len()));
+            return Err(WireError::payload_too_short(
+                "FlightResult",
+                157,
+                payload.len(),
+            ));
         }
 
         let poly_scale = codec::read_int24(payload, 109)?;
@@ -204,7 +208,11 @@ pub struct FlightResultV1 {
 impl FlightResultV1 {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 94 {
-            return Err(WireError::payload_too_short("FlightResultV1", 94, payload.len()));
+            return Err(WireError::payload_too_short(
+                "FlightResultV1",
+                94,
+                payload.len(),
+            ));
         }
 
         let poly_scale = codec::read_int24(payload, 46)?;
@@ -304,7 +312,11 @@ pub struct ClubResult {
 impl ClubResult {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 167 {
-            return Err(WireError::payload_too_short("ClubResult", 167, payload.len()));
+            return Err(WireError::payload_too_short(
+                "ClubResult",
+                167,
+                payload.len(),
+            ));
         }
 
         let poly_scale = codec::read_int24(payload, 47)?;
@@ -424,7 +436,11 @@ pub struct SpinResult {
 impl SpinResult {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 138 {
-            return Err(WireError::payload_too_short("SpinResult", 138, payload.len()));
+            return Err(WireError::payload_too_short(
+                "SpinResult",
+                138,
+                payload.len(),
+            ));
         }
 
         let version = payload[0];
@@ -581,7 +597,11 @@ pub struct TrackingStatus {
 impl TrackingStatus {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 82 {
-            return Err(WireError::payload_too_short("TrackingStatus", 82, payload.len()));
+            return Err(WireError::payload_too_short(
+                "TrackingStatus",
+                82,
+                payload.len(),
+            ));
         }
 
         Ok(Self {
@@ -773,9 +793,7 @@ impl ClubPrc {
     /// Decode from a response payload. First byte is data_len, rest is sub-records.
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.is_empty() {
-            return Ok(Self {
-                points: Vec::new(),
-            });
+            return Ok(Self { points: Vec::new() });
         }
 
         let data_len = payload[0] as usize;
@@ -855,10 +873,7 @@ impl ShotText {
             .iter()
             .rposition(|&b| b >= 0x20)
             .map_or(0, |p| p + 1);
-        let start = payload[..end]
-            .iter()
-            .position(|&b| b >= 0x20)
-            .unwrap_or(0);
+        let start = payload[..end].iter().position(|&b| b >= 0x20).unwrap_or(0);
         Ok(Self {
             text: String::from_utf8_lossy(&payload[start..end]).into_owned(),
         })

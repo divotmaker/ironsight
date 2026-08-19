@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::process;
 use std::time::{Duration, Instant};
 
+use ironsight::BinaryConnection;
 use ironsight::client::{BinaryClient, BinaryEvent};
 use ironsight::conn::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
@@ -15,7 +16,6 @@ use ironsight::protocol::config::{
     MODE_CHIPPING, MODE_OUTDOOR, MODE_PUTTING, ParamData, ParamValue, RadarCal,
 };
 use ironsight::seq::AvrSettings;
-use ironsight::BinaryConnection;
 
 // ── Test steps ───────────────────────────────────────────────────────────────
 
@@ -125,7 +125,11 @@ fn run() -> Result<(), ironsight::ConnError> {
                     .dsp
                     .as_ref()
                     .map(|d| format!("bat={}%", d.battery_percent()));
-                println!("  [keepalive] OK — {} {}", dsp.unwrap_or_default(), avr.unwrap_or_default());
+                println!(
+                    "  [keepalive] OK — {} {}",
+                    dsp.unwrap_or_default(),
+                    avr.unwrap_or_default()
+                );
 
                 // Transition: first mode change outdoor → chipping
                 step = Step::ModeChange1;

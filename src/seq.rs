@@ -591,7 +591,10 @@ enum PiStep {
     WaitNetConfig,
     WaitNetConfigPw,
     /// Waiting for batch of ParamReadReq responses.
-    WaitParams { ids: Vec<u8>, idx: usize },
+    WaitParams {
+        ids: Vec<u8>,
+        idx: usize,
+    },
     Done,
 }
 
@@ -707,9 +710,7 @@ impl Sequence for PiSequencer {
                     self.ssid = parts.next().unwrap_or("").to_string();
                     self.password = parts.next().unwrap_or("").to_string();
                     // Start the param read batches
-                    let ids = vec![
-                        0x01, 0x07, 0x08, 0x09, 0x06, 0x0B, 0x03, 0x04, 0x05,
-                    ];
+                    let ids = vec![0x01, 0x07, 0x08, 0x09, 0x06, 0x0B, 0x03, 0x04, 0x05];
                     self.step = PiStep::WaitParams { ids, idx: 0 };
                     return vec![Action::Send(
                         Command::ParamReadReq(ParamReadReq { param_id: 0x01 }),
@@ -730,9 +731,7 @@ impl Sequence for PiSequencer {
                     }
                     let next_id = ids[*idx];
                     return vec![Action::Send(
-                        Command::ParamReadReq(ParamReadReq {
-                            param_id: next_id,
-                        }),
+                        Command::ParamReadReq(ParamReadReq { param_id: next_id }),
                         BusAddr::Pi,
                     )];
                 }
@@ -769,9 +768,13 @@ enum AvrConfigStep {
     /// Wait for leading B0[01 00] config-gate ACK before first param.
     WaitInitGateAck,
     /// Send next param, wait for ConfigAck.
-    WaitParamAck { param_idx: usize },
+    WaitParamAck {
+        param_idx: usize,
+    },
     /// Wait for B0 commit ConfigAck after param write.
-    WaitParamCommitAck { param_idx: usize },
+    WaitParamCommitAck {
+        param_idx: usize,
+    },
     /// Wait for ModeSet echo.
     WaitModeEcho,
     /// Wait for B0 commit after ModeSet.
@@ -877,10 +880,7 @@ impl Sequence for AvrConfigSequencer {
                 if let Message::ConfigAck(_) = env.message {
                     if let Some(ref cal) = self.settings.radar_cal {
                         self.step = AvrConfigStep::WaitRadarCalEcho;
-                        return vec![Action::Send(
-                            Command::RadarCal(cal.clone()),
-                            BusAddr::Avr,
-                        )];
+                        return vec![Action::Send(Command::RadarCal(cal.clone()), BusAddr::Avr)];
                     }
                     // No RadarCal — skip to done (mode changes don't need it).
                     self.step = AvrConfigStep::Done;
@@ -1111,7 +1111,10 @@ enum ArmStep {
     /// After ConfigAck, wait for both PiStatus and "ARMED" text.
     /// On older firmware PiStatus arrives first; on BM17.04 (Jan 2026)
     /// the "ARMED DetectionMode=N" text arrives before PiStatus.
-    WaitPiAndArmed { got_pi: bool, got_armed: bool },
+    WaitPiAndArmed {
+        got_pi: bool,
+        got_armed: bool,
+    },
     Done,
 }
 
@@ -1689,10 +1692,7 @@ pub fn keepalive(conn: &mut Connection) -> Result<KeepaliveStatus, ConnError> {
 ///
 /// Called after receiving E5 "PROCESSED". Drives: ack → drain to IDLE →
 /// ConfigQuery → ShotResultReq → ARM → wait ARMED.
-pub fn complete_shot(
-    conn: &mut Connection,
-    log: impl Fn(&str),
-) -> Result<ShotData, ConnError> {
+pub fn complete_shot(conn: &mut Connection, log: impl Fn(&str)) -> Result<ShotData, ConnError> {
     conn.stream_mut()
         .set_read_timeout(Some(Duration::from_millis(100)))?;
     log("waiting for IDLE...");

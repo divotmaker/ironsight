@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use ironsight::conn::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
-use ironsight::protocol::config::{ParamData, ParamValue, RadarCal, MODE_CHIPPING};
+use ironsight::protocol::config::{MODE_CHIPPING, ParamData, ParamValue, RadarCal};
 use ironsight::seq::{self, Action, AvrSettings, AvrSync, DspSync, PiSync, ShotSequencer};
 use ironsight::{BinaryConnection, ConnError, Message, Sequence};
 

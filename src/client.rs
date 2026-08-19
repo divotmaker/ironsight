@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 
 use crate::addr::BusAddr;
 use crate::conn::{BinaryConnection, ConnError, Envelope};
+use crate::protocol::Message;
 use crate::protocol::camera::CamConfig;
 use crate::protocol::status::{AvrStatus, DspStatus, PiStatus};
-use crate::protocol::Message;
 use crate::seq::{
     self, Action, ArmSequencer, AvrConfigSequencer, AvrSequencer, AvrSettings, AvrSync,
     CameraConfigSequencer, DisarmSequencer, DspSequencer, DspSync, PiSequencer, PiSync, Sequence,
@@ -619,7 +619,9 @@ impl<S: Read + Write> BinaryClient<S> {
                 if seq.is_complete() {
                     Ok(FeedResult::Done)
                 } else if let Some(datum) = seq.take_pending() {
-                    Ok(FeedResult::Intermediate(Box::new(BinaryEvent::ShotDatum(datum))))
+                    Ok(FeedResult::Intermediate(Box::new(BinaryEvent::ShotDatum(
+                        datum,
+                    ))))
                 } else {
                     Ok(FeedResult::Consumed)
                 }
@@ -764,4 +766,3 @@ impl BinaryClient<TcpStream> {
         Ok(Self::new(conn))
     }
 }
-

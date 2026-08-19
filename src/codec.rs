@@ -24,7 +24,8 @@ pub fn read_uint16(data: &[u8], offset: usize) -> Result<u16> {
 /// Read a big-endian signed 24-bit integer (sign-extended to i32).
 pub fn read_int24(data: &[u8], offset: usize) -> Result<i32> {
     check_len(data, offset, 3, "INT24")?;
-    let raw = ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | data[offset + 2] as u32;
+    let raw =
+        ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | data[offset + 2] as u32;
     // Sign-extend from 24 bits
     Ok(if raw >= 0x80_0000 {
         raw as i32 - 0x100_0000
@@ -165,7 +166,11 @@ pub fn write_float40(buf: &mut Vec<u8>, value: f64) {
 
 fn check_len(data: &[u8], offset: usize, need: usize, name: &'static str) -> Result<()> {
     if data.len() < offset + need {
-        Err(WireError::payload_too_short(name, offset + need, data.len()))
+        Err(WireError::payload_too_short(
+            name,
+            offset + need,
+            data.len(),
+        ))
     } else {
         Ok(())
     }
@@ -262,10 +267,7 @@ mod tests {
         // 0.0254: exp=-5 (0xFFFB), mant=6818274 (0x6809E2)
         let data = [0xFF, 0xFB, 0x68, 0x09, 0xE2];
         let val = read_float40(&data, 0).unwrap();
-        assert!(
-            (val - 0.0254).abs() < 1e-6,
-            "expected 0.0254, got {val}"
-        );
+        assert!((val - 0.0254).abs() < 1e-6, "expected 0.0254, got {val}");
     }
 
     #[test]

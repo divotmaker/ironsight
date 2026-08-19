@@ -16,7 +16,8 @@ const PCAP_TRIGGER: &str = r##"{"epochTime":1771985855.931274,"frameNumber":0,"g
 
 const PCAP_CONFIG: &str = r##"{"bufferConfiguration":{"bufferSizePostTrigger":0,"bufferSizePreTrigger":0},"cameraCalibration":{"cx":0,"cy":0,"distCoeffs":[0,0,0,0,0,0,0,0],"fx":0,"fy":0,"height":0,"position":[0,0,0],"rotation":[0,0,0],"width":0},"cameraConfiguration":{"ROI_height":480,"ROI_maxHeight":0,"ROI_maxWidth":0,"ROI_width":640,"ROI_x":0,"ROI_y":0,"isFreeRun":true,"rotationDegCW":0},"frameNumberInfoEnabled":true,"livePreviewProcessingConfiguration":{"ROI_center_u":0,"ROI_center_v":0,"ROI_height":0,"ROI_width":0,"enabled":false,"rotationDegCW":0},"loggingEnabled":true,"saveVideosEnabled":true,"type":"CONFIG","version":5}"##;
 
-const PCAP_STATUS: &str = r##"{"bufferStatus":[{"bufferIndex":0,"status":"TRIGGERED"}],"type":"STATUS","version":1}"##;
+const PCAP_STATUS: &str =
+    r##"{"bufferStatus":[{"bufferIndex":0,"status":"TRIGGERED"}],"type":"STATUS","version":1}"##;
 
 const PCAP_LOG: &str = r##"{"level":1,"message":"[GVP][2026-02-25 04:17:36.122][173.07/743.766MB][GolfVideoProcessor] Requesting trigger {b39aaf63-edda-42e4-a823-fdcd0d601871} at frame 0","type":"LOG","version":1}"##;
 
@@ -293,7 +294,7 @@ fn config_request_encode_decode_round_trip() {
 
 #[test]
 fn trigger_encode_decode_round_trip() {
-    use ironsight::gvp::{trigger::Trigger, GvpCommand};
+    use ironsight::gvp::{GvpCommand, trigger::Trigger};
 
     let trig = Trigger::new("{test-guid-123}".into(), 1771985855.931274);
     let cmd = GvpCommand::Trigger(trig);
@@ -315,7 +316,7 @@ fn trigger_encode_decode_round_trip() {
 
 #[test]
 fn config_encode_decode_round_trip() {
-    use ironsight::gvp::{config::GvpConfig, GvpCommand};
+    use ironsight::gvp::{GvpCommand, config::GvpConfig};
 
     let cfg = GvpConfig::fusion();
     let cmd = GvpCommand::Config(cfg.clone());

@@ -198,12 +198,7 @@ fn fit_track_polynomials(
     (poly_fit_4(&ts, &us), poly_fit_4(&ts, &vs))
 }
 
-fn make_poly_radius(
-    poly_x: &[f64],
-    object_radius: f64,
-    range_m: f64,
-    start_time: f64,
-) -> [f64; 5] {
+fn make_poly_radius(poly_x: &[f64], object_radius: f64, range_m: f64, start_time: f64) -> [f64; 5] {
     let x0 = (range_m + eval_poly(poly_x, start_time)).max(0.1);
     let r0 = CAM_FX * object_radius / x0;
     [1.0, r0, r0 * 0.15, 0.0, 0.0]
@@ -283,7 +278,12 @@ fn compute_trajectory_hints(
             let club_pz = [cz[0], cz[1], cz[2], 0.0, 0.0];
 
             let (poly_u, poly_v) = fit_track_polynomials(
-                &club_px, &club_py, &club_pz, range_m, start_time, BALL_DURATION,
+                &club_px,
+                &club_py,
+                &club_pz,
+                range_m,
+                start_time,
+                BALL_DURATION,
             );
             let poly_r = make_poly_radius(&club_px, CLUB_RADIUS_M, range_m, start_time);
 
@@ -303,12 +303,7 @@ fn compute_trajectory_hints(
             start_time,
             poly_u: ball_poly_u,
             poly_v: ball_poly_v,
-            poly_radius: make_poly_radius(
-                &flight.poly_x,
-                CLUB_RADIUS_M,
-                range_m,
-                start_time,
-            ),
+            poly_radius: make_poly_radius(&flight.poly_x, CLUB_RADIUS_M, range_m, start_time),
         })
     };
 
@@ -333,10 +328,7 @@ fn compute_trajectory_hints(
 }
 
 fn print_shot_summary(shot_num: u32, data: &ShotData) {
-    let has_club_data = data
-        .club
-        .as_ref()
-        .is_some_and(|c| c.dynamic_loft != 0.0);
+    let has_club_data = data.club.as_ref().is_some_and(|c| c.dynamic_loft != 0.0);
     let is_full = data.flight.is_some() && data.spin.is_some() && has_club_data;
 
     let title = if is_full {
@@ -362,10 +354,7 @@ fn print_shot_summary(shot_num: u32, data: &ShotData) {
 
     if let Some(ref f) = data.flight {
         println!();
-        println!(
-            "  Ball Speed   {:>7.1} mph",
-            ms_to_mph(f.launch_speed),
-        );
+        println!("  Ball Speed   {:>7.1} mph", ms_to_mph(f.launch_speed),);
         if has_club_data {
             let c = data.club.as_ref().unwrap();
             println!(
@@ -427,8 +416,7 @@ fn print_gvp_event(event: &GvpEvent) {
         GvpEvent::Config(cfg) => {
             println!(
                 "  [gvp] CONFIG: {}x{}",
-                cfg.camera_configuration.roi_width,
-                cfg.camera_configuration.roi_height,
+                cfg.camera_configuration.roi_width, cfg.camera_configuration.roi_height,
             );
         }
         GvpEvent::Status(s) => {
@@ -448,15 +436,20 @@ fn print_gvp_event(event: &GvpEvent) {
                 };
                 println!(
                     "  [gvp]   trackId={} ({}) points={}",
-                    track.track_id, label, track.len(),
+                    track.track_id,
+                    label,
+                    track.len(),
                 );
                 if !track.is_empty() {
                     if track.track_id <= 1 {
                         for i in 0..track.len() {
                             println!(
                                 "  [gvp]     [{:>2}] f={:<3} u={:>7.2} v={:>7.2} r={:>5.1} shutter={:.3}ms",
-                                i, track.frame_number[i],
-                                track.u[i], track.v[i], track.radius[i],
+                                i,
+                                track.frame_number[i],
+                                track.u[i],
+                                track.v[i],
+                                track.radius[i],
                                 track.shutter_time_ms[i],
                             );
                         }
@@ -543,7 +536,9 @@ fn main() {
 
 fn run() -> Result<(), ConnError> {
     let binary_addr: SocketAddr = DEFAULT_ADDR.parse().unwrap();
-    let gvp_addr: SocketAddr = format!("{}:{DEFAULT_PORT}", binary_addr.ip()).parse().unwrap();
+    let gvp_addr: SocketAddr = format!("{}:{DEFAULT_PORT}", binary_addr.ip())
+        .parse()
+        .unwrap();
 
     // --- Blocking setup: handshake + configure + camera startup -----------
     // These require blocking send/recv and cannot go through BinaryClient.
@@ -684,96 +679,94 @@ fn run() -> Result<(), ConnError> {
                     println!("=== Re-armed ===\n");
                 }
 
-                BinaryEvent::Message(env) => {
-                    match env.message {
-                        Message::FlightResult(ref r) => {
-                            println!(
-                                "  Flight (shot #{}): ball={:.1}mph club={:.1}mph VLA={:.1}° carry={:.0}yd",
-                                r.total,
-                                ms_to_mph(r.launch_speed),
-                                ms_to_mph(r.clubhead_speed),
-                                r.launch_elevation,
-                                r.carry_distance * 1.09361,
-                            );
-                            println!(
-                                "    face={:.1}° loft={:.1}° path={:.1}° AoA={:.1}°",
-                                r.club_face_angle,
-                                r.club_effective_loft,
-                                r.club_strike_direction,
-                                r.club_attack_angle,
-                            );
+                BinaryEvent::Message(env) => match env.message {
+                    Message::FlightResult(ref r) => {
+                        println!(
+                            "  Flight (shot #{}): ball={:.1}mph club={:.1}mph VLA={:.1}° carry={:.0}yd",
+                            r.total,
+                            ms_to_mph(r.launch_speed),
+                            ms_to_mph(r.clubhead_speed),
+                            r.launch_elevation,
+                            r.carry_distance * 1.09361,
+                        );
+                        println!(
+                            "    face={:.1}° loft={:.1}° path={:.1}° AoA={:.1}°",
+                            r.club_face_angle,
+                            r.club_effective_loft,
+                            r.club_strike_direction,
+                            r.club_attack_angle,
+                        );
 
-                            let hints = compute_trajectory_hints(
-                                r,
-                                pending_club.as_ref(),
-                                &shot_guid,
-                                range_m,
-                                prc_start_time,
-                            );
-                            send_gvp_hints(&mut gvp, &hints);
-                            hints_sent = true;
-                        }
-
-                        Message::ClubResult(ref r) => {
-                            println!(
-                                "  Club: speed={:.1}mph smash={:.2} low_point={:.1}in pre_impact={:.3}ms",
-                                ms_to_mph(r.pre_club_speed),
-                                r.smash_factor,
-                                m_to_in(r.club_offset),
-                                r.pre_impact_time,
-                            );
-                            pending_club = Some(r.clone());
-                        }
-
-                        Message::SpinResult(ref r) => {
-                            println!(
-                                "  Spin: total={}rpm axis={:.1}°",
-                                r.pm_spin_final, r.spin_axis
-                            );
-                        }
-
-                        Message::PrcData(ref r) => {
-                            if prc_start_time.is_none() && !r.points.is_empty() {
-                                let t = f64::from(r.points[0].time) * 26.7e-6;
-                                prc_start_time = Some(t);
-                                println!(
-                                    "  PRC: seq={} points={} startTime={:.6}s (tick={})",
-                                    r.sequence,
-                                    r.points.len(),
-                                    t,
-                                    r.points[0].time
-                                );
-                            } else {
-                                println!("  PRC: seq={} points={}", r.sequence, r.points.len());
-                            }
-                        }
-
-                        Message::ClubPrc(ref r) => {
-                            println!("  Club PRC: points={}", r.points.len());
-                        }
-
-                        Message::CamImageAvail(ref r) => {
-                            println!(
-                                "  Camera: streaming={} fusion={} video={}",
-                                r.streaming_available, r.fusion_available, r.video_available,
-                            );
-                        }
-
-                        Message::FlightResultV1(ref r) => {
-                            println!(
-                                "  FlightV1: ball={:.1}mph VLA={:.1}° dist={:.0}yd",
-                                ms_to_mph(r.ball_velocity),
-                                r.elevation,
-                                r.distance * 1.09361,
-                            );
-                        }
-
-                        Message::Unknown { type_id, .. } => {
-                            println!("  [unknown msg 0x{type_id:02X}]");
-                        }
-                        _ => {}
+                        let hints = compute_trajectory_hints(
+                            r,
+                            pending_club.as_ref(),
+                            &shot_guid,
+                            range_m,
+                            prc_start_time,
+                        );
+                        send_gvp_hints(&mut gvp, &hints);
+                        hints_sent = true;
                     }
-                }
+
+                    Message::ClubResult(ref r) => {
+                        println!(
+                            "  Club: speed={:.1}mph smash={:.2} low_point={:.1}in pre_impact={:.3}ms",
+                            ms_to_mph(r.pre_club_speed),
+                            r.smash_factor,
+                            m_to_in(r.club_offset),
+                            r.pre_impact_time,
+                        );
+                        pending_club = Some(r.clone());
+                    }
+
+                    Message::SpinResult(ref r) => {
+                        println!(
+                            "  Spin: total={}rpm axis={:.1}°",
+                            r.pm_spin_final, r.spin_axis
+                        );
+                    }
+
+                    Message::PrcData(ref r) => {
+                        if prc_start_time.is_none() && !r.points.is_empty() {
+                            let t = f64::from(r.points[0].time) * 26.7e-6;
+                            prc_start_time = Some(t);
+                            println!(
+                                "  PRC: seq={} points={} startTime={:.6}s (tick={})",
+                                r.sequence,
+                                r.points.len(),
+                                t,
+                                r.points[0].time
+                            );
+                        } else {
+                            println!("  PRC: seq={} points={}", r.sequence, r.points.len());
+                        }
+                    }
+
+                    Message::ClubPrc(ref r) => {
+                        println!("  Club PRC: points={}", r.points.len());
+                    }
+
+                    Message::CamImageAvail(ref r) => {
+                        println!(
+                            "  Camera: streaming={} fusion={} video={}",
+                            r.streaming_available, r.fusion_available, r.video_available,
+                        );
+                    }
+
+                    Message::FlightResultV1(ref r) => {
+                        println!(
+                            "  FlightV1: ball={:.1}mph VLA={:.1}° dist={:.0}yd",
+                            ms_to_mph(r.ball_velocity),
+                            r.elevation,
+                            r.distance * 1.09361,
+                        );
+                    }
+
+                    Message::Unknown { type_id, .. } => {
+                        println!("  [unknown msg 0x{type_id:02X}]");
+                    }
+                    _ => {}
+                },
 
                 BinaryEvent::Configured
                 | BinaryEvent::Disarmed
@@ -798,10 +791,7 @@ fn run() -> Result<(), ConnError> {
 }
 
 /// Send trajectory hints to GVP.
-fn send_gvp_hints(
-    gvp: &mut GvpClient<std::net::TcpStream>,
-    hints: &TrajectoryHints,
-) {
+fn send_gvp_hints(gvp: &mut GvpClient<std::net::TcpStream>, hints: &TrajectoryHints) {
     if let Some(ref club_track) = hints.club_track {
         println!("[gvp] Sending EXPECTED_CLUB_TRACK");
         let _ = gvp.send_club_track(club_track);

@@ -8,12 +8,12 @@ use std::net::SocketAddr;
 use std::process;
 use std::time::Duration;
 
+use ironsight::BinaryConnection;
 use ironsight::client::{BinaryClient, BinaryEvent};
 use ironsight::conn::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
-use ironsight::protocol::config::{ParamData, ParamValue, RadarCal, MODE_CHIPPING};
+use ironsight::protocol::config::{MODE_CHIPPING, ParamData, ParamValue, RadarCal};
 use ironsight::seq::AvrSettings;
-use ironsight::BinaryConnection;
 
 fn ms_to_mph(ms: f64) -> f64 {
     ms * 2.23694
@@ -107,9 +107,7 @@ fn run() -> Result<(), ironsight::ConnError> {
                 BinaryEvent::Disarmed => {
                     println!("\n=== Disarmed ===");
                 }
-                BinaryEvent::ShotDatum(_)
-                | BinaryEvent::Keepalive(_)
-                | BinaryEvent::Message(_) => {
+                BinaryEvent::ShotDatum(_) | BinaryEvent::Keepalive(_) | BinaryEvent::Message(_) => {
                     // on_recv callback already printed it
                 }
             }

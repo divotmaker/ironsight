@@ -129,7 +129,9 @@ impl Command {
         let frame = self.encode(dest);
         let mut s = format!(
             "APP→{} 0x{:02X} {}B",
-            dest, frame.type_id, frame.payload.len(),
+            dest,
+            frame.type_id,
+            frame.payload.len(),
         );
         if !frame.payload.is_empty() {
             s.push_str(" | ");
@@ -220,7 +222,9 @@ pub enum Message {
     CamConfig(camera::CamConfig),
     CamImageAvail(camera::CamImageAvail),
     SensorActResp(camera::SensorActResp),
-    WifiScan { payload: Vec<u8> },
+    WifiScan {
+        payload: Vec<u8>,
+    },
 
     // -- Shot results --
     FlightResult(shot::FlightResult),
@@ -270,59 +274,33 @@ impl Message {
             TYPE_PARAM_VALUE => Ok(Message::ParamValue(config::ParamValue::decode(p)?)),
             TYPE_RADAR_CAL => Ok(Message::RadarCal(config::RadarCal::decode(p)?)),
             TYPE_CONFIG_RESP => Ok(Message::ConfigResp(config::ConfigResp::decode(p)?)),
-            TYPE_AVR_CONFIG_RESP => {
-                Ok(Message::AvrConfigResp(config::AvrConfigResp::decode(p)?))
-            }
+            TYPE_AVR_CONFIG_RESP => Ok(Message::AvrConfigResp(config::AvrConfigResp::decode(p)?)),
 
             // -- Handshake responses --
-            TYPE_DSP_QUERY_RESP => {
-                Ok(Message::DspQueryResp(handshake::DspQueryResp::decode(p)?))
-            }
-            TYPE_DEV_INFO_RESP => {
-                Ok(Message::DevInfoResp(handshake::DevInfoResp::decode(p)?))
-            }
-            TYPE_PROD_INFO => {
-                Ok(Message::ProdInfoResp(handshake::ProdInfoResp::decode(p)?))
-            }
-            TYPE_NET_CONFIG => {
-                Ok(Message::NetConfigResp(handshake::NetConfigResp::decode(p)?))
-            }
-            TYPE_CAL_PARAM_RESP => {
-                Ok(Message::CalParamResp(handshake::CalParamResp::decode(p)?))
-            }
-            TYPE_CAL_DATA_RESP => {
-                Ok(Message::CalDataResp(handshake::CalDataResp::decode(p)?))
-            }
+            TYPE_DSP_QUERY_RESP => Ok(Message::DspQueryResp(handshake::DspQueryResp::decode(p)?)),
+            TYPE_DEV_INFO_RESP => Ok(Message::DevInfoResp(handshake::DevInfoResp::decode(p)?)),
+            TYPE_PROD_INFO => Ok(Message::ProdInfoResp(handshake::ProdInfoResp::decode(p)?)),
+            TYPE_NET_CONFIG => Ok(Message::NetConfigResp(handshake::NetConfigResp::decode(p)?)),
+            TYPE_CAL_PARAM_RESP => Ok(Message::CalParamResp(handshake::CalParamResp::decode(p)?)),
+            TYPE_CAL_DATA_RESP => Ok(Message::CalDataResp(handshake::CalDataResp::decode(p)?)),
             TYPE_TIME_SYNC => Ok(Message::TimeSync(handshake::TimeSync::decode(p)?)),
 
             // -- Camera responses --
             TYPE_CAM_STATE => Ok(Message::CamState(camera::CamState::decode(p)?)),
             TYPE_CAM_CONFIG => Ok(Message::CamConfig(camera::CamConfig::decode(p)?)),
-            TYPE_CAM_IMAGE_AVAIL => {
-                Ok(Message::CamImageAvail(camera::CamImageAvail::decode(p)?))
-            }
-            TYPE_SENSOR_ACT_RESP => {
-                Ok(Message::SensorActResp(camera::SensorActResp::decode(p)?))
-            }
+            TYPE_CAM_IMAGE_AVAIL => Ok(Message::CamImageAvail(camera::CamImageAvail::decode(p)?)),
+            TYPE_SENSOR_ACT_RESP => Ok(Message::SensorActResp(camera::SensorActResp::decode(p)?)),
             TYPE_WIFI_SCAN => Ok(Message::WifiScan {
                 payload: p.to_vec(),
             }),
 
             // -- Shot results --
-            TYPE_FLIGHT_RESULT => {
-                Ok(Message::FlightResult(shot::FlightResult::decode(p)?))
-            }
-            TYPE_FLIGHT_RESULT_V1 => {
-                Ok(Message::FlightResultV1(shot::FlightResultV1::decode(p)?))
-            }
+            TYPE_FLIGHT_RESULT => Ok(Message::FlightResult(shot::FlightResult::decode(p)?)),
+            TYPE_FLIGHT_RESULT_V1 => Ok(Message::FlightResultV1(shot::FlightResultV1::decode(p)?)),
             TYPE_CLUB_RESULT => Ok(Message::ClubResult(shot::ClubResult::decode(p)?)),
             TYPE_SPIN_RESULT => Ok(Message::SpinResult(shot::SpinResult::decode(p)?)),
-            TYPE_SPEED_PROFILE => {
-                Ok(Message::SpeedProfile(shot::SpeedProfile::decode(p)?))
-            }
-            TYPE_TRACKING_STATUS => {
-                Ok(Message::TrackingStatus(shot::TrackingStatus::decode(p)?))
-            }
+            TYPE_SPEED_PROFILE => Ok(Message::SpeedProfile(shot::SpeedProfile::decode(p)?)),
+            TYPE_TRACKING_STATUS => Ok(Message::TrackingStatus(shot::TrackingStatus::decode(p)?)),
             TYPE_PRC_DATA => Ok(Message::PrcData(shot::PrcData::decode(p)?)),
             TYPE_CLUB_PRC => Ok(Message::ClubPrc(shot::ClubPrc::decode(p)?)),
             TYPE_SHOT_TEXT => Ok(Message::ShotText(shot::ShotText::decode(p)?)),

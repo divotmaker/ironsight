@@ -32,7 +32,13 @@ impl fmt::Debug for Envelope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // "FlightResult { total: 3, ... } [AVR 0xD4 158B | 9E 00 03 ...]"
         write!(f, "{:?}", self.message)?;
-        write!(f, " [{} 0x{:02X} {}B", self.src, self.type_id, self.raw.len())?;
+        write!(
+            f,
+            " [{} 0x{:02X} {}B",
+            self.src,
+            self.type_id,
+            self.raw.len()
+        )?;
         if !self.raw.is_empty() {
             write!(f, " | ")?;
             for b in self.raw.iter() {
@@ -237,8 +243,7 @@ impl<S: Read + Write> BinaryConnection<S> {
         let src = frame.src;
         let type_id = frame.type_id;
         let raw = frame.payload.clone();
-        let message =
-            Message::decode(&frame).map_err(|e| ConnError::Wire(e.with_raw(&raw)))?;
+        let message = Message::decode(&frame).map_err(|e| ConnError::Wire(e.with_raw(&raw)))?;
         Ok(Envelope {
             src,
             type_id,

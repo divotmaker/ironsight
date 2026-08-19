@@ -54,7 +54,11 @@ pub struct AvrConfigCmd {
 impl AvrConfigCmd {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 2 {
-            return Err(WireError::payload_too_short("AvrConfigCmd", 2, payload.len()));
+            return Err(WireError::payload_too_short(
+                "AvrConfigCmd",
+                2,
+                payload.len(),
+            ));
         }
         Ok(Self {
             arm: payload[1] == 0x01,
@@ -77,7 +81,11 @@ pub struct ParamReadReq {
 impl ParamReadReq {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 4 {
-            return Err(WireError::payload_too_short("ParamReadReq", 4, payload.len()));
+            return Err(WireError::payload_too_short(
+                "ParamReadReq",
+                4,
+                payload.len(),
+            ));
         }
         Ok(Self {
             param_id: payload[3],
@@ -117,7 +125,11 @@ impl ParamValue {
             0x06 => {
                 // INT24 format (7 bytes)
                 if payload.len() < 7 {
-                    return Err(WireError::payload_too_short("ParamValue(INT24)", 7, payload.len()));
+                    return Err(WireError::payload_too_short(
+                        "ParamValue(INT24)",
+                        7,
+                        payload.len(),
+                    ));
                 }
                 Ok(Self {
                     param_id: payload[3],
@@ -127,14 +139,22 @@ impl ParamValue {
             0x08 => {
                 // FLOAT40 format (9 bytes)
                 if payload.len() < 9 {
-                    return Err(WireError::payload_too_short("ParamValue(FLOAT40)", 9, payload.len()));
+                    return Err(WireError::payload_too_short(
+                        "ParamValue(FLOAT40)",
+                        9,
+                        payload.len(),
+                    ));
                 }
                 Ok(Self {
                     param_id: payload[3],
                     value: ParamData::Float40(codec::read_float40(payload, 4)?),
                 })
             }
-            other => Err(WireError::unexpected_length("ParamValue", 6, other as usize)),
+            other => Err(WireError::unexpected_length(
+                "ParamValue",
+                6,
+                other as usize,
+            )),
         }
     }
 
@@ -199,7 +219,11 @@ pub struct ConfigResp {
 impl ConfigResp {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 69 {
-            return Err(WireError::payload_too_short("ConfigResp", 69, payload.len()));
+            return Err(WireError::payload_too_short(
+                "ConfigResp",
+                69,
+                payload.len(),
+            ));
         }
         let mut params = [0i16; 34];
         for (i, p) in params.iter_mut().enumerate() {

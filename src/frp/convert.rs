@@ -1,7 +1,7 @@
 //! Convert ironsight protocol types to FRP domain types.
 
-use flightrelay::units::{Distance, Velocity};
 use flightrelay::types::{BallFlight, ClubData};
+use flightrelay::units::{Distance, Velocity};
 
 use crate::protocol::shot::{ClubResult, FlightResult};
 

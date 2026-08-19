@@ -21,7 +21,10 @@ pub enum WireError {
     #[error("unknown bus address 0x{addr:02X}")]
     UnknownBusAddr { addr: u8 },
 
-    #[error("payload too short for {msg_type}: need {need} bytes, got {got}{}", format_raw_suffix(raw))]
+    #[error(
+        "payload too short for {msg_type}: need {need} bytes, got {got}{}",
+        format_raw_suffix(raw)
+    )]
     PayloadTooShort {
         msg_type: &'static str,
         need: usize,
@@ -36,7 +39,10 @@ pub enum WireError {
     #[error("invalid string payload: {0}")]
     InvalidString(#[from] std::string::FromUtf8Error),
 
-    #[error("unexpected payload length for {msg_type}: expected {expected}, got {got}{}", format_raw_suffix(raw))]
+    #[error(
+        "unexpected payload length for {msg_type}: expected {expected}, got {got}{}",
+        format_raw_suffix(raw)
+    )]
     UnexpectedLength {
         msg_type: &'static str,
         expected: usize,
@@ -49,23 +55,49 @@ pub enum WireError {
 impl WireError {
     /// Create a `PayloadTooShort` error (raw bytes filled in later via `with_raw`).
     pub(crate) fn payload_too_short(msg_type: &'static str, need: usize, got: usize) -> Self {
-        Self::PayloadTooShort { msg_type, need, got, raw: Vec::new() }
+        Self::PayloadTooShort {
+            msg_type,
+            need,
+            got,
+            raw: Vec::new(),
+        }
     }
 
     /// Create an `UnexpectedLength` error (raw bytes filled in later via `with_raw`).
     pub(crate) fn unexpected_length(msg_type: &'static str, expected: usize, got: usize) -> Self {
-        Self::UnexpectedLength { msg_type, expected, got, raw: Vec::new() }
+        Self::UnexpectedLength {
+            msg_type,
+            expected,
+            got,
+            raw: Vec::new(),
+        }
     }
 
     /// Attach raw payload bytes to decode-phase errors for diagnostics.
     pub fn with_raw(self, payload: &[u8]) -> Self {
         match self {
-            Self::PayloadTooShort { msg_type, need, got, .. } => {
-                Self::PayloadTooShort { msg_type, need, got, raw: payload.to_vec() }
-            }
-            Self::UnexpectedLength { msg_type, expected, got, .. } => {
-                Self::UnexpectedLength { msg_type, expected, got, raw: payload.to_vec() }
-            }
+            Self::PayloadTooShort {
+                msg_type,
+                need,
+                got,
+                ..
+            } => Self::PayloadTooShort {
+                msg_type,
+                need,
+                got,
+                raw: payload.to_vec(),
+            },
+            Self::UnexpectedLength {
+                msg_type,
+                expected,
+                got,
+                ..
+            } => Self::UnexpectedLength {
+                msg_type,
+                expected,
+                got,
+                raw: payload.to_vec(),
+            },
             other => other,
         }
     }

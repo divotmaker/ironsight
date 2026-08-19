@@ -1,7 +1,16 @@
-//! ironsight-frp — FlightRelay Protocol device server for Mevo+/Gen2.
+//! ironsight-frp — Flight Relay Protocol device for Mevo+/Gen2.
 //!
-//! Connects to a FlightScope Mevo+ or Gen2 on TCP 5100, arms it, and serves
-//! shot data over FRP (WebSocket on port 5880) to any connected controller.
+//! Connects to a FlightScope Mevo+ or Gen2 on TCP 5100, arms it, and streams
+//! shot data over FRP to a controller.
+//!
+//! ```text
+//! ironsight-frp [mevo-addr] [frp-target]
+//! ```
+//!
+//! `frp-target` selects the transport direction. A `ws://` or `wss://` URL
+//! bridges this device to a central controller such as flighthook; anything
+//! else is a bind address that controllers connect to. Defaults to
+//! `0.0.0.0:5880`.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -10,7 +19,7 @@ use std::time::Duration;
 
 use ironsight::client::{BinaryClient, BinaryEvent};
 use ironsight::conn::{BinaryConnection, DEFAULT_ADDR};
-use ironsight::frp::FrpServer;
+use ironsight::frp::FrpDevice;
 use ironsight::protocol::config;
 use ironsight::seq::AvrSettings;
 
@@ -18,30 +27,28 @@ fn main() -> ExitCode {
     let mevo_addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_ADDR.to_owned());
-    let frp_addr = std::env::args()
+    let frp_target = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "0.0.0.0:5880".to_owned());
+    let bridging = frp_target.starts_with("ws://") || frp_target.starts_with("wss://");
 
     eprintln!("ironsight-frp: connecting to Mevo at {mevo_addr}");
-    eprintln!("ironsight-frp: FRP server on {frp_addr}");
 
-    // Bind FRP server first so controllers can connect while we handshake
-    let mut frp = match FrpServer::bind(&frp_addr) {
+    // Open the FRP endpoint first so it connects while we handshake the Mevo
+    let frp = if bridging {
+        eprintln!("ironsight-frp: bridging to controller at {frp_target}");
+        FrpDevice::bridge(&frp_target, "ironsight")
+    } else {
+        eprintln!("ironsight-frp: serving controllers on {frp_target}");
+        FrpDevice::serve(&frp_target)
+    };
+    let mut frp = match frp {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ironsight-frp: failed to bind FRP server: {e}");
+            eprintln!("ironsight-frp: failed to open FRP endpoint: {e}");
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("ironsight-frp: FRP server listening");
-
-    // Accept controller connection (blocking)
-    eprintln!("ironsight-frp: waiting for FRP controller...");
-    if let Err(e) = frp.accept() {
-        eprintln!("ironsight-frp: controller accept failed: {e}");
-        return ExitCode::FAILURE;
-    }
-    eprintln!("ironsight-frp: controller connected");
 
     // Connect to Mevo
     let conn = match BinaryConnection::connect(&mevo_addr) {
@@ -106,6 +113,13 @@ fn main() -> ExitCode {
                 }
             }
             Ok(None) => {
+                // Adopt a newly established controller connection
+                match frp.poll_connection() {
+                    Ok(true) => eprintln!("ironsight-frp: controller connected"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("ironsight-frp: telemetry resend failed: {e}"),
+                }
+
                 // Check for controller commands
                 if let Some(mode) = frp.check_controller() {
                     eprintln!("ironsight-frp: detection mode → {mode}");

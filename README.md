@@ -18,9 +18,10 @@ clients share the same `poll()` pattern:
   handshake, configuration, arming, keepalives, and shot detection.
 - **`GvpClient`** — GVP camera protocol (TCP port 1258, `gvp` feature). Handles
   trigger, trajectory hints, and ball tracker results.
-- **`FrpServer`** — [Flight Relay Protocol](https://github.com/flightrelay/spec)
-  device server (`frp` feature). Bridges `BinaryClient` shot data to any FRP
-  controller over WebSocket (port 5880).
+- **`FrpDevice`** — [Flight Relay Protocol](https://github.com/flightrelay/spec)
+  device (`frp` feature). Bridges `BinaryClient` shot data to an FRP controller
+  over WebSocket, either serving controllers on a local port (default 5880) or
+  dialing a central controller such as flighthook.
 
 Both clients are generic over any `Read + Write` stream. Blocking convenience
 wrappers and low-level sequencer state machines are also available. No async

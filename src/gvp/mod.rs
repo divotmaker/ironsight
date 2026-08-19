@@ -208,16 +208,14 @@ impl GvpCommand {
                 value
             }
             GvpCommand::ExpectedClubTrack(track) => {
-                let mut value =
-                    serde_json::to_value(track).expect("ExpectedTrack serialization");
+                let mut value = serde_json::to_value(track).expect("ExpectedTrack serialization");
                 let obj = value.as_object_mut().expect("ExpectedTrack is an object");
                 obj.insert("type".into(), TYPE_EXPECTED_CLUB_TRACK.into());
                 obj.insert("version".into(), VERSION_EXPECTED_TRACK.into());
                 value
             }
             GvpCommand::ExpectedTrack(track) => {
-                let mut value =
-                    serde_json::to_value(track).expect("ExpectedTrack serialization");
+                let mut value = serde_json::to_value(track).expect("ExpectedTrack serialization");
                 let obj = value.as_object_mut().expect("ExpectedTrack is an object");
                 obj.insert("type".into(), TYPE_EXPECTED_TRACK.into());
                 obj.insert("version".into(), VERSION_EXPECTED_TRACK.into());
@@ -235,8 +233,7 @@ impl GvpCommand {
     pub fn encode_pretty(&self) -> Vec<u8> {
         // Re-encode with pretty printing for debug/logging.
         let compact = self.encode();
-        let value: Value =
-            serde_json::from_slice(&compact[..compact.len() - 1]).expect("re-parse");
+        let value: Value = serde_json::from_slice(&compact[..compact.len() - 1]).expect("re-parse");
         let mut bytes = serde_json::to_vec_pretty(&value).expect("pretty JSON");
         bytes.push(0x00);
         bytes
@@ -275,7 +272,8 @@ mod tests {
 
     #[test]
     fn decode_status() {
-        let json = r#"{"type":"STATUS","version":1,"bufferStatus":[{"bufferIndex":0,"status":"IDLE"}]}"#;
+        let json =
+            r#"{"type":"STATUS","version":1,"bufferStatus":[{"bufferIndex":0,"status":"IDLE"}]}"#;
         let msg = GvpMessage::decode(json).unwrap();
         match msg {
             GvpMessage::Status(s) => {

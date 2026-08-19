@@ -56,7 +56,7 @@ impl RawFrame {
                         return Err(WireError::InvalidEscape {
                             code: other,
                             offset: i,
-                        })
+                        });
                     }
                 };
                 unstuffed.push((decoded, i));
@@ -69,9 +69,7 @@ impl RawFrame {
 
         // Need at least 5 unstuffed bytes: DEST + SRC + TYPE + CS_HI + CS_LO
         if unstuffed.len() < 5 {
-            return Err(WireError::FrameTooShort {
-                len: wire.len(),
-            });
+            return Err(WireError::FrameTooShort { len: wire.len() });
         }
 
         // Last 2 unstuffed bytes are the checksum

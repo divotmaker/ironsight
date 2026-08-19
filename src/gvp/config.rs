@@ -161,7 +161,6 @@ impl GvpConfig {
     /// actual capture resolution is controlled by binary 0x82 CAM_CONFIG.
     #[must_use]
     pub fn is_fusion(&self) -> bool {
-        self.camera_configuration.roi_width == 1640
-            && self.camera_configuration.roi_height == 1232
+        self.camera_configuration.roi_width == 1640 && self.camera_configuration.roi_height == 1232
     }
 }

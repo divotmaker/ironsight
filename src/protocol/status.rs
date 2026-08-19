@@ -148,7 +148,11 @@ pub struct DspStatus80 {
 impl DspStatus80 {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 64 {
-            return Err(WireError::payload_too_short("DspStatus80", 64, payload.len()));
+            return Err(WireError::payload_too_short(
+                "DspStatus80",
+                64,
+                payload.len(),
+            ));
         }
         Ok(Self {
             state: payload[1],
@@ -200,7 +204,9 @@ impl std::fmt::Debug for DspStatus46 {
         write!(
             f,
             "DspStatus46 {{ version: 0x{:02X}, state: 0x{:02X}, len: {}, payload: ",
-            self.version, self.state, self.payload.len(),
+            self.version,
+            self.state,
+            self.payload.len(),
         )?;
         for (i, b) in self.payload.iter().enumerate() {
             if i > 0 {
@@ -278,10 +284,7 @@ impl Text {
             .rposition(|&b| b >= 0x20)
             .map_or(0, |p| p + 1);
         // Strip leading control chars
-        let start = payload[..end]
-            .iter()
-            .position(|&b| b >= 0x20)
-            .unwrap_or(0);
+        let start = payload[..end].iter().position(|&b| b >= 0x20).unwrap_or(0);
         Ok(Self {
             text: String::from_utf8_lossy(&payload[start..end]).into_owned(),
         })

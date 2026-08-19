@@ -64,7 +64,11 @@ pub struct DspQueryResp {
 impl DspQueryResp {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 3 {
-            return Err(WireError::payload_too_short("DspQueryResp", 3, payload.len()));
+            return Err(WireError::payload_too_short(
+                "DspQueryResp",
+                3,
+                payload.len(),
+            ));
         }
         Ok(Self {
             version: payload[0],
@@ -125,7 +129,11 @@ pub struct ProdInfoReq {
 impl ProdInfoReq {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 2 {
-            return Err(WireError::payload_too_short("ProdInfoReq", 2, payload.len()));
+            return Err(WireError::payload_too_short(
+                "ProdInfoReq",
+                2,
+                payload.len(),
+            ));
         }
         Ok(Self {
             sub_query: payload[1],
@@ -147,7 +155,9 @@ pub struct ProdInfoResp {
 
 impl ProdInfoResp {
     pub fn decode(payload: &[u8]) -> Result<Self> {
-        Ok(Self { text: decode_cstr(payload) })
+        Ok(Self {
+            text: decode_cstr(payload),
+        })
     }
 }
 
@@ -162,7 +172,11 @@ pub struct NetConfigReq {
 impl NetConfigReq {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 2 {
-            return Err(WireError::payload_too_short("NetConfigReq", 2, payload.len()));
+            return Err(WireError::payload_too_short(
+                "NetConfigReq",
+                2,
+                payload.len(),
+            ));
         }
         Ok(Self {
             query_password: payload[1] == 0x08,
