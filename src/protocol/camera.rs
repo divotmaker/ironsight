@@ -374,3 +374,47 @@ fn parse_null_padded_string(data: &[u8]) -> Option<String> {
         Some(String::from_utf8_lossy(&data[..end]).into_owned())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fusion_preset_values() {
+        let preset = CamConfig::fusion_preset();
+        assert!(preset.is_fusion());
+        assert_eq!(preset.resolution_width, 1640);
+        assert_eq!(preset.resolution_height, 1232);
+        assert_eq!(preset.quality, 80);
+        assert_eq!(preset.framerate, 10);
+        assert_eq!(preset.streaming_framerate, 1);
+        assert!(!preset.fusion_camera_mode);
+    }
+
+    #[test]
+    fn fusion_preset_round_trip() {
+        let preset = CamConfig::fusion_preset();
+        let encoded = preset.encode();
+        assert_eq!(encoded.len(), 52);
+        let decoded = CamConfig::decode(&encoded).unwrap();
+        assert!(decoded.is_fusion());
+        assert_eq!(decoded.framerate, 10);
+        assert!(!decoded.fusion_camera_mode);
+        assert_eq!(decoded.encode(), encoded);
+    }
+
+    #[test]
+    fn standard_preset_round_trip() {
+        let preset = CamConfig::standard_preset();
+        assert!(!preset.is_fusion());
+        let encoded = preset.encode();
+        let decoded = CamConfig::decode(&encoded).unwrap();
+        assert!(!decoded.is_fusion());
+        assert_eq!(decoded.encode(), encoded);
+    }
+
+    #[test]
+    fn decode_short_payload_fails() {
+        assert!(CamConfig::decode(&[0u8; 51]).is_err());
+    }
+}

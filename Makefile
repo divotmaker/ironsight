@@ -2,15 +2,14 @@ build:
 	cargo build
 
 test:
-	cargo test
+	cargo test --all-features
 
 clippy:
-	cargo clippy
+	cargo clippy --all-targets --all-features
 
 lint:
-	cargo clippy --all-targets --features gvp,frp
-	cargo test --lib --features gvp,frp
-	cargo test --doc --features gvp,frp
+	cargo clippy --all-targets --all-features
+	cargo test --all-features
 
 build-frp:
 	cargo build --release --features frp --bin ironsight-frp

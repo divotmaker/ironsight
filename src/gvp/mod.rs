@@ -318,6 +318,124 @@ mod tests {
     }
 
     #[test]
+    fn decode_status_triggered() {
+        let json = r#"{"type":"STATUS","version":1,"bufferStatus":[{"bufferIndex":0,"status":"TRIGGERED"}]}"#;
+        let msg = GvpMessage::decode(json).unwrap();
+        match msg {
+            GvpMessage::Status(s) => {
+                assert_eq!(s.status(), "TRIGGERED");
+                assert!(!s.is_idle());
+                assert_eq!(s.buffer_status.len(), 1);
+                assert_eq!(s.buffer_status[0].buffer_index, 0);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_config() {
+        let json = r#"{"type":"CONFIG","version":5,
+            "bufferConfiguration":{"bufferSizePostTrigger":0,"bufferSizePreTrigger":0},
+            "cameraCalibration":{"cx":0,"cy":0,"distCoeffs":[0,0,0,0,0,0,0,0],"fx":0,"fy":0,
+                "height":0,"position":[0,0,0],"rotation":[0,0,0],"width":0},
+            "cameraConfiguration":{"ROI_height":480,"ROI_maxHeight":0,"ROI_maxWidth":0,
+                "ROI_width":640,"ROI_x":0,"ROI_y":0,"isFreeRun":true,"rotationDegCW":0},
+            "frameNumberInfoEnabled":true,
+            "livePreviewProcessingConfiguration":{"ROI_center_u":0,"ROI_center_v":0,
+                "ROI_height":0,"ROI_width":0,"enabled":false,"rotationDegCW":0},
+            "loggingEnabled":true,"saveVideosEnabled":true}"#;
+        let msg = GvpMessage::decode(json).unwrap();
+        match msg {
+            GvpMessage::Config(cfg) => {
+                assert_eq!(cfg.camera_configuration.roi_width, 640);
+                assert_eq!(cfg.camera_configuration.roi_height, 480);
+                assert!(!cfg.is_fusion());
+                assert!(cfg.frame_number_info_enabled);
+                assert!(cfg.logging_enabled);
+                assert!(cfg.save_videos_enabled);
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_result() {
+        let json = r#"{"type":"RESULT","version":1,"guid":"{test-guid}",
+            "cameraCalibration":{"cx":0,"cy":0,"distCoeffs":[0,0,0,0,0,0,0,0],"fx":0,"fy":0,
+                "height":0,"position":[0,0,0],"rotation":[0,0,0],"width":0},
+            "tracks":[
+                {"trackId":1,"frameNumber":[10,12,14],"timestamp":[1.0,1.011,1.022],
+                 "u":[240.0,280.0,300.0],"v":[80.0,140.0,210.0],"radius":[44.0,54.0,56.0],
+                 "circularityFactor":[22.0,59.0,52.0],"shutterTime_ms":[1,1,1]},
+                {"trackId":0,"frameNumber":[20,21],"timestamp":[1.05,1.055],
+                 "u":[326.0,326.3],"v":[303.0,289.6],"radius":[12.9,12.4],
+                 "circularityFactor":[0.74,0.23],"shutterTime_ms":[1,1]},
+                {"trackId":2,"frameNumber":[0],"timestamp":[0.9],"u":[327.2],"v":[312.5],
+                 "radius":[12.2],"circularityFactor":[31],"shutterTime_ms":[1]}
+            ]}"#;
+        let msg = GvpMessage::decode(json).unwrap();
+        match msg {
+            GvpMessage::Result(r) => {
+                assert_eq!(r.guid, "{test-guid}");
+                assert_eq!(r.tracks.len(), 3);
+
+                let club = r.club_track().expect("club track present");
+                assert!(club.is_club());
+                assert_eq!(club.len(), 3);
+                assert_eq!(club.frame_number, [10, 12, 14]);
+
+                let ball = r.ball_track().expect("ball track present");
+                assert!(ball.is_ball());
+                assert_eq!(ball.len(), 2);
+                assert_eq!(ball.radius, [12.9, 12.4]);
+
+                assert_eq!(r.camera_calibration.fx, 0.0);
+                assert_eq!(r.camera_calibration.cy, 0.0);
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_app_to_gvp_types_as_unknown() {
+        for msg_type in [
+            "TRIGGER",
+            "MT_GOLF_EXPECTED_CLUB_TRACK",
+            "MT_GOLF_EXPECTED_TRACK",
+        ] {
+            let json = format!(r#"{{"type":"{msg_type}","version":1}}"#);
+            match GvpMessage::decode(&json).unwrap() {
+                GvpMessage::Unknown { msg_type: t, .. } => assert_eq!(t, msg_type),
+                other => panic!("expected Unknown for {msg_type}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn encode_config_decodes_back() {
+        let cfg = config::GvpConfig::fusion();
+        let bytes = GvpCommand::Config(cfg.clone()).encode();
+        let json_str = std::str::from_utf8(&bytes[..bytes.len() - 1]).unwrap();
+        match GvpMessage::decode(json_str).unwrap() {
+            GvpMessage::Config(decoded) => {
+                assert_eq!(
+                    decoded.camera_configuration.roi_width,
+                    cfg.camera_configuration.roi_width
+                );
+                assert_eq!(
+                    decoded.camera_configuration.roi_height,
+                    cfg.camera_configuration.roi_height
+                );
+                assert_eq!(
+                    decoded.buffer_configuration.buffer_size_pre_trigger,
+                    cfg.buffer_configuration.buffer_size_pre_trigger
+                );
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn decode_unknown_type() {
         let json = r#"{"type":"FUTURE_TYPE","version":99}"#;
         let msg = GvpMessage::decode(json).unwrap();

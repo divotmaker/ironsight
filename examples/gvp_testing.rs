@@ -129,8 +129,8 @@ fn poly_fit_4(ts: &[f64], ys: &[f64]) -> [f64; 5] {
         let mut ti = 1.0;
         for i in 0..5 {
             let mut tj = 1.0;
-            for j in 0..5 {
-                vtv[i][j] += ti * tj;
+            for cell in &mut vtv[i] {
+                *cell += ti * tj;
                 tj *= t;
             }
             vty[i] += ti * y;
@@ -487,10 +487,10 @@ fn cam_state_poll(
             return Err(ConnError::Timeout);
         }
         let env = conn.recv_timeout(remaining)?;
-        if matches!(env.src, BusAddr::Pi) {
-            if let Message::CamState(cs) = env.message {
-                return Ok(cs.state);
-            }
+        if matches!(env.src, BusAddr::Pi)
+            && let Message::CamState(cs) = env.message
+        {
+            return Ok(cs.state);
         }
     }
 }
@@ -652,27 +652,24 @@ fn run() -> Result<(), ConnError> {
 
                 BinaryEvent::ShotComplete(data) => {
                     // Send trajectory hints if not already sent from pre-PROCESSED data.
-                    if !hints_sent {
-                        if let Some(ref flight) = data.flight {
-                            // Extract prc_start_time from drain data if not captured earlier.
-                            if prc_start_time.is_none() {
-                                for prc in &data.prc {
-                                    if !prc.points.is_empty() {
-                                        prc_start_time =
-                                            Some(f64::from(prc.points[0].time) * 26.7e-6);
-                                        break;
-                                    }
+                    if !hints_sent && let Some(ref flight) = data.flight {
+                        // Extract prc_start_time from drain data if not captured earlier.
+                        if prc_start_time.is_none() {
+                            for prc in &data.prc {
+                                if !prc.points.is_empty() {
+                                    prc_start_time = Some(f64::from(prc.points[0].time) * 26.7e-6);
+                                    break;
                                 }
                             }
-                            let hints = compute_trajectory_hints(
-                                flight,
-                                data.club.as_ref().or(pending_club.as_ref()),
-                                &shot_guid,
-                                range_m,
-                                prc_start_time,
-                            );
-                            send_gvp_hints(&mut gvp, &hints);
                         }
+                        let hints = compute_trajectory_hints(
+                            flight,
+                            data.club.as_ref().or(pending_club.as_ref()),
+                            &shot_guid,
+                            range_m,
+                            prc_start_time,
+                        );
+                        send_gvp_hints(&mut gvp, &hints);
                     }
 
                     print_shot_summary(shot_count, &data);
