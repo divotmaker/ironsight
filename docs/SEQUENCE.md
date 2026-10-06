@@ -374,7 +374,7 @@ Key writable parameters (see WIRE.md &sect;6.3 for encoding):
 
 | Param | Type | Description |
 | ----- | ---- | ----------- |
-| 0x0006 | INT24 | Ball type (0=RCT, 1=Standard) |
+| 0x0006 | INT24 | Ball type (0=Standard, 1=RCT) |
 | 0x000F | FLOAT40 | Minimum track percentage (0.6–1.0) |
 | 0x0026 | FLOAT40 | Driver tee height (meters) |
 

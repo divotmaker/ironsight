@@ -714,7 +714,7 @@ Key writable parameters (APP &rarr; AVR):
 
 | Param ID | Type    | Description                                |
 | -------- | ------- | ------------------------------------------ |
-| 0x0006   | INT24   | Ball type (0 = RCT, 1 = Standard)          |
+| 0x0006   | INT24   | Ball type (0 = Standard, 1 = RCT)          |
 | 0x000F   | FLOAT40 | Outdoor minimum track percentage (0.6-1.0) |
 | 0x0026   | FLOAT40 | Driver tee height (meters)                 |
 | 0x0007   | INT24   | Radar config (mode-dependent)              |

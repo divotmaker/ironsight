@@ -46,10 +46,10 @@ fn default_avr_settings() -> AvrSettings {
     AvrSettings {
         mode: MODE_CHIPPING,
         params: vec![
-            // Ball type: 0 = RCT
+            // Ball type: 1 = RCT
             ParamValue {
                 param_id: 0x06,
-                value: ParamData::Int24(0),
+                value: ParamData::Int24(1),
             },
             // Outdoor minimum track %: 1.0
             ParamValue {
