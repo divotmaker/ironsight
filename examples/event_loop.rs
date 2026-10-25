@@ -106,10 +106,9 @@ fn default_cam_config() -> CamConfig {
 
 fn print_handshake(dsp: &DspSync, avr: &AvrSync, pi: &PiSync) {
     println!("--- Handshake complete ---");
-    println!(
-        "  DSP: type=0x{:02X} pcb={}",
-        dsp.hw_info.dsp_type, dsp.hw_info.pcb
-    );
+    if let Some(ref hw) = dsp.hw_info {
+        println!("  DSP: type=0x{:02X} pcb={}", hw.dsp_type, hw.pcb);
+    }
     println!("  DSP info: {}", dsp.dev_info.text);
     println!("  AVR info: {}", avr.dev_info.text);
     println!(
@@ -171,11 +170,11 @@ fn run() -> Result<(), ConnError> {
     let settings = default_avr_settings();
     if let Some(ref cal) = settings.radar_cal {
         println!(
-            "Configuring... mode=Outdoor ball=RCT range={}mm height={}mm",
+            "Configuring... mode=Chipping ball=RCT range={}mm height={}mm",
             cal.range_mm, cal.height_mm,
         );
     } else {
-        println!("Configuring... mode=Outdoor ball=RCT (no radar cal)");
+        println!("Configuring... mode=Chipping ball=RCT (no radar cal)");
     }
     seq::configure_avr(&mut conn, &settings)?;
     seq::configure_camera(&mut conn, &default_cam_config())?;

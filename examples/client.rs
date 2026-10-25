@@ -1,8 +1,9 @@
 //! Non-blocking client example: connect, handshake, configure, arm, shot loop.
 //!
-//! Usage: cargo run --example client
+//! Usage: cargo run --example client [device-addr]
 //!
-//! Requires: connected to Mevo+ WiFi (SSID = device serial).
+//! Requires: connected to the device's WiFi (Mevo+: SSID = device serial).
+//! `device-addr` defaults to 192.168.2.1:5100.
 
 use std::net::SocketAddr;
 use std::process;
@@ -13,6 +14,7 @@ use ironsight::client::{BinaryClient, BinaryEvent};
 use ironsight::conn::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
 use ironsight::protocol::config::{MODE_CHIPPING, ParamData, ParamValue, RadarCal};
+use ironsight::protocol::handshake::DeviceModel;
 use ironsight::seq::AvrSettings;
 
 fn ms_to_mph(ms: f64) -> f64 {
@@ -31,7 +33,11 @@ fn main() {
 }
 
 fn run() -> Result<(), ironsight::ConnError> {
-    let addr: SocketAddr = DEFAULT_ADDR.parse().unwrap();
+    let addr: SocketAddr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_ADDR.to_owned())
+        .parse()
+        .expect("device address must be ip:port");
     println!("Connecting to {addr}...");
     let mut conn = BinaryConnection::connect_timeout(&addr, Duration::from_secs(5))?;
     println!("Connected.");
@@ -41,22 +47,24 @@ fn run() -> Result<(), ironsight::ConnError> {
 
     let mut client = BinaryClient::from_tcp(conn)?;
 
-    // Enqueue the full startup sequence.
+    // Configuration depends on the model, so it is enqueued once the
+    // handshake has identified the device.
     client.handshake();
-    client.configure_avr(default_avr_settings());
-    client.configure_cam(default_cam_config());
-    client.arm();
 
     println!("Starting poll loop...");
     loop {
         if let Some(event) = client.poll()? {
             match event {
                 BinaryEvent::Handshake(h) => {
-                    println!("\n=== Handshake complete ===");
-                    println!("  SSID: {}  password: {}", h.pi.ssid, h.pi.password);
+                    println!("\n=== Handshake complete: {} ===", h.model);
+                    if let Some(ref pi) = h.pi {
+                        println!("  SSID: {}  password: {}", pi.ssid, pi.password);
+                    }
                     println!("  DSP: {}", h.dsp.dev_info.text);
                     println!("  AVR: {}", h.avr.dev_info.text);
-                    println!("  PI:  {}", h.pi.dev_info.text);
+                    if let Some(ref pi) = h.pi {
+                        println!("  PI:  {}", pi.dev_info.text);
+                    }
                     println!(
                         "  Battery: {}%{}",
                         h.dsp.status.battery_percent(),
@@ -66,6 +74,15 @@ fn run() -> Result<(), ironsight::ConnError> {
                             ""
                         },
                     );
+
+                    if h.model == DeviceModel::Xi {
+                        // No camera; limited-flight mode with the device's stored params.
+                        client.configure_avr(AvrSettings::xi());
+                    } else {
+                        client.configure_avr(default_avr_settings());
+                        client.configure_cam(default_cam_config());
+                    }
+                    client.arm();
                 }
                 BinaryEvent::Configured => {
                     println!("\n=== Configured ===");
@@ -96,9 +113,15 @@ fn run() -> Result<(), ironsight::ConnError> {
                             c.face_angle,
                         );
                     }
+                    if let Some(ref f) = data.flight {
+                        println!(
+                            "    Spin (D4): back {} rpm  side {} rpm",
+                            f.backspin_rpm, f.sidespin_rpm,
+                        );
+                    }
                     if let Some(ref s) = data.spin {
                         println!(
-                            "    Spin: {} rpm  Axis: {:.1}°",
+                            "    Spin (EF): {} rpm  Axis: {:.1}°",
                             s.pm_spin_final, s.spin_axis,
                         );
                     }

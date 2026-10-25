@@ -21,6 +21,9 @@ The Mevo+ exposes three TCP services:
 
 Only port 5100 is required for shot data.
 
+The FlightScope Xi exposes port 5100 only and has no camera Pi; see &sect;8 for
+how its sequence differs.
+
 **Strictly sequential**: APP always waits for a response before sending the next
 message. There is no pipelining. Typical APP reaction time after receiving a
 response is <1 ms.
@@ -463,3 +466,76 @@ The three messages that carry the primary shot result:
 | 0xEF SPIN_RESULT | PMSpinFinal (total spin), SpinAxis (/10 = degrees) |
 
 0xE8 FLIGHT_RESULT_V1 can serve as a partial/early result if latency matters.
+
+---
+
+## 8. FlightScope Xi (alpha)
+
+The Xi uses the same framing, checksum, bus addresses, address and port as the
+Mevo+. It has no camera Pi: nothing on the bus answers at address 0x12, so every
+step that waits for the PI is left out. Status: alpha (connects, arms, reports
+shots; little real-world use so far).
+
+### 8.1 Detection
+
+The DSP device info (0xE7) is 99 bytes on the Xi rather than 76. Its only text
+slot is the last 16 bytes, holding the firmware version and model, e.g.
+`"0.38 FS Xi"`. A client that finds `FS Xi` there is talking to an Xi.
+
+The AVR status text after arming reads `ARMED Xi`.
+
+### 8.2 Handshake
+
+| Phase | Xi |
+| ----- | -- |
+| 1. DSP sync | As &sect;2.1. A 0x48 response from the Xi has not been observed, and ironsight does not rely on one: it moves on to 0x67 after a timeout (2 s) or a ConfigNack. |
+| 2. AVR sync | 0xAA &times;2, 0x67 &times;2, 0xBE 0x0C/0x0D, 0x21, then 0xD0 &rarr; 0xD1. Stop there: no 0xD2 factory cal, no 0x23 (the AVR rejects it with 0x94), no 0xBE 0x64, no 0x9B. |
+| 3. PI sync | Skipped. |
+| 4. Post-sync config | B0 `[01 00]` &rarr; 0x95, A5 `[02 00 XX]` (detection mode, see below) &rarr; A5 echo, B0 `[01 00]` &rarr; 0x95. No parameter writes and no radar cal; the Xi keeps its stored values. |
+| 5. PI post-config | Skipped. |
+| 6. ARM | 0xAA DSP, 0xAA AVR, B0 `[01 01]` &rarr; 0x95, then wait for the E3 `ARMED Xi` text (about 1 s). No PI poll. |
+
+If the Xi is still armed from an earlier session, the first B0 `[01 00]` of the
+configure phase disarms it: the AVR sends 0x95, `ARMED CANCELLED` and 0xB1.
+
+The detection mode is 9 (Limited flight, for nets and simulator screens) by
+default, or 8 (Outdoor, full flight) for real outdoor use; see WIRE.md &sect;7.
+Mode 9 is the only one seen working on an Xi so far. ironsight writes only the
+mode for either; the param writes FS Golf sends with mode 8 are not sent. Other
+mode values have not been mapped for the Xi.
+
+### 8.3 Keepalive
+
+Poll DSP and AVR only. The Xi's DSP status (0xAA) is 29 bytes (`payload[0]` =
+0x1C), a layout not decoded yet; its AVR status is the same 25-byte format as
+the Mevo+.
+
+### 8.4 Shot flow
+
+As on the Mevo+ (&sect;4.1), the result set arrives before `PROCESSED`:
+
+```
+E5 "BALL TRIGGER" → 0xBA → E9 → E8 → E0 → E1 → D4 → ED → D9 → EF → 0xDF
+  → E5 "PROCESSED" → E5 "IDLE" → B1
+```
+
+D4, E8, ED and EF use the Mevo+ layouts (D4 is 157 bytes). After `PROCESSED`
+the post-shot cycle of &sect;7.2 works unchanged: 0x69 &times;2, IDLE, 0x6D
+&rarr; ED, B0 `[01 01]` &rarr; 0x95, E3 `ARMED Xi`.
+
+The Xi often sends several frames in one TCP segment, so a client must handle
+more than one frame per read and keep them in arrival order.
+
+### 8.5 Unknown message types
+
+The Xi sends types with no known layout. Treat them as opaque and never fail on
+them:
+
+| Type | Source | Size | When |
+| ---- | ------ | ---- | ---- |
+| 0x36 | AVR | 0 B | Shortly before a trigger |
+| 0xBA | AVR | 81 B | Once per shot, after the trigger |
+| 0xE0 | AVR | 7 B | Once per shot, before D4 |
+| 0xE1 | AVR | 3 B | Once per shot, before D4 |
+| 0xDF | AVR | 205 B | Once per shot, before PROCESSED |
+| 0xF1 | DSP | 27 B | In reply to a 0xF1 `[01 01]` request |

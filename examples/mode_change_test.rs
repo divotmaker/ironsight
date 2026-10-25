@@ -13,7 +13,7 @@ use ironsight::client::{BinaryClient, BinaryEvent};
 use ironsight::conn::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
 use ironsight::protocol::config::{
-    MODE_CHIPPING, MODE_OUTDOOR, MODE_PUTTING, ParamData, ParamValue, RadarCal,
+    MODE_CHIPPING, MODE_LIMITED_FLIGHT, MODE_PUTTING, ParamData, ParamValue, RadarCal,
 };
 use ironsight::seq::AvrSettings;
 
@@ -25,7 +25,7 @@ enum Step {
     InitialArm,
     /// Wait for at least one keepalive while armed
     WaitKeepalive,
-    /// First mode change: Outdoor → Chipping (disarm → configure → arm)
+    /// First mode change: Limited flight → Chipping (disarm → configure → arm)
     ModeChange1,
     /// Wait for keepalive after first mode change
     WaitKeepalive2,
@@ -64,9 +64,9 @@ fn run() -> Result<(), ironsight::ConnError> {
     let mut client = BinaryClient::from_tcp(conn)?;
     client.set_keepalive_interval(Duration::from_secs(3));
 
-    // Enqueue: handshake → configure(outdoor) → cam → arm
+    // Enqueue: handshake → configure(limited flight) → cam → arm
     client.handshake();
-    client.configure_avr(avr_settings_full(MODE_OUTDOOR));
+    client.configure_avr(avr_settings_full(MODE_LIMITED_FLIGHT));
     client.configure_cam(cam_config());
     client.arm();
 
@@ -78,7 +78,7 @@ fn run() -> Result<(), ironsight::ConnError> {
     let mut handshake_done = false;
     let mut configure_count = 0u8; // need 2: AVR + cam
 
-    println!("[step] InitialArm: handshake → configure(outdoor/9) → cam → arm");
+    println!("[step] InitialArm: handshake → configure(limited-flight/9) → cam → arm");
 
     loop {
         if phase_start.elapsed() > timeout {
@@ -108,7 +108,7 @@ fn run() -> Result<(), ironsight::ConnError> {
                 println!("  [configured] {label} OK");
             }
             (Step::InitialArm, BinaryEvent::Armed) => {
-                println!("  [armed] OK — device armed in outdoor mode");
+                println!("  [armed] OK — device armed in limited-flight mode");
                 assert!(handshake_done, "armed before handshake");
                 assert!(configure_count >= 2, "armed before both configures");
 
@@ -131,15 +131,15 @@ fn run() -> Result<(), ironsight::ConnError> {
                     avr.unwrap_or_default()
                 );
 
-                // Transition: first mode change outdoor → chipping
+                // Transition: first mode change limited flight → chipping
                 step = Step::ModeChange1;
                 phase_start = Instant::now();
-                println!("\n[step] ModeChange1: outdoor(9) → chipping(5)");
+                println!("\n[step] ModeChange1: limited-flight(9) → chipping(5)");
                 client.configure_avr(avr_settings_mode_only(MODE_CHIPPING));
                 client.arm();
             }
 
-            // ── ModeChange1 (outdoor → chipping) ─────────────────────
+            // ── ModeChange1 (limited flight → chipping) ─────────────────────
             (Step::ModeChange1, BinaryEvent::Disarmed) => {
                 println!("  [disarmed] OK");
             }
@@ -213,9 +213,9 @@ fn run() -> Result<(), ironsight::ConnError> {
     }
 
     println!("\n=== ALL STEPS PASSED ===");
-    println!("  1. Connect + handshake + configure(outdoor) + arm  ✓");
+    println!("  1. Connect + handshake + configure(9) + arm        ✓");
     println!("  2. Keepalive received while armed                  ✓");
-    println!("  3. Mode change outdoor → chipping                  ✓");
+    println!("  3. Mode change limited flight → chipping           ✓");
     println!("  4. Keepalive after mode change                     ✓");
     println!("  5. Mode change chipping → putting                  ✓");
     println!("  6. Keepalive after second mode change              ✓");

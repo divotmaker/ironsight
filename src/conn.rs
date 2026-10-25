@@ -212,9 +212,11 @@ impl<S: Read + Write> BinaryConnection<S> {
                 Ok(0) => return Err(ConnError::Disconnected),
                 Ok(n) => {
                     let mut frames = self.splitter.feed(&self.read_buf[..n]);
-                    if let Some(first) = frames.pop() {
-                        // Stash extras (in arrival order — frames was built
-                        // left-to-right, pop takes from the end, so reverse).
+                    if !frames.is_empty() {
+                        // Return the first frame; stash the rest so they come
+                        // out in arrival order (`pending` is drained from the
+                        // end, so store them reversed).
+                        let first = frames.remove(0);
                         frames.reverse();
                         self.pending.extend(frames);
                         let env = Self::decode_wire(&first)?;
@@ -299,3 +301,66 @@ impl BinaryConnection<TcpStream> {
 
 /// Type alias for backwards compatibility.
 pub type Connection = BinaryConnection<TcpStream>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stream that returns all of its bytes in one read, then `WouldBlock`.
+    struct Burst(Vec<u8>);
+
+    impl Read for Burst {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+
+    impl Write for Burst {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn frames_from_one_read_come_out_in_arrival_order() {
+        let mut wire = Vec::new();
+        for text in [&b"\x0aPROCESSED\0"[..], b"\x05IDLE\0"] {
+            wire.extend(
+                RawFrame {
+                    dest: BusAddr::App,
+                    src: BusAddr::Avr,
+                    type_id: 0xE5,
+                    payload: text.to_vec(),
+                }
+                .encode(),
+            );
+        }
+        wire.extend(
+            RawFrame {
+                dest: BusAddr::App,
+                src: BusAddr::Avr,
+                type_id: 0xB1,
+                payload: vec![0x02, 0x00, 0x00],
+            }
+            .encode(),
+        );
+        let mut conn = BinaryConnection::new(Burst(wire));
+        let types: Vec<(u8, Vec<u8>)> = std::iter::from_fn(|| conn.recv().unwrap())
+            .map(|e| (e.type_id, e.raw))
+            .collect();
+        assert_eq!(types.len(), 3);
+        assert_eq!(types[0], (0xE5, b"\x0aPROCESSED\0".to_vec()));
+        assert_eq!(types[1], (0xE5, b"\x05IDLE\0".to_vec()));
+        assert_eq!(types[2].0, 0xB1);
+    }
+}

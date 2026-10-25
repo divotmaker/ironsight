@@ -753,7 +753,8 @@ Format: `[02 bus_addr acked_cmd]`
 #### 0x48 / 0xC8 &mdash; DSP_QUERY / DSP_QUERY_RESP
 
 Request: empty (0 bytes), APP &rarr; DSP.
-Response: 3 bytes, DSP &rarr; APP.
+Response: 3 bytes, DSP &rarr; APP. A response from the Xi's DSP has not been
+observed; ironsight does not rely on one (see `DSP_QUERY_TIMEOUT`, 2 s).
 
 ```
 [0]  version   (0x02)
@@ -768,6 +769,10 @@ Constant across sessions (same device).
 Request: empty, APP &rarr; DSP/AVR/PI.
 Response: 75-76 bytes of ASCII strings: model name, firmware version, serial
 number, build date/time.
+
+The Xi's DSP answers with 99 bytes: a binary header and one 16-byte text slot at
+the end holding firmware version and model (`"0.38 FS Xi"`). Its AVR answers
+in the 75-byte layout.
 
 #### 0xFD &mdash; PROD_INFO
 
@@ -988,7 +993,7 @@ Request format: `[03 00 XX 02]` where `XX` is the page offset.
 
 The commsIndex value is sent via 0xA5 `[02 00 XX]` to set the detection mode.
 
-| commsIndex | Mode                  | Description         | Notes                                           |
+| commsIndex | Mode                  | App label           | Notes                                           |
 | ---------- | --------------------- | ------------------- | ----------------------------------------------- |
 | 1          | Indoor                | Indoor              | Never observed in pcap                          |
 | **2**      | **LongIndoor**        | **Long Indoor**     | Observed in pcap (transient, never armed alone) |
@@ -996,16 +1001,30 @@ The commsIndex value is sent via 0xA5 `[02 00 XX]` to set the detection mode.
 | 4          | ClubSwing             | Club Swing Only     | No ball tracking. Never observed in pcap        |
 | **5**      | **SimulatorChipping** | **Chipping**        | MaxVel=120, Fs=37500.0                          |
 | 6          | SimulatorPutting      | Sim Putting         | Never observed in pcap                          |
-| **9**      | **Outdoor**           | **Normal/Outdoor**  | MaxVel=120, Fs=37500.0, club trigger off        |
+| **8**      | &mdash;               | **Outdoor**         | Full flight; needs unobstructed flight          |
+| **9**      | **Outdoor**           | **Limited flight**  | MaxVel=120, Fs=37500.0, club trigger off        |
 | 13         | RawSampling           | Environmental       | Never observed in pcap                          |
 | 14         | Putting               | Putting (dedicated) | Never observed in pcap                          |
 | 15         | ShortGameChipIn       | Chipping Indoor     | Never observed in pcap                          |
 | 16         | ShortGameChipOut      | Chipping Outdoor    | Never observed in pcap                          |
 
 Bold entries have been observed in pcap captures. Modes 3, 5, and 9 are the
-primary operating modes. Mode 2 (LongIndoor) only appears as a transient
-intermediate step during configuration &mdash; it is set and then immediately
-overwritten by the final target mode before arming.
+primary operating modes for indoor and simulator use. Mode 2 (LongIndoor) only
+appears as a transient intermediate step during configuration &mdash; it is set
+and then immediately overwritten by the final target mode before arming.
+
+FlightScope's FS Golf app calls mode 9 "Limited flight" and mode 8 "Outdoor".
+The Mode column holds the mode's name, which for 9 is `Outdoor`; mode 8 is
+listed by its app label only.
+Mode 9 (Limited flight) is for nets and simulator screens, where the ball's
+flight is cut short. Mode 8 (Outdoor) tracks the full flight and needs the ball
+to fly unobstructed (about 40 yd). In mode 8 a shot into a screen still
+produces the early result (0xE8), but the full result (0xD4) carries a launch
+speed and elevation of 0, and the AVR sends a text such as
+`Distance Model Error: 38 (ERROR_MODEL_TOO_LITTLE_TIME)`.
+
+When FS Golf switches to mode 8 it also writes params 0x0028, 0x0007, 0x0025
+and 0x0001 alongside the 0xA5 mode set.
 
 ---
 

@@ -1,7 +1,7 @@
-//! ironsight-frp — Flight Relay Protocol device for Mevo+/Gen2.
+//! ironsight-frp — Flight Relay Protocol device for Mevo+/Gen2/Xi.
 //!
-//! Connects to a FlightScope Mevo+ or Gen2 on TCP 5100, arms it, and streams
-//! shot data over FRP to a controller.
+//! Connects to a FlightScope Mevo+, Gen2 or Xi on TCP 5100, arms it, and
+//! streams shot data over FRP to a controller.
 //!
 //! ```text
 //! ironsight-frp [mevo-addr] [frp-target]
@@ -21,6 +21,7 @@ use ironsight::client::{BinaryClient, BinaryEvent};
 use ironsight::conn::{BinaryConnection, DEFAULT_ADDR};
 use ironsight::frp::FrpDevice;
 use ironsight::protocol::config;
+use ironsight::protocol::handshake::DeviceModel;
 use ironsight::seq::AvrSettings;
 
 fn main() -> ExitCode {
@@ -75,18 +76,27 @@ fn main() -> ExitCode {
             Ok(Some(event)) => {
                 match &event {
                     BinaryEvent::Handshake(h) => {
-                        eprintln!("ironsight-frp: handshake complete — {}", h.pi.ssid);
                         frp.set_device_name(h);
+                        eprintln!(
+                            "ironsight-frp: handshake complete — {} ({})",
+                            frp.device_name(),
+                            h.model,
+                        );
                         if let Err(e) = frp.send_device_info(h) {
                             eprintln!("ironsight-frp: send device_info failed: {e}");
                         }
 
-                        // Configure for indoor full-swing and arm
-                        client.configure_avr(AvrSettings {
-                            mode: config::MODE_INDOOR,
-                            params: vec![],
-                            radar_cal: None,
-                        });
+                        if h.model == DeviceModel::Xi {
+                            // The Xi runs in limited-flight mode (9) with its stored params
+                            client.configure_avr(AvrSettings::xi());
+                        } else {
+                            // Configure for indoor full-swing
+                            client.configure_avr(AvrSettings {
+                                mode: config::MODE_INDOOR,
+                                params: vec![],
+                                radar_cal: None,
+                            });
+                        }
                         client.arm();
                     }
                     BinaryEvent::Armed => {
@@ -122,15 +132,21 @@ fn main() -> ExitCode {
 
                 // Check for controller commands
                 if let Some(mode) = frp.check_controller() {
-                    eprintln!("ironsight-frp: detection mode → {mode}");
-                    let avr_mode = ironsight::frp::detection_mode_to_avr(mode);
-                    client.configure_avr(AvrSettings {
-                        mode: avr_mode,
-                        params: vec![],
-                        radar_cal: None,
-                    });
-                    client.arm();
-                    armed = false;
+                    if client.model() == DeviceModel::Xi {
+                        eprintln!(
+                            "ironsight-frp: detection mode → {mode} ignored (Xi stays in limited-flight mode)"
+                        );
+                    } else {
+                        eprintln!("ironsight-frp: detection mode → {mode}");
+                        let avr_mode = ironsight::frp::detection_mode_to_avr(mode);
+                        client.configure_avr(AvrSettings {
+                            mode: avr_mode,
+                            params: vec![],
+                            radar_cal: None,
+                        });
+                        client.arm();
+                        armed = false;
+                    }
                 }
 
                 thread::sleep(Duration::from_millis(1));

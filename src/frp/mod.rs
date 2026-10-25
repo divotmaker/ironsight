@@ -1,7 +1,7 @@
 //! FRP device adapter — bridges ironsight's binary protocol to the
 //! [Flight Relay Protocol](https://github.com/flightrelay/spec).
 //!
-//! Maps [`BinaryEvent`]s from a connected Mevo+/Gen2 to FRP envelopes and
+//! Maps [`BinaryEvent`]s from a connected Mevo+/Gen2/Xi to FRP envelopes and
 //! streams them to an FRP controller. The adapter always plays the FRP
 //! [`Role::Device`]; the transport direction is the caller's choice:
 //!
@@ -9,7 +9,7 @@
 //! - [`FrpDevice::bridge`] dials a central controller such as flighthook
 //!
 //! Either way the device emits shot envelopes and accepts `set_detection_mode`.
-//! Connections are established on a background thread so the caller's Mevo poll
+//! Connections are established on a background thread so the caller's device poll
 //! loop never blocks; a dropped connection is re-established automatically.
 //!
 //! Requires the `frp` feature.
@@ -27,6 +27,7 @@ use flightrelay::{
 
 use crate::client::{BinaryEvent, HandshakeOutcome};
 use crate::protocol::config;
+use crate::protocol::handshake::DeviceModel;
 use crate::seq::ShotDatum;
 
 pub use convert::{ball_flight, club_data};
@@ -34,9 +35,14 @@ pub use convert::{ball_flight, club_data};
 /// Backoff between failed connection attempts.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Device name derived from the handshake SSID (e.g. `"FS M2-ABC123"`).
+/// Device name derived from the handshake: the WiFi SSID reported by the
+/// camera Pi (e.g. `"FS M2-ABC123"`), or the model name on models without one
+/// (`"FlightScope Xi"`).
 fn device_name(handshake: &HandshakeOutcome) -> String {
-    handshake.pi.ssid.clone()
+    match handshake.pi {
+        Some(ref pi) => pi.ssid.clone(),
+        None => handshake.model.to_string(),
+    }
 }
 
 /// Map an FRP [`DetectionMode`] to the corresponding ironsight mode constant.
@@ -172,9 +178,16 @@ impl FrpDevice {
         self.conn.is_some()
     }
 
-    /// Set the device name (typically from handshake SSID).
+    /// Set the device name (the handshake SSID, or the model name on models
+    /// without a camera Pi).
     pub fn set_device_name(&mut self, handshake: &HandshakeOutcome) {
         self.device = device_name(handshake);
+    }
+
+    /// The FRP device name.
+    #[must_use]
+    pub fn device_name(&self) -> &str {
+        &self.device
     }
 
     /// Poll for incoming controller commands (non-blocking).
@@ -216,10 +229,17 @@ impl FrpDevice {
             format!("{:.1}", handshake.avr.status.roll),
         );
 
-        let model = if handshake.dsp.hw_info.dsp_type == 0xC0 {
-            "Mevo Gen2"
-        } else {
-            "Mevo+"
+        let model = match handshake.model {
+            DeviceModel::Xi => "Xi",
+            _ if handshake
+                .dsp
+                .hw_info
+                .as_ref()
+                .is_some_and(|hw| hw.dsp_type == 0xC0) =>
+            {
+                "Mevo Gen2"
+            }
+            _ => "Mevo+",
         };
 
         let env = FrpEnvelope {

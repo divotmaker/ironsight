@@ -83,38 +83,118 @@ impl DspQueryResp {
     }
 }
 
-/// Device info response (75-76 bytes). Type 0xE7.
+/// Device info response. Type 0xE7.
 ///
-/// Binary header followed by three 16-byte null-terminated text slots.
+/// Mevo+/Gen2: binary header followed by three 16-byte null-terminated text
+/// slots.
 /// AVR/PI (75B): header = [1..26], slots at 27/43/59.
 /// DSP   (76B): header = [1..27], slots at 28/44/60.
 /// Slot contents vary by bus:
 ///   DSP: version, serial, firmware tag
 ///   AVR: version + model, build date, build time
 ///   PI:  firmware rev, build date, build time
+///
+/// Xi DSP (99B): binary header followed by a single 16-byte text slot at the
+/// end of the payload holding the firmware version and model
+/// (e.g. `"0.38 FS Xi"`).
 #[derive(Debug, Clone)]
 pub struct DevInfoResp {
     /// Concatenation of all non-empty text slots, separated by spaces.
     pub text: String,
+    /// Raw payload bytes.
+    pub payload: Vec<u8>,
 }
 
 impl DevInfoResp {
     pub fn decode(payload: &[u8]) -> Result<Self> {
-        // byte[0] = len(payload) - 1.  DSP: 76B (len=75), AVR/PI: 75B (len=74).
-        let slot_start = if payload.len() >= 76 { 28 } else { 27 };
         let mut parts = Vec::new();
-        for i in 0..3 {
-            let offset = slot_start + i * 16;
-            if offset + 16 <= payload.len() {
-                let s = decode_cstr(&payload[offset..offset + 16]);
-                if !s.is_empty() {
-                    parts.push(s);
+        if payload.len() > 76 {
+            // Xi DSP layout: one text slot in the last 16 bytes.
+            let s = decode_cstr(&payload[payload.len() - 16..]);
+            let s = s.trim_end();
+            if !s.is_empty() {
+                parts.push(s.to_string());
+            }
+        } else {
+            // byte[0] = len(payload) - 1.  DSP: 76B (len=75), AVR/PI: 75B (len=74).
+            let slot_start = if payload.len() >= 76 { 28 } else { 27 };
+            for i in 0..3 {
+                let offset = slot_start + i * 16;
+                if offset + 16 <= payload.len() {
+                    let s = decode_cstr(&payload[offset..offset + 16]);
+                    if !s.is_empty() {
+                        parts.push(s);
+                    }
                 }
             }
         }
         Ok(Self {
             text: parts.join(" "),
+            payload: payload.to_vec(),
         })
+    }
+
+    /// Device model family named in this response.
+    ///
+    /// Meaningful for the DSP's response, which carries the model string.
+    #[must_use]
+    pub fn model(&self) -> DeviceModel {
+        DeviceModel::from_dev_info(self)
+    }
+}
+
+/// Launch monitor model family, detected from the DSP device info (0xE7).
+///
+/// The family decides the handshake: the Mevo+ and Mevo Gen2 have a camera
+/// Pi on the bus, the Xi does not. [`DeviceGen`] tells the Mevo generations
+/// apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum DeviceModel {
+    /// Mevo+ or Mevo Gen2: radar plus camera Pi.
+    #[default]
+    Mevo,
+    /// Xi: radar only, no camera Pi.
+    Xi,
+}
+
+impl DeviceModel {
+    /// Detect the model family from the DSP device info.
+    ///
+    /// The Xi names itself `"FS Xi"` in its DSP device info. Anything else is
+    /// treated as a Mevo.
+    #[must_use]
+    pub fn from_dev_info(info: &DevInfoResp) -> Self {
+        const XI_TAG: &[u8] = b"FS Xi";
+        if info.payload.windows(XI_TAG.len()).any(|w| w == XI_TAG) {
+            DeviceModel::Xi
+        } else {
+            DeviceModel::Mevo
+        }
+    }
+
+    /// Whether the device has a camera Pi (bus address 0x12).
+    ///
+    /// Without one, the PI handshake phase, camera configuration and PI
+    /// status polls are skipped.
+    #[must_use]
+    pub fn has_camera(&self) -> bool {
+        matches!(self, DeviceModel::Mevo)
+    }
+
+    /// Short label for logging and display.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            DeviceModel::Mevo => "Mevo",
+            DeviceModel::Xi => "Xi",
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FlightScope {}", self.label())
     }
 }
 
@@ -331,5 +411,35 @@ impl TimeSync {
         buf.push(self.session);
         buf.extend_from_slice(&self.tail);
         buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xi_dsp_dev_info() {
+        let mut p = vec![0u8; 99];
+        p[0] = 0x62;
+        p[83..97].copy_from_slice(b"0.38 FS Xi    ");
+        let info = DevInfoResp::decode(&p).unwrap();
+        assert_eq!(info.text, "0.38 FS Xi");
+        assert_eq!(info.model(), DeviceModel::Xi);
+        assert!(!info.model().has_camera());
+        assert_eq!(info.model().to_string(), "FlightScope Xi");
+    }
+
+    #[test]
+    fn mevo_dsp_dev_info() {
+        let mut p = vec![0u8; 76];
+        p[0] = 0x4B;
+        p[28..37].copy_from_slice(b"FS Mevo 2");
+        p[44..51].copy_from_slice(b"BM17.04");
+        p[60..65].copy_from_slice(b"ABCDE");
+        let info = DevInfoResp::decode(&p).unwrap();
+        assert_eq!(info.text, "FS Mevo 2 BM17.04 ABCDE");
+        assert_eq!(info.model(), DeviceModel::Mevo);
+        assert!(info.model().has_camera());
     }
 }

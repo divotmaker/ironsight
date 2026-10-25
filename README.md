@@ -11,8 +11,8 @@ FlightScope and Mevo are trademarks of their respective owner.
 
 ## Description
 
-Client library for the FlightScope Mevo+ / Mevo Gen2 protocol. Two non-blocking
-clients share the same `poll()` pattern:
+Client library for the FlightScope Mevo+ / Mevo Gen2 / Xi protocol. Two
+non-blocking clients share the same `poll()` pattern:
 
 - **`BinaryClient`** — binary radar protocol (TCP port 5100). Handles
   handshake, configuration, arming, keepalives, and shot detection.
@@ -107,9 +107,39 @@ until `1.0`.
 | ------------ | --------------- | --------------- |
 | Mevo+ (Gen1) | `FS M2-XXXXXX`  | Fully supported |
 | Mevo Gen2    | `FS MG2-XXXXXX` | Fully supported |
+| Xi           | &mdash;         | **Alpha**       |
 
-Device generation is detected at connection time via the `0xC8` DSP query
-response (`dspType`: `0x80` = Mevo+, `0xC0` = Gen2).
+The model family (`DeviceModel`) is detected during the handshake from the DSP
+device info (`0xE7`): the Xi names itself `FS Xi` there. Mevo generation is
+detected from the `0xC8` DSP query response (`dspType`: `0x80` = Mevo+,
+`0xC0` = Gen2).
+
+### FlightScope Xi (alpha)
+
+The Xi speaks the same protocol on the same address and port
+(`192.168.2.1:5100`), with the same framing and bus addresses. It has no camera
+Pi, so `BinaryClient` adapts once the handshake has identified it:
+
+- The PI handshake phase is skipped; `HandshakeOutcome::pi` is `None`.
+- Nothing is ever sent to the PI bus address: no PI status polls in arming or
+  keepalives, and `configure_cam()` sends nothing (it reports `Configured`
+  straight away).
+- ironsight does not rely on the DSP query (`0x48`): a response from the Xi
+  has not been observed, and without one the handshake moves on after
+  `DSP_QUERY_TIMEOUT` (2 s), leaving `DspSync::hw_info` as `None`.
+- The AVR sync stops after the IF calibration exchange (no factory
+  calibration, hardware config query, param `0x64` or time sync).
+- `AvrSettings::xi()` configures detection mode 9 (`MODE_LIMITED_FLIGHT`, for
+  nets and simulator screens) with no parameter writes or radar calibration,
+  so the Xi keeps the values stored on it. `AvrSettings::xi_with_mode(mode)`
+  selects another mode, e.g. `MODE_FULL_OUTDOOR` (8) for full-flight outdoor
+  use; only the mode is written, not the extra params FS Golf sends with it.
+- Shot results (`E8`, `D4`, `ED`, `EF`) decode with the Mevo+ layouts.
+
+Alpha means it connects, arms and reports shots, but has had little real-world
+use. Only limited flight (9) has been seen working on an Xi; full-flight
+outdoor (8) is untested there, and putting/chipping modes have not been mapped
+for the Xi yet. See [SEQUENCE.md](docs/SEQUENCE.md#8-flightscope-xi-alpha).
 
 ## Protocol Documentation
 
@@ -133,21 +163,29 @@ handled automatically:
 
 ```rust
 use ironsight::client::{BinaryClient, BinaryEvent};
+use ironsight::protocol::handshake::DeviceModel;
+use ironsight::seq::AvrSettings;
 use ironsight::BinaryConnection;
 
 let conn = BinaryConnection::connect("192.168.2.1:5100")?;
 let mut client = BinaryClient::from_tcp(conn)?;
 
 client.handshake();
-client.configure_avr(avr_settings);
-client.configure_cam(cam_config);
-client.arm();
 
 loop {
     match client.poll()? {
-        Some(BinaryEvent::Handshake(h)) => println!("SSID: {}", h.pi.ssid),
+        Some(BinaryEvent::Handshake(h)) => {
+            println!("Connected to {}", h.model);
+            if h.model == DeviceModel::Xi {
+                client.configure_avr(AvrSettings::xi());
+            } else {
+                client.configure_avr(avr_settings.clone());
+                client.configure_cam(cam_config.clone());
+            }
+            client.arm();
+        }
         Some(BinaryEvent::Armed) => println!("Ready for shots"),
-        Some(BinaryEvent::Shot(data)) => println!("Shot! {data:?}"),
+        Some(BinaryEvent::ShotComplete(data)) => println!("Shot! {data:?}"),
         _ => {}
     }
 }

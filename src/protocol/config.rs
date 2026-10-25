@@ -13,7 +13,18 @@ pub const MODE_PUTTING: u8 = 3;
 pub const MODE_CLUB_SWING: u8 = 4;
 pub const MODE_CHIPPING: u8 = 5;
 pub const MODE_SIM_PUTTING: u8 = 6;
-pub const MODE_OUTDOOR: u8 = 9;
+/// Full-flight outdoor detection. FlightScope's FS Golf app calls this mode
+/// "Outdoor". The ball must fly freely: shots into a net or screen do not
+/// produce a valid flight result (0xD4).
+pub const MODE_FULL_OUTDOOR: u8 = 8;
+/// Limited-flight detection, for nets and simulator screens. FlightScope's
+/// FS Golf app calls this mode "Limited flight".
+pub const MODE_LIMITED_FLIGHT: u8 = 9;
+/// Alias of [`MODE_LIMITED_FLIGHT`].
+#[deprecated(
+    note = "9 is FS Golf's 'Limited flight' mode; use MODE_LIMITED_FLIGHT, or MODE_FULL_OUTDOOR (8) for full-flight outdoor"
+)]
+pub const MODE_OUTDOOR: u8 = MODE_LIMITED_FLIGHT;
 pub const MODE_RAW_SAMPLING: u8 = 13;
 pub const MODE_PUTTING_DEDICATED: u8 = 14;
 pub const MODE_CHIP_IN: u8 = 15;
