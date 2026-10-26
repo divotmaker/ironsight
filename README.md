@@ -94,12 +94,11 @@ at your option.
 
 ## Status
 
-**Alpha** (`0.0.x`). The protocol is reverse-engineered and still being mapped —
-the API will change as new message types are decoded and existing ones are
-refined. This crate follows [SemVer](https://semver.org/): while the version is
-`0.0.x`, any release may contain breaking changes. Once the API stabilizes it
-will move to `0.1.0`, after which breaking changes will bump the minor version
-until `1.0`.
+Pre-1.0 (`0.x`). The protocol is reverse-engineered and still being mapped —
+some message types and modes aren't decoded yet, and the API may change as
+that work continues. This crate follows [SemVer](https://semver.org/): while
+the version is `0.x`, any minor release may contain breaking changes. Once the
+API stabilizes it will move to `1.0`.
 
 ## Supported Devices
 
@@ -107,14 +106,14 @@ until `1.0`.
 | ------------ | --------------- | --------------- |
 | Mevo+ (Gen1) | `FS M2-XXXXXX`  | Fully supported |
 | Mevo Gen2    | `FS MG2-XXXXXX` | Fully supported |
-| Xi           | &mdash;         | **Alpha**       |
+| Xi           | &mdash;         | **Supported**   |
 
 The model family (`DeviceModel`) is detected during the handshake from the DSP
 device info (`0xE7`): the Xi names itself `FS Xi` there. Mevo generation is
 detected from the `0xC8` DSP query response (`dspType`: `0x80` = Mevo+,
 `0xC0` = Gen2).
 
-### FlightScope Xi (alpha)
+### FlightScope Xi
 
 The Xi speaks the same protocol on the same address and port
 (`192.168.2.1:5100`), with the same framing and bus addresses. It has no camera
@@ -136,10 +135,10 @@ Pi, so `BinaryClient` adapts once the handshake has identified it:
   use; only the mode is written, not the extra params FS Golf sends with it.
 - Shot results (`E8`, `D4`, `ED`, `EF`) decode with the Mevo+ layouts.
 
-Alpha means it connects, arms and reports shots, but has had little real-world
-use. Only limited flight (9) has been seen working on an Xi; full-flight
-outdoor (8) is untested there, and putting/chipping modes have not been mapped
-for the Xi yet. See [SEQUENCE.md](docs/SEQUENCE.md#8-flightscope-xi-alpha).
+It connects, arms and reports shots, and has been verified against
+FlightScope's own FS Golf app on a real Xi. Only limited flight (9) has been
+verified this way; full-flight outdoor (8) is untested, and putting/chipping
+modes have not been mapped for the Xi yet. See [SEQUENCE.md](docs/SEQUENCE.md#8-flightscope-xi).
 
 ## Protocol Documentation
 

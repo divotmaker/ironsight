@@ -469,12 +469,12 @@ The three messages that carry the primary shot result:
 
 ---
 
-## 8. FlightScope Xi (alpha)
+## 8. FlightScope Xi
 
 The Xi uses the same framing, checksum, bus addresses, address and port as the
 Mevo+. It has no camera Pi: nothing on the bus answers at address 0x12, so every
-step that waits for the PI is left out. Status: alpha (connects, arms, reports
-shots; little real-world use so far).
+step that waits for the PI is left out. Status: supported (connects, arms,
+reports shots; verified against FlightScope's own FS Golf app).
 
 ### 8.1 Detection
 
