@@ -12,6 +12,7 @@
 //! else is a bind address that controllers connect to. Defaults to
 //! `0.0.0.0:5880`.
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::process::ExitCode;
 use std::thread;
@@ -22,7 +23,7 @@ use ironsight::conn::{BinaryConnection, DEFAULT_ADDR};
 use ironsight::frp::FrpDevice;
 use ironsight::protocol::config;
 use ironsight::protocol::handshake::DeviceModel;
-use ironsight::seq::AvrSettings;
+use ironsight::seq::{AvrSettings, XiSettings};
 
 fn main() -> ExitCode {
     let mevo_addr = std::env::args()
@@ -87,8 +88,8 @@ fn main() -> ExitCode {
                         }
 
                         if h.model == DeviceModel::Xi {
-                            // The Xi runs in limited-flight mode (9) with its stored params
-                            client.configure_avr(AvrSettings::xi());
+                            // FS Golf's full-swing configuration, limited-flight mode (9)
+                            client.configure_xi(XiSettings::default());
                         } else {
                             // Configure for indoor full-swing
                             client.configure_avr(AvrSettings {
@@ -113,6 +114,16 @@ fn main() -> ExitCode {
                                 f.total, f.carry_distance, f.launch_speed
                             );
                         }
+                    }
+                    BinaryEvent::StepRefused(env) => {
+                        let hex: String = env.raw.iter().fold(String::new(), |mut s, b| {
+                            let _ = write!(s, "{b:02x}");
+                            s
+                        });
+                        eprintln!(
+                            "ironsight-frp: warning: step refused, continuing: 0x{:02X} {hex}",
+                            env.type_id
+                        );
                     }
                     BinaryEvent::Keepalive(_) => {}
                     _ => {}

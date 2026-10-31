@@ -5,6 +5,7 @@
 //! Requires: connected to the device's WiFi (Mevo+: SSID = device serial).
 //! `device-addr` defaults to 192.168.2.1:5100.
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::process;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use ironsight::conn::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
 use ironsight::protocol::config::{MODE_CHIPPING, ParamData, ParamValue, RadarCal};
 use ironsight::protocol::handshake::DeviceModel;
-use ironsight::seq::AvrSettings;
+use ironsight::seq::{AvrSettings, XiSettings};
 
 fn ms_to_mph(ms: f64) -> f64 {
     ms * 2.23694
@@ -76,8 +77,8 @@ fn run() -> Result<(), ironsight::ConnError> {
                     );
 
                     if h.model == DeviceModel::Xi {
-                        // No camera; limited-flight mode with the device's stored params.
-                        client.configure_avr(AvrSettings::xi());
+                        // No camera; FS Golf's full-swing configuration in limited-flight mode.
+                        client.configure_xi(XiSettings::default());
                     } else {
                         client.configure_avr(default_avr_settings());
                         client.configure_cam(default_cam_config());
@@ -129,6 +130,16 @@ fn run() -> Result<(), ironsight::ConnError> {
                 }
                 BinaryEvent::Disarmed => {
                     println!("\n=== Disarmed ===");
+                }
+                BinaryEvent::StepRefused(env) => {
+                    let hex = env.raw.iter().fold(String::new(), |mut s, b| {
+                        let _ = write!(s, "{b:02x}");
+                        s
+                    });
+                    println!(
+                        "  WARNING: step refused, continuing: 0x{:02X} {hex}",
+                        env.type_id
+                    );
                 }
                 BinaryEvent::ShotDatum(_) | BinaryEvent::Keepalive(_) | BinaryEvent::Message(_) => {
                     // on_recv callback already printed it

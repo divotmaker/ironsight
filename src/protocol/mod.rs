@@ -121,6 +121,9 @@ pub enum Command {
     // -- Shot ack (empty payloads) --
     ShotDataAck,
     ShotResultReq,
+
+    // -- Result ack (the Xi's flight results) --
+    ConfigAck(status::ConfigAck),
 }
 
 impl Command {
@@ -171,6 +174,7 @@ impl Command {
             Command::SensorAct(m) => (TYPE_SENSOR_ACT, m.encode()),
             Command::ShotDataAck => (TYPE_SHOT_DATA_ACK, vec![]),
             Command::ShotResultReq => (TYPE_SHOT_RESULT_REQ, vec![]),
+            Command::ConfigAck(m) => (TYPE_CONFIG_ACK, m.encode()),
         };
 
         RawFrame {

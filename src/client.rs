@@ -28,7 +28,7 @@ use crate::protocol::status::{AvrStatus, DspStatus, PiStatus};
 use crate::seq::{
     self, Action, ArmSequencer, AvrConfigSequencer, AvrSequencer, AvrSettings, AvrSync,
     CameraConfigSequencer, DisarmSequencer, DspSequencer, DspSync, PiSequencer, PiSync, Sequence,
-    ShotData, ShotDatum, ShotSequencer,
+    ShotData, ShotDatum, ShotSequencer, XiConfigSequencer, XiSettings,
 };
 
 // ---------------------------------------------------------------------------
@@ -63,6 +63,12 @@ pub enum BinaryEvent {
     /// from DSP/AVR/PI responses. Useful for staleness detection and
     /// telemetry updates.
     Keepalive(StatusSnapshot),
+    /// The device refused (0x94) a step of the Xi configuration or the Xi
+    /// DSP power-mode write, and the operation carried on with its next
+    /// step. Carries the 0x94 frame: `raw` is `[02 bus type & 0x7F]`, the
+    /// refusing bus and the refused command. Worth logging as a warning
+    /// with that hex. Emitted before the operation's own completion event.
+    StepRefused(Envelope),
     /// Any message not consumed by the active operation.
     Message(Envelope),
 }
@@ -94,6 +100,7 @@ pub struct StatusSnapshot {
 enum QueuedOp {
     Handshake,
     ConfigureAvr(AvrSettings),
+    ConfigureXi(XiSettings),
     ConfigureCam(CamConfig),
     Arm,
     Keepalive,
@@ -121,9 +128,10 @@ enum HandshakePhase {
     Pi(PiSequencer),
 }
 
-/// Single-phase configure operations (AVR or camera, independently).
+/// Single-phase configure operations (AVR, Xi or camera, independently).
 enum ConfigurePhase {
     Avr(AvrConfigSequencer),
+    Xi(XiConfigSequencer),
     Camera(CameraConfigSequencer),
 }
 
@@ -249,6 +257,9 @@ pub struct BinaryClient<S: Read + Write> {
     /// Event produced without sending anything (camera configuration on a
     /// model without a camera). Returned by the next `poll()`.
     ready_event: Option<BinaryEvent>,
+    /// The Xi's connect-time configuration block has been sent on this
+    /// connection.
+    xi_connect_sent: bool,
 }
 
 impl<S: Read + Write> BinaryClient<S> {
@@ -280,6 +291,7 @@ impl<S: Read + Write> BinaryClient<S> {
             trigger_time: None,
             early_shot: ShotData::default(),
             ready_event: None,
+            xi_connect_sent: false,
         }
     }
 
@@ -288,6 +300,9 @@ impl<S: Read + Write> BinaryClient<S> {
     /// Drives the active operation (if any), processes incoming messages,
     /// and manages keepalive scheduling. Returns `Ok(None)` when no data
     /// is available (non-blocking).
+    ///
+    /// On the Xi, every 0xE8 and 0xD4 flight result is acked with 0x95 as
+    /// soon as it is received (see [`seq::result_ack`]).
     ///
     /// # Errors
     ///
@@ -331,6 +346,11 @@ impl<S: Read + Write> BinaryClient<S> {
                 HandshakePhase::Dsp(ref mut dsp) => {
                     for a in dsp.check_timeout() {
                         seq::send_action(&mut self.conn, a)?;
+                    }
+                    // On the Xi a timed-out power-mode write is the last
+                    // DSP step.
+                    if dsp.is_complete() {
+                        return self.advance_phase();
                     }
                 }
                 HandshakePhase::Avr(ref mut avr) => {
@@ -384,6 +404,12 @@ impl<S: Read + Write> BinaryClient<S> {
             None => return Ok(None),
         };
 
+        // 5b. Xi result ack: answer an E8 or D4 before anything else
+        //     handles the frame.
+        if let Some(ack) = seq::result_ack(self.model(), &env) {
+            seq::send_action(&mut self.conn, ack)?;
+        }
+
         // 6. Update status cache.
         match (&env.message, env.src) {
             (Message::DspStatus(s), BusAddr::Dsp) => self.status.dsp = Some(s.clone()),
@@ -412,12 +438,23 @@ impl<S: Read + Write> BinaryClient<S> {
                         | (Message::PiStatus(_), BusAddr::Pi)
                 );
             if !dominated {
-                match Self::feed_active(active, &env, &mut self.conn)? {
-                    FeedResult::Consumed => return Ok(None),
-                    FeedResult::Intermediate(event) => return Ok(Some(*event)),
-                    FeedResult::PhaseComplete => return self.advance_phase(),
-                    FeedResult::Done => return self.finish_op(),
-                }
+                let result = Self::feed_active(active, &env, &mut self.conn)?;
+                let refused = Self::take_refused(active).map(BinaryEvent::StepRefused);
+                let event = match result {
+                    FeedResult::Consumed => None,
+                    FeedResult::Intermediate(event) => Some(*event),
+                    FeedResult::PhaseComplete => self.advance_phase()?,
+                    FeedResult::Done => self.finish_op()?,
+                };
+                let Some(refused) = refused else {
+                    return Ok(event);
+                };
+                // The refusal goes first; the operation's own event follows
+                // on the next poll. Neither refusing operation finishes by
+                // starting another, so `ready_event` is free here.
+                debug_assert!(self.ready_event.is_none());
+                self.ready_event = event;
+                return Ok(Some(refused));
             }
         }
 
@@ -495,6 +532,20 @@ impl<S: Read + Write> BinaryClient<S> {
     /// Emits [`BinaryEvent::Disarmed`] then [`BinaryEvent::Configured`].
     pub fn configure_avr(&mut self, avr: AvrSettings) {
         self.queue.push_back(QueuedOp::ConfigureAvr(avr));
+    }
+
+    /// Enqueue the Xi's configuration, sent the way FS Golf sends it
+    /// (see [`XiConfigSequencer`]).
+    ///
+    /// The first Xi configuration on a connection sends the connect-time
+    /// block (parameter writes, radar calibration) followed by the mode
+    /// block; later ones send the mode block only, for a mode change. If
+    /// the device is armed when this operation starts executing, it is
+    /// disarmed first. Emits [`BinaryEvent::Disarmed`] (when it disarmed)
+    /// then [`BinaryEvent::Configured`]. Arm afterwards with
+    /// [`arm()`](Self::arm).
+    pub fn configure_xi(&mut self, xi: XiSettings) {
+        self.queue.push_back(QueuedOp::ConfigureXi(xi));
     }
 
     /// Enqueue camera configuration.
@@ -576,17 +627,30 @@ impl<S: Read + Write> BinaryClient<S> {
                 if self.armed {
                     // Device is armed — disarm first, then re-queue configure.
                     self.queue.push_front(QueuedOp::ConfigureAvr(avr_settings));
-                    let (seq, actions) = DisarmSequencer::new();
-                    for a in actions {
-                        seq::send_action(&mut self.conn, a)?;
-                    }
-                    self.active = Some(ActiveOp::Disarm(seq));
+                    self.start_disarm()?;
                 } else {
                     let (seq, actions) = AvrConfigSequencer::new(avr_settings);
                     for a in actions {
                         seq::send_action(&mut self.conn, a)?;
                     }
                     self.active = Some(ActiveOp::Configure(ConfigurePhase::Avr(seq)));
+                }
+            }
+            QueuedOp::ConfigureXi(xi) => {
+                if self.armed {
+                    self.queue.push_front(QueuedOp::ConfigureXi(xi));
+                    self.start_disarm()?;
+                } else {
+                    let (seq, actions) = if self.xi_connect_sent {
+                        XiConfigSequencer::mode_change(&xi)
+                    } else {
+                        self.xi_connect_sent = true;
+                        XiConfigSequencer::connect(&xi)
+                    };
+                    for a in actions {
+                        seq::send_action(&mut self.conn, a)?;
+                    }
+                    self.active = Some(ActiveOp::Configure(ConfigurePhase::Xi(seq)));
                 }
             }
             QueuedOp::ConfigureCam(_) if !self.model().has_camera() => {
@@ -618,7 +682,30 @@ impl<S: Read + Write> BinaryClient<S> {
         Ok(())
     }
 
+    /// Start an explicit disarm (the configure op that needs it has been
+    /// re-queued at the front).
+    fn start_disarm(&mut self) -> Result<(), ConnError> {
+        let (seq, actions) = DisarmSequencer::new();
+        for a in actions {
+            seq::send_action(&mut self.conn, a)?;
+        }
+        self.active = Some(ActiveOp::Disarm(seq));
+        Ok(())
+    }
+
     // -- Internal: feed a message to the active operation -------------------
+
+    /// The 0x94 that ended a step of the active operation, if any.
+    fn take_refused(active: &mut ActiveOp) -> Option<Envelope> {
+        match active {
+            ActiveOp::Configure(ConfigurePhase::Xi(seq)) => seq.take_refused(),
+            ActiveOp::Handshake { phase, .. } => match &mut **phase {
+                HandshakePhase::Dsp(seq) => seq.take_refused(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 
     fn feed_active(
         active: &mut ActiveOp,
@@ -660,6 +747,7 @@ impl<S: Read + Write> BinaryClient<S> {
             ActiveOp::Configure(config_phase) => {
                 let actions = match config_phase {
                     ConfigurePhase::Avr(seq) => seq.feed(env),
+                    ConfigurePhase::Xi(seq) => seq.feed(env),
                     ConfigurePhase::Camera(seq) => seq.feed(env),
                 };
                 for a in actions {
@@ -667,6 +755,7 @@ impl<S: Read + Write> BinaryClient<S> {
                 }
                 let complete = match config_phase {
                     ConfigurePhase::Avr(seq) => seq.is_complete(),
+                    ConfigurePhase::Xi(seq) => seq.is_complete(),
                     ConfigurePhase::Camera(seq) => seq.is_complete(),
                 };
                 if complete {
@@ -784,8 +873,8 @@ impl<S: Read + Write> BinaryClient<S> {
         // Detect if a Mevo was armed from a prior session.
         // DspStatus state 6 = armed. This ensures the next
         // configure_avr will auto-disarm. The Xi's DSP status has a
-        // different layout; its configure phase opens with a B0[01 00]
-        // config gate, which disarms it.
+        // different layout; its configuration sends B0[01 00] before the
+        // mode block, which disarms it.
         if outcome.model == DeviceModel::Mevo && outcome.dsp.status.state() == 6 {
             self.armed = true;
         }
@@ -880,6 +969,7 @@ mod tests {
     use crate::frame::{FrameSplitter, RawFrame};
     use crate::protocol::camera::CamConfig;
     use crate::protocol::config::{MODE_FULL_OUTDOOR, MODE_LIMITED_FLIGHT};
+    use crate::seq::XiShotType;
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -983,6 +1073,20 @@ mod tests {
         outbox: VecDeque<u8>,
         /// ED returned for the next ShotResultReq.
         shot_ed: Option<Vec<u8>>,
+        /// Armed by B0 `[01 01]`, disarmed by B0 `[01 00]`.
+        armed: bool,
+        /// DSP power mode (param 0x01 on the DSP); 0 until written.
+        dsp_power_mode: u8,
+        /// Frames (dest, type, payload) refused once with a 0x94 instead of
+        /// their normal reply.
+        refuse: Vec<(BusAddr, u8, Vec<u8>)>,
+        /// Frames (dest, type, payload) left unanswered once.
+        ignore: Vec<(BusAddr, u8, Vec<u8>)>,
+        /// AVR status polls refused (0x94 `[02 30 2A]`) before the first
+        /// answer, as after power-on.
+        avr_boot_nacks: usize,
+        /// Refuse the DSP query instead of leaving it unanswered.
+        nack_dsp_query: bool,
     }
 
     impl XiState {
@@ -1001,9 +1105,44 @@ mod tests {
         /// query timeout path is exercised.
         fn respond(&mut self, f: &RawFrame) {
             let p = &f.payload;
+            if let Some(i) = self
+                .refuse
+                .iter()
+                .position(|(d, t, pl)| *d == f.dest && *t == f.type_id && pl == p)
+            {
+                self.refuse.remove(i);
+                self.push(f.dest, 0x94, vec![0x02, f.dest as u8, f.type_id & 0x7F]);
+                return;
+            }
+            if let Some(i) = self
+                .ignore
+                .iter()
+                .position(|(d, t, pl)| *d == f.dest && *t == f.type_id && pl == p)
+            {
+                self.ignore.remove(i);
+                return;
+            }
             match (f.dest, f.type_id) {
                 (BusAddr::Dsp, 0xAA) => self.push(BusAddr::Dsp, 0xAA, xi_dsp_status()),
+                (BusAddr::Avr, 0xAA) if self.avr_boot_nacks > 0 => {
+                    self.avr_boot_nacks -= 1;
+                    self.push(BusAddr::Avr, 0x94, vec![0x02, 0x30, 0x2A]);
+                }
                 (BusAddr::Avr, 0xAA) => self.push(BusAddr::Avr, 0xAA, xi_avr_status()),
+                (BusAddr::Dsp, 0x48) if self.nack_dsp_query => {
+                    self.push(BusAddr::Dsp, 0x94, vec![0x02, 0x40, 0x48]);
+                }
+                (BusAddr::Dsp, 0xBF) => {
+                    self.push(BusAddr::Dsp, 0x95, vec![0x02, 0x40, 0x3F]);
+                    if p[3] == 0x01 && p[6] != self.dsp_power_mode {
+                        let req =
+                            format!("  REQ Power Mode : {} ({}) \0", p[6], self.dsp_power_mode);
+                        let new = format!("  NEW Power Mode : {} \0", p[6]);
+                        self.push(BusAddr::Dsp, 0xE3, req.into_bytes());
+                        self.push(BusAddr::Dsp, 0xE3, new.into_bytes());
+                        self.dsp_power_mode = p[6];
+                    }
+                }
                 (BusAddr::Dsp, 0x67) => self.push(BusAddr::Dsp, 0xE7, xi_dsp_dev_info()),
                 (BusAddr::Avr, 0x67) => self.push(BusAddr::Avr, 0xE7, xi_avr_dev_info()),
                 (BusAddr::Dsp, 0xFD) => {
@@ -1023,12 +1162,17 @@ mod tests {
                 }
                 (BusAddr::Avr, 0xBF) => self.push(BusAddr::Avr, 0x95, vec![0x02, 0x30, 0x3F]),
                 (BusAddr::Avr, 0xD0) => self.push(BusAddr::Avr, 0xD1, vec![0u8; 171]),
-                (BusAddr::Avr, 0xA5) => self.push(BusAddr::Avr, 0xA5, p.clone()),
+                (BusAddr::Avr, 0xA5 | 0xA4) => self.push(BusAddr::Avr, f.type_id, p.clone()),
                 (BusAddr::Avr, 0xB0) => {
                     self.push(BusAddr::Avr, 0x95, vec![0x02, 0x30, 0x30]);
                     if p == &[0x01, 0x01] {
+                        self.armed = true;
                         self.push(BusAddr::Avr, 0xE3, b"\n\rARMED Xi\0".to_vec());
                         self.push(BusAddr::Avr, 0xE3, b" INDOOR\0".to_vec());
+                    } else if self.armed {
+                        self.armed = false;
+                        self.push(BusAddr::Avr, 0xE3, b"  ARMED CANCELLED\0".to_vec());
+                        self.push(BusAddr::Avr, 0xB1, vec![0x02, 0x00, 0x00]);
                     }
                 }
                 (BusAddr::Avr, 0x6D) => {
@@ -1127,7 +1271,7 @@ mod tests {
         assert!(h.avr.avr_config.is_none());
 
         // Configure + arm. The camera config is a no-op on the Xi.
-        client.configure_avr(AvrSettings::xi());
+        client.configure_xi(XiSettings::default());
         client.configure_cam(CamConfig::fusion_preset());
         client.arm();
         poll_until(&mut client, &mut events, |e| {
@@ -1185,24 +1329,36 @@ mod tests {
         // Nothing is ever sent to the PI.
         assert!(st.received.iter().all(|f| f.dest != BusAddr::Pi));
         // Mevo-only handshake requests are not sent.
-        for type_id in [0x23, 0xD2, 0x9B, 0xDE, 0x82, 0x83, 0x90, 0xA4] {
+        for type_id in [0x23, 0xD2, 0x9B, 0xDE, 0x82, 0x83, 0x90] {
             assert!(
                 st.received.iter().all(|f| f.type_id != type_id),
                 "unexpected 0x{type_id:02X}"
             );
         }
-        // No parameter writes; param reads limited to 0x0C and 0x0D.
-        assert!(st.sent(BusAddr::Avr, 0xBF).is_empty());
+        // One DSP write: power mode Normal.
+        let dsp_bf = st.sent(BusAddr::Dsp, 0xBF);
+        assert_eq!(dsp_bf.len(), 1);
+        assert_eq!(dsp_bf[0].payload, hex("06000001000001"));
+        assert_eq!(st.dsp_power_mode, 1);
+        // FS Golf's configuration: 19 param writes, param 0x02 read
+        // after the handshake's 0x0C and 0x0D, one radar cal.
+        assert_eq!(st.sent(BusAddr::Avr, 0xBF).len(), 19);
         let reads: Vec<u8> = st
             .sent(BusAddr::Avr, 0xBE)
             .iter()
             .map(|f| f.payload[3])
             .collect();
-        assert_eq!(reads, [0x0C, 0x0D]);
-        // Detection mode 9 (limited flight).
-        let modes = st.sent(BusAddr::Avr, 0xA5);
-        assert_eq!(modes.len(), 1);
-        assert_eq!(modes[0].payload, [0x02, 0x00, MODE_LIMITED_FLIGHT]);
+        assert_eq!(reads, [0x0C, 0x0D, 0x02]);
+        let cal = st.sent(BusAddr::Avr, 0xA4);
+        assert_eq!(cal.len(), 1);
+        assert_eq!(cal[0].payload, [0x06, 0x09, 0x86, 0x00, 0x19, 0x00, 0x00]);
+        // Mode 8 first, then detection mode 9 (limited flight) twice.
+        let modes: Vec<u8> = st
+            .sent(BusAddr::Avr, 0xA5)
+            .iter()
+            .map(|f| f.payload[2])
+            .collect();
+        assert_eq!(modes, [0x08, MODE_LIMITED_FLIGHT, MODE_LIMITED_FLIGHT]);
         // Armed once at startup and re-armed after the shot.
         let arms = st
             .sent(BusAddr::Avr, 0xB0)
@@ -1211,6 +1367,413 @@ mod tests {
             .count();
         assert_eq!(arms, 2);
         assert_eq!(st.sent(BusAddr::Avr, 0x6D).len(), 1);
+    }
+
+    /// Frames sent, as "DEST TYPE payload".
+    fn tx_lines(frames: &[RawFrame]) -> Vec<String> {
+        use std::fmt::Write as _;
+        frames
+            .iter()
+            .map(|f| {
+                let hex = f.payload.iter().fold(String::new(), |mut s, b| {
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+                format!("{} {:02X} {hex}", f.dest, f.type_id)
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The Xi connection: DSP sync ending with the DSP power-mode write
+    /// right after the DSP config query (0x21) is answered, then AVR sync,
+    /// the configuration (its first frame is the AVR Altitude write) and the
+    /// arm.
+    #[test]
+    fn xi_connect_sequence_wakes_the_dsp_after_its_config_query() {
+        let state = Rc::new(RefCell::new(XiState {
+            nack_dsp_query: true,
+            ..XiState::default()
+        }));
+        let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
+        let mut events = Vec::new();
+        client.handshake();
+        client.configure_xi(XiSettings::default());
+        client.arm();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Armed)
+        });
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, BinaryEvent::StepRefused(_)))
+        );
+        let st = state.borrow();
+        let lines = tx_lines(&st.received);
+        assert_eq!(
+            lines[..18],
+            [
+                "DSP AA 0101",
+                "DSP 48",
+                "DSP 67",
+                "DSP FD 0100",
+                "DSP FD 0108",
+                "DSP FD 0109",
+                "DSP 21",
+                "DSP BF 06000001000001",
+                "AVR AA 0101",
+                "AVR AA 0101",
+                "AVR 67",
+                "AVR 67",
+                "AVR BE 0300000c",
+                "AVR BE 0300000d",
+                "AVR 21",
+                "AVR D0 020008",
+                "AVR BF 06000001000000",
+                "AVR A5 020008",
+            ]
+        );
+        // After the handshake the DSP gets only the arm's status poll.
+        assert!(
+            lines[18..]
+                .iter()
+                .filter(|l| l.starts_with("DSP "))
+                .all(|l| l == "DSP AA 0101")
+        );
+        assert_eq!(lines.last().unwrap(), "AVR B0 0101");
+        assert_eq!(st.dsp_power_mode, 1);
+    }
+
+    /// Run handshake, configure and arm against `state`, returning the
+    /// events seen.
+    fn connect_and_arm(state: &Rc<RefCell<XiState>>) -> Vec<BinaryEvent> {
+        let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
+        let mut events = Vec::new();
+        client.handshake();
+        client.configure_xi(XiSettings::default());
+        client.arm();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Armed)
+        });
+        assert!(client.is_armed());
+        events
+    }
+
+    /// A 0x94 refusing a configuration step, of each command type the Xi
+    /// configuration sends, is reported as `StepRefused` (with the 0x94's
+    /// hex) and the configuration carries on to the arm, sending every
+    /// frame it sends without the refusal.
+    #[test]
+    fn xi_config_nack_of_each_step_type_continues_to_the_arm() {
+        let baseline = {
+            let state = Rc::new(RefCell::new(XiState {
+                nack_dsp_query: true,
+                ..XiState::default()
+            }));
+            connect_and_arm(&state);
+            tx_lines(&state.borrow().received)
+        };
+        for (type_id, payload) in [
+            (0xA5, "020008"),
+            (0xA4, "06098600190000"),
+            (0xBE, "03000002"),
+            (0xBF, "06000001000000"),
+            (0xB0, "0100"),
+        ] {
+            let state = Rc::new(RefCell::new(XiState {
+                nack_dsp_query: true,
+                refuse: vec![(BusAddr::Avr, type_id, hex(payload))],
+                ..XiState::default()
+            }));
+            let events = connect_and_arm(&state);
+            let refused: Vec<&Envelope> = events
+                .iter()
+                .filter_map(|e| match e {
+                    BinaryEvent::StepRefused(env) => Some(env),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(refused.len(), 1, "0x{type_id:02X}: {events:?}");
+            assert_eq!((refused[0].src, refused[0].type_id), (BusAddr::Avr, 0x94));
+            assert_eq!(refused[0].raw, [0x02, 0x30, type_id & 0x7F]);
+            // Reported before the configuration completes.
+            let pos = |pred: fn(&BinaryEvent) -> bool| events.iter().position(pred).unwrap();
+            assert!(
+                pos(|e| matches!(e, BinaryEvent::StepRefused(_)))
+                    < pos(|e| matches!(e, BinaryEvent::Configured))
+            );
+            let st = state.borrow();
+            assert!(st.refuse.is_empty(), "0x{type_id:02X} never sent");
+            assert_eq!(tx_lines(&st.received), baseline, "0x{type_id:02X}");
+        }
+    }
+
+    /// A NACK on the last step still lets the configuration complete:
+    /// `StepRefused` first, `Configured` on the next poll.
+    #[test]
+    fn xi_config_nack_of_the_last_step_completes() {
+        let state = Rc::new(RefCell::new(XiState {
+            nack_dsp_query: true,
+            ..XiState::default()
+        }));
+        let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
+        let mut events = Vec::new();
+        client.handshake();
+        client.configure_xi(XiSettings::default());
+        client.arm();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Armed)
+        });
+        // Mode change: its last frame is BF param 0x20 = 0.0.
+        events.clear();
+        state.borrow_mut().refuse = vec![(BusAddr::Avr, 0xBF, hex("080000200000000000"))];
+        client.configure_xi(XiSettings::default());
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Configured)
+        });
+        let n = events.len();
+        assert!(
+            matches!(&events[n - 2], BinaryEvent::StepRefused(env) if env.raw == [0x02, 0x30, 0x3F])
+        );
+        assert!(state.borrow().refuse.is_empty());
+        client.arm();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Armed)
+        });
+    }
+
+    /// A DSP that refuses the power-mode write does not stop the
+    /// handshake: `StepRefused` with the DSP's 0x94, then the AVR sync
+    /// and the arm as normal.
+    #[test]
+    fn xi_dsp_power_mode_nack_continues_to_the_arm() {
+        let state = Rc::new(RefCell::new(XiState {
+            nack_dsp_query: true,
+            refuse: vec![(BusAddr::Dsp, 0xBF, hex("06000001000001"))],
+            ..XiState::default()
+        }));
+        let events = connect_and_arm(&state);
+        let refused: Vec<&Envelope> = events
+            .iter()
+            .filter_map(|e| match e {
+                BinaryEvent::StepRefused(env) => Some(env),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!((refused[0].src, refused[0].type_id), (BusAddr::Dsp, 0x94));
+        assert_eq!(refused[0].raw, [0x02, 0x40, 0x3F]);
+        let st = state.borrow();
+        assert!(st.refuse.is_empty());
+        assert_eq!(st.dsp_power_mode, 0);
+        assert!(!st.sent(BusAddr::Avr, 0xB0).is_empty());
+    }
+
+    /// A DSP that never answers the power-mode write does not stop the
+    /// handshake: after [`seq::DSP_QUERY_TIMEOUT`] it carries on to the AVR
+    /// sync and the arm, with `power_mode_unanswered` set and no
+    /// `StepRefused`.
+    #[test]
+    fn xi_dsp_power_mode_unanswered_continues_to_the_arm() {
+        let state = Rc::new(RefCell::new(XiState {
+            nack_dsp_query: true,
+            ignore: vec![(BusAddr::Dsp, 0xBF, hex("06000001000001"))],
+            ..XiState::default()
+        }));
+        let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
+        let mut events = Vec::new();
+        client.handshake();
+        client.configure_xi(XiSettings::default());
+        client.arm();
+        let t0 = Instant::now();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Armed)
+        });
+        assert!(t0.elapsed() >= seq::DSP_QUERY_TIMEOUT);
+        let handshake = events
+            .iter()
+            .find_map(|e| match e {
+                BinaryEvent::Handshake(h) => Some(h),
+                _ => None,
+            })
+            .expect("handshake");
+        assert!(handshake.dsp.power_mode_unanswered);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, BinaryEvent::StepRefused(_)))
+        );
+        let st = state.borrow();
+        assert!(st.ignore.is_empty());
+        assert_eq!(st.dsp_power_mode, 0);
+        assert_eq!(st.sent(BusAddr::Dsp, 0xBF).len(), 1);
+        assert!(!st.sent(BusAddr::Avr, 0xB0).is_empty());
+    }
+
+    /// After power-on the Xi's AVR refuses status polls for a few seconds.
+    /// The handshake re-polls about once a second until it answers, then
+    /// completes; nothing is reported as a refused step.
+    #[test]
+    fn xi_avr_refusing_status_polls_is_re_polled() {
+        let state = Rc::new(RefCell::new(XiState {
+            nack_dsp_query: true,
+            avr_boot_nacks: 2,
+            ..XiState::default()
+        }));
+        let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
+        let mut events = Vec::new();
+        client.handshake();
+        let t0 = Instant::now();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Handshake(_))
+        });
+        let elapsed = t0.elapsed();
+        assert!(elapsed >= 2 * seq::STATUS_REPOLL_INTERVAL, "{elapsed:?}");
+        assert!(elapsed < 4 * seq::STATUS_REPOLL_INTERVAL, "{elapsed:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, BinaryEvent::StepRefused(_)))
+        );
+        let st = state.borrow();
+        let avr: Vec<String> = tx_lines(&st.received)
+            .into_iter()
+            .filter(|l| l.starts_with("AVR "))
+            .collect();
+        // Refused, re-polled, refused, re-polled, answered; then the
+        // second poll and the rest of the AVR sync.
+        assert_eq!(
+            avr[..6],
+            [
+                "AVR AA 0101",
+                "AVR AA 0101",
+                "AVR AA 0101",
+                "AVR AA 0101",
+                "AVR 67",
+                "AVR 67"
+            ]
+        );
+        assert_eq!(client.model(), DeviceModel::Xi);
+    }
+
+    /// Handshake, configure and arm a client on the scripted Xi.
+    fn armed_xi() -> (BinaryClient<XiStream>, Rc<RefCell<XiState>>) {
+        let state = Rc::new(RefCell::new(XiState::default()));
+        let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
+        let mut events = Vec::new();
+        client.handshake();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Handshake(_))
+        });
+        client.configure_xi(XiSettings::default());
+        client.arm();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Armed)
+        });
+        (client, state)
+    }
+
+    /// Frames sent, as (type, payload).
+    type Sent = Vec<(u8, Vec<u8>)>;
+
+    /// Deliver `xi_shot()` one frame at a time until `ShotComplete`.
+    /// Returns, for each received frame, its type and what was sent while
+    /// handling it (status polls left out); and the last frame sent at the
+    /// moment each E8/D4 datum event was returned.
+    fn shot_tx_per_frame(
+        client: &mut BinaryClient<XiStream>,
+        state: &Rc<RefCell<XiState>>,
+    ) -> (Vec<(u8, Sent)>, Sent) {
+        let (frames, ed) = xi_shot();
+        state.borrow_mut().shot_ed = Some(ed);
+        let mut per_frame = Vec::new();
+        let mut at_datum = Vec::new();
+        let mut complete = false;
+        for (type_id, payload) in frames {
+            let before = state.borrow().received.len();
+            state.borrow_mut().push(BusAddr::Avr, type_id, payload);
+            // Each poll handles at most one frame; 50 cover this frame and
+            // every reply the scripted device pushes for it.
+            for _ in 0..50 {
+                match client.poll().unwrap() {
+                    Some(BinaryEvent::ShotDatum(ShotDatum::FlightV1(_) | ShotDatum::Flight(_))) => {
+                        let st = state.borrow();
+                        let last = st.received.last().unwrap();
+                        at_datum.push((last.type_id, last.payload.clone()));
+                    }
+                    Some(BinaryEvent::ShotComplete(_)) => complete = true,
+                    _ => {}
+                }
+            }
+            let tx = state.borrow().received[before..]
+                .iter()
+                .filter(|f| f.type_id != 0xAA)
+                .map(|f| (f.type_id, f.payload.clone()))
+                .collect();
+            per_frame.push((type_id, tx));
+        }
+        assert!(complete, "no ShotComplete");
+        (per_frame, at_datum)
+    }
+
+    /// Every E8 and D4 from the Xi is acked with 0x95 the moment it is
+    /// received: one ack per frame, sent before the frame's event is
+    /// returned and before anything else of the post-shot cycle.
+    #[test]
+    fn xi_flight_results_are_acked_on_arrival() {
+        let (mut client, state) = armed_xi();
+        let (per_frame, at_datum) = shot_tx_per_frame(&mut client, &state);
+        assert_eq!(
+            per_frame,
+            [
+                (0xE5, vec![]),
+                (0xE8, vec![(0x95, vec![0x02, 0x10, 0x68])]),
+                (0xD4, vec![(0x95, vec![0x02, 0x10, 0x54])]),
+                (0xED, vec![]),
+                (0xEF, vec![]),
+                (0xE5, vec![(0x69, vec![]), (0x69, vec![])]),
+                (0xE5, vec![(0x6D, vec![]), (0xB0, vec![0x01, 0x01])]),
+                (0xB1, vec![]),
+            ]
+        );
+        assert_eq!(
+            at_datum,
+            [
+                (0x95, vec![0x02, 0x10, 0x68]),
+                (0x95, vec![0x02, 0x10, 0x54])
+            ]
+        );
+        // The acks go to the AVR.
+        let st = state.borrow();
+        assert_eq!(st.sent(BusAddr::Avr, 0x95).len(), 2);
+        assert_eq!(st.received.iter().filter(|f| f.type_id == 0x95).count(), 2);
+    }
+
+    /// The same shot on a Mevo sends no 0x95: only the post-shot cycle
+    /// (0x69 x2, 0x6D, B0 `[01 01]`). The scripted device is the Xi with
+    /// the handshake outcome relabelled, so only the model differs.
+    #[test]
+    fn mevo_shot_sends_no_result_ack() {
+        let (mut client, state) = armed_xi();
+        client.device.as_mut().unwrap().model = DeviceModel::Mevo;
+        let before = state.borrow().received.len();
+        let (per_frame, _) = shot_tx_per_frame(&mut client, &state);
+        assert_eq!(
+            per_frame,
+            [
+                (0xE5, vec![]),
+                (0xE8, vec![]),
+                (0xD4, vec![]),
+                (0xED, vec![]),
+                (0xEF, vec![]),
+                (0xE5, vec![(0x69, vec![]), (0x69, vec![])]),
+                (0xE5, vec![(0x6D, vec![]), (0xB0, vec![0x01, 0x01])]),
+                (0xB1, vec![]),
+            ]
+        );
+        let st = state.borrow();
+        assert!(st.received[before..].iter().all(|f| f.type_id != 0x95));
     }
 
     /// Results arriving before PROCESSED (the order both the Mevo+ and the
@@ -1331,8 +1894,8 @@ mod tests {
         assert!(shot.club.is_some());
     }
 
-    /// A selected Xi mode is written as-is in the A5 mode set, with no
-    /// parameter writes.
+    /// A selected Xi mode is written as-is in both A5 mode sets after the
+    /// connect-time mode 8.
     #[test]
     fn xi_full_outdoor_mode_is_written() {
         let state = Rc::new(RefCell::new(XiState::default()));
@@ -1342,17 +1905,84 @@ mod tests {
         poll_until(&mut client, &mut events, |e| {
             matches!(e, BinaryEvent::Handshake(_))
         });
-        client.configure_avr(AvrSettings::xi_with_mode(MODE_FULL_OUTDOOR));
+        client.configure_xi(XiSettings {
+            mode: MODE_FULL_OUTDOOR,
+            ..XiSettings::default()
+        });
         client.arm();
         poll_until(&mut client, &mut events, |e| {
             matches!(e, BinaryEvent::Armed)
         });
         let st = state.borrow();
-        let modes = st.sent(BusAddr::Avr, 0xA5);
-        assert_eq!(modes.len(), 1);
-        assert_eq!(modes[0].payload, [0x02, 0x00, 0x08]);
-        assert!(st.sent(BusAddr::Avr, 0xBF).is_empty());
-        assert!(st.sent(BusAddr::Avr, 0xA4).is_empty());
+        let modes: Vec<&[u8]> = st
+            .sent(BusAddr::Avr, 0xA5)
+            .iter()
+            .map(|f| f.payload.as_slice())
+            .collect();
+        assert_eq!(modes, [[0x02, 0x00, 0x08]; 3]);
+    }
+
+    /// A second Xi configuration on the connection disarms the armed
+    /// device, sends the mode block only, and is armed again.
+    #[test]
+    fn xi_mode_change_disarms_and_sends_the_mode_block() {
+        let state = Rc::new(RefCell::new(XiState::default()));
+        let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
+        let mut events = Vec::new();
+        client.handshake();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Handshake(_))
+        });
+        client.configure_xi(XiSettings::default());
+        client.arm();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Armed)
+        });
+        let before = state.borrow().received.len();
+
+        events.clear();
+        client.configure_xi(XiSettings {
+            shot_type: XiShotType::Pitching,
+            ..XiSettings::default()
+        });
+        client.arm();
+        poll_until(&mut client, &mut events, |e| {
+            matches!(e, BinaryEvent::Armed)
+        });
+        assert!(matches!(events[0], BinaryEvent::Disarmed));
+        assert!(events.iter().any(|e| matches!(e, BinaryEvent::Configured)));
+        assert!(client.is_armed());
+
+        let st = state.borrow();
+        let wire: Vec<(u8, Vec<u8>)> = st.received[before..]
+            .iter()
+            .filter(|f| f.dest == BusAddr::Avr && f.type_id != 0xAA)
+            .map(|f| (f.type_id, f.payload.clone()))
+            .collect();
+        let bf = |id: u8, v: [u8; 3]| (0xBF, vec![0x06, 0x00, 0x00, id, v[0], v[1], v[2]]);
+        let zero = (0xBF, vec![0x08, 0x00, 0x00, 0x20, 0, 0, 0, 0, 0]);
+        let one = (
+            0xBF,
+            vec![0x08, 0x00, 0x00, 0x28, 0x00, 0x01, 0x40, 0x00, 0x00],
+        );
+        let gate = (0xB0, vec![0x01, 0x00]);
+        assert_eq!(
+            wire,
+            [
+                gate.clone(),
+                bf(0x08, [0, 0, 1]),
+                gate.clone(),
+                bf(0x16, [0, 0, 2]),
+                zero.clone(),
+                bf(0x07, [0x00, 0x54, 0x48]),
+                (0xA5, vec![0x02, 0x00, MODE_LIMITED_FLIGHT]),
+                gate,
+                one,
+                bf(0x16, [0, 0, 2]),
+                zero,
+                (0xB0, vec![0x01, 0x01]),
+            ]
+        );
     }
 
     #[test]
@@ -1365,7 +1995,7 @@ mod tests {
         poll_until(&mut client, &mut events, |e| {
             matches!(e, BinaryEvent::Handshake(_))
         });
-        client.configure_avr(AvrSettings::xi());
+        client.configure_xi(XiSettings::default());
         client.arm();
         poll_until(&mut client, &mut events, |e| {
             matches!(e, BinaryEvent::Armed)

@@ -126,19 +126,44 @@ Pi, so `BinaryClient` adapts once the handshake has identified it:
 - ironsight does not rely on the DSP query (`0x48`): a response from the Xi
   has not been observed, and without one the handshake moves on after
   `DSP_QUERY_TIMEOUT` (2 s), leaving `DspSync::hw_info` as `None`.
+- The DSP sync ends with a power-mode write to the DSP,
+  `BF [06 00 00 01 00 00 01]` (DSP param `0x01` = 1, Normal; 4 is Standby),
+  answered by `0x95 [02 40 3F]`. It wakes a DSP that was left in Standby,
+  and changes nothing on one already in Normal. With no answer within
+  `DSP_QUERY_TIMEOUT` (2 s) the handshake carries on and sets
+  `DspSync::power_mode_unanswered`.
 - The AVR sync stops after the IF calibration exchange (no factory
-  calibration, hardware config query, param `0x64` or time sync).
-- `AvrSettings::xi()` configures detection mode 9 (`MODE_LIMITED_FLIGHT`, for
-  nets and simulator screens) with no parameter writes or radar calibration,
-  so the Xi keeps the values stored on it. `AvrSettings::xi_with_mode(mode)`
-  selects another mode, e.g. `MODE_FULL_OUTDOOR` (8) for full-flight outdoor
-  use; only the mode is written, not the extra params FS Golf sends with it.
+  calibration, hardware config query, param `0x64` or time sync). For a few
+  seconds after power-on the Xi's AVR refuses status polls (`0x94
+  [02 30 2A]`); the handshake re-sends the poll every
+  `STATUS_REPOLL_INTERVAL` (1 s) until the AVR answers. This applies to every
+  model, and changes nothing when the AVR answers the first poll.
+- `BinaryClient::configure_xi(XiSettings)` sends the configuration FS Golf
+  sends to the Xi, frame for frame: on the first call of a connection a
+  connect-time block (parameter writes and the radar calibration from
+  `XiSettings::radar_cal`), then a mode block with the detection mode
+  (`MODE_LIMITED_FLIGHT` (9) for nets and simulator screens, or
+  `MODE_FULL_OUTDOOR` (8)) and the session type (`XiShotType::FullSwing`, or
+  `XiShotType::Pitching` for chips and pitches, which FS Golf pairs with
+  mode 9). Later calls send the mode block only, disarming first if the Xi is
+  armed. `XiSettings::default()` is full swing in mode 9 with FS Golf's
+  default radar calibration (2438 mm to the ball, 25 mm surface height).
+  Each frame waits for its reply. A `0x94` refusing a frame (or the DSP
+  power-mode write) ends that step too: `BinaryClient` reports it as
+  `BinaryEvent::StepRefused`, carrying the `0x94` frame, and carries on.
+- `AvrSettings::xi()` and `AvrSettings::xi_with_mode(mode)` are deprecated:
+  they send the detection mode only, with no parameter writes or radar
+  calibration.
 - Shot results (`E8`, `D4`, `ED`, `EF`) decode with the Mevo+ layouts.
+  `BinaryClient` acks every `E8` and `D4` with `0x95` the moment it arrives
+  (`[02 10 68]` / `[02 10 54]`), as FS Golf does; `seq::result_ack` builds the
+  ack for callers that drive the sequencers themselves.
 
 It connects, arms and reports shots, and has been verified against
-FlightScope's own FS Golf app on a real Xi. Only limited flight (9) has been
-verified this way; full-flight outdoor (8) is untested, and putting/chipping
-modes have not been mapped for the Xi yet. See [SEQUENCE.md](docs/SEQUENCE.md#8-flightscope-xi).
+FlightScope's own FS Golf app on a real Xi. FS Golf's full-swing and pitching
+configurations in mode 9 are reproduced byte for byte; mode 8 uses the same
+frames with only the mode changed, and is untested. FS Golf's putting
+configuration for the Xi is not known. See [SEQUENCE.md](docs/SEQUENCE.md#8-flightscope-xi).
 
 ## Protocol Documentation
 
@@ -163,7 +188,7 @@ handled automatically:
 ```rust
 use ironsight::client::{BinaryClient, BinaryEvent};
 use ironsight::protocol::handshake::DeviceModel;
-use ironsight::seq::AvrSettings;
+use ironsight::seq::XiSettings;
 use ironsight::BinaryConnection;
 
 let conn = BinaryConnection::connect("192.168.2.1:5100")?;
@@ -176,7 +201,7 @@ loop {
         Some(BinaryEvent::Handshake(h)) => {
             println!("Connected to {}", h.model);
             if h.model == DeviceModel::Xi {
-                client.configure_avr(AvrSettings::xi());
+                client.configure_xi(XiSettings::default());
             } else {
                 client.configure_avr(avr_settings.clone());
                 client.configure_cam(cam_config.clone());

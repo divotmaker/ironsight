@@ -769,7 +769,8 @@ fn run() -> Result<(), ConnError> {
                 | BinaryEvent::Disarmed
                 | BinaryEvent::Handshake(_)
                 | BinaryEvent::ShotDatum(_)
-                | BinaryEvent::Keepalive(_) => {}
+                | BinaryEvent::Keepalive(_)
+                | BinaryEvent::StepRefused(_) => {}
             }
         }
 

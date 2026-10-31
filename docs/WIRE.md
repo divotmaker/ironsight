@@ -733,12 +733,13 @@ Format: `[06 range_hi range_lo 00 height_mm 00 00]`
 
 #### 0x95 &mdash; CONFIG_ACK (3 bytes)
 
-Generic command acknowledgment. Device &rarr; APP only.
+Generic acknowledgment. The device acks the app's commands; on the Xi the
+app also acks each flight result it receives (APP &rarr; AVR).
 
 Format: `[02 bus_addr acked_cmd]`
 
-- `bus_addr`: responding subsystem (0x30 = AVR, 0x12 = PI)
-- `acked_cmd`: low 7 bits of the command being acknowledged (`cmd_type & 0x7F`)
+- `bus_addr`: acknowledging side (0x30 = AVR, 0x12 = PI, 0x10 = APP)
+- `acked_cmd`: low 7 bits of the type being acknowledged (`type & 0x7F`)
 
 | Ack byte | Acknowledges       |
 | -------- | ------------------ |
@@ -747,6 +748,8 @@ Format: `[02 bus_addr acked_cmd]`
 | `0x52`   | 0xD2 cal data      |
 | `0x01`   | 0x81 camera state  |
 | `0x02`   | 0x82 camera config |
+| `0x68`   | 0xE8 flight result (APP &rarr; AVR, Xi only) |
+| `0x54`   | 0xD4 flight result (APP &rarr; AVR, Xi only) |
 
 ### 6.4 Device Info
 

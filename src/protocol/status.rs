@@ -1,5 +1,6 @@
 //! Status, keepalive, and acknowledgment messages.
 
+use crate::addr::BusAddr;
 use crate::codec;
 use crate::error::{Result, WireError};
 
@@ -234,18 +235,36 @@ impl PiStatus {
     }
 }
 
-/// Generic command acknowledgment (3 bytes). Type 0x95.
+/// Generic acknowledgment (3 bytes). Type 0x95. Bidirectional: the device
+/// acks the app's commands, and on the Xi the app acks each flight result
+/// (see [`ConfigAck::for_result`]).
 ///
 /// Format: `[02 bus_addr acked_cmd]`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigAck {
-    /// Responding subsystem (0x30=AVR, 0x12=PI)
+    /// Acknowledging side (0x30 = AVR, 0x12 = PI, 0x10 = APP)
     pub bus_addr: u8,
-    /// Low 7 bits of the acknowledged command
+    /// Low 7 bits of the acknowledged type
     pub acked_cmd: u8,
 }
 
 impl ConfigAck {
+    /// The app's ack of a received frame of type `type_id`:
+    /// `[02 10 type_id & 0x7F]`.
+    #[must_use]
+    pub fn for_result(type_id: u8) -> Self {
+        Self {
+            bus_addr: BusAddr::App as u8,
+            acked_cmd: type_id & 0x7F,
+        }
+    }
+
+    /// Encode the 3-byte payload: `[02 bus_addr acked_cmd]`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        vec![0x02, self.bus_addr, self.acked_cmd]
+    }
+
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 3 {
             return Err(WireError::payload_too_short("ConfigAck", 3, payload.len()));

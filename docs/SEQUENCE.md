@@ -79,6 +79,11 @@ DSP response latency: 10–30 ms.
 
 AVR response latency: 2–32 ms.
 
+An AVR that is still starting up refuses the status poll with 0x94
+`[02 30 2A]` instead of answering it. ironsight sends the poll again 1 s
+later (`STATUS_REPOLL_INTERVAL`), once per refusal, until the AVR answers or
+the operation times out. Without a refusal nothing changes.
+
 **Intermediate responses**: The D0 (CalParamReq) exchange produces an 0xE3 Text
 and 0x95 ConfigAck before the actual 0xD1 response. The D2 (CalDataReq) may also
 produce an intermediate ConfigAck. Skip Text and ConfigAck messages when waiting
@@ -488,29 +493,117 @@ The AVR status text after arming reads `ARMED Xi`.
 
 | Phase | Xi |
 | ----- | -- |
-| 1. DSP sync | As &sect;2.1. A 0x48 response from the Xi has not been observed, and ironsight does not rely on one: it moves on to 0x67 after a timeout (2 s) or a ConfigNack. |
-| 2. AVR sync | 0xAA &times;2, 0x67 &times;2, 0xBE 0x0C/0x0D, 0x21, then 0xD0 &rarr; 0xD1. Stop there: no 0xD2 factory cal, no 0x23 (the AVR rejects it with 0x94), no 0xBE 0x64, no 0x9B. |
+| 1. DSP sync | As &sect;2.1. A 0x48 response from the Xi has not been observed, and ironsight does not rely on one: it moves on to 0x67 after a timeout (2 s) or a ConfigNack. After the 0x21 config query is answered, the DSP power-mode write: 0xBF `[06 00 00 01 00 00 01]` &rarr; 0x95 `[02 40 3F]`, with the same 2 s timeout (see below). |
+| 2. AVR sync | 0xAA &times;2, 0x67 &times;2, 0xBE 0x0C/0x0D, 0x21, then 0xD0 &rarr; 0xD1. Stop there: no 0xD2 factory cal, no 0x23 (the AVR rejects it with 0x94), no 0xBE 0x64, no 0x9B. For several seconds after power-on the AVR refuses the status poll with 0x94 `[02 30 2A]`; it is re-sent every second until answered (&sect;2.2). |
 | 3. PI sync | Skipped. |
-| 4. Post-sync config | B0 `[01 00]` &rarr; 0x95, A5 `[02 00 XX]` (detection mode, see below) &rarr; A5 echo, B0 `[01 00]` &rarr; 0x95. No parameter writes and no radar cal; the Xi keeps its stored values. |
+| 4. Post-sync config | FS Golf's connect-time block, then its mode block; see &sect;8.3. |
 | 5. PI post-config | Skipped. |
 | 6. ARM | 0xAA DSP, 0xAA AVR, B0 `[01 01]` &rarr; 0x95, then wait for the E3 `ARMED Xi` text (about 1 s). No PI poll. |
 
 If the Xi is still armed from an earlier session, the first B0 `[01 00]` of the
 configure phase disarms it: the AVR sends 0x95, `ARMED CANCELLED` and 0xB1.
 
-The detection mode is 9 (Limited flight, for nets and simulator screens) by
-default, or 8 (Outdoor, full flight) for real outdoor use; see WIRE.md &sect;7.
-Mode 9 is the only one seen working on an Xi so far. ironsight writes only the
-mode for either; the param writes FS Golf sends with mode 8 are not sent. Other
-mode values have not been mapped for the Xi.
+**DSP power mode.** Param 0x01 on the DSP is its power mode: 1 = Normal,
+4 = Standby (FS Golf writes 4 when it exits). ironsight writes 1 to the DSP
+on every connection, as its last DSP sync step:
 
-### 8.3 Keepalive
+```
+BF 06 00 00 01 00 00 01      →  0x95 [02 40 3F]
+```
+
+When this changes the mode, the DSP follows the 0x95 with E3 texts
+(`REQ Power Mode : 1 (4)`, `NEW Power Mode : 1`, then its apps loading); when
+the DSP is already in Normal only the 0x95 comes back. A 0x94 `[02 40 3F]`
+refusing the write also ends the step, and so does no reply within 2 s
+(`DSP_QUERY_TIMEOUT`); the handshake then carries on with the AVR sync and
+sets `DspSync::power_mode_unanswered`. Param 0x01 on the AVR is a different
+parameter (Altitude, &sect;8.3). The Mevo+ and Gen2 are not sent this write.
+
+### 8.3 Configuration
+
+ironsight (`BinaryClient::configure_xi`, `XiConfigSequencer`) sends the frames
+FS Golf sends, in the same order, one at a time. Each waits for its reply:
+
+| Frame | Reply |
+| ----- | ----- |
+| 0xBF param write | 0x95 `[02 30 3F]` |
+| B0 `[01 00]` | 0x95 `[02 30 30]` (about 110 ms) |
+| A5 mode set | A5 echo |
+| A4 radar cal | A4 echo |
+| 0xBE read of param 0x02 | 0xBF with the value |
+
+A 0x94 refusing the frame, `[02 30 TT]` with `TT` the frame's type & 0x7F
+(`3F` for a BF write, `30` for B0, `25` for A5, `24` for A4, `3E` for the BE
+read), also ends the step: ironsight carries on with the next frame and
+reports the refusal (`BinaryEvent::StepRefused`, carrying the 0x94). A 0x94
+for another type does not end the step. A frame that gets no reply at all
+waits for the operation timeout (30 s by default).
+
+**Connect-time block**, once per connection. `RR RR` is the distance from the
+Xi to the ball and `HH` the surface height, both in mm (FS Golf's defaults:
+2438 mm, 25 mm); `CC` is the session type and `MM` the detection mode:
+
+```
+BF 06 00 00 01 00 00 00          BF 06 00 00 07 00 54 48
+A5 02 00 08                      BF 06 00 00 02 00 00 03
+BE 03 00 00 02                   BF 06 00 00 14 00 00 02
+A4 06 RR RR 00 HH 00 00          BF 08 00 00 27 00 05 78 00 00   (30.0)
+BF 06 00 00 08 00 00 01          BF 08 00 00 28 00 01 40 00 00   (1.0)
+BF 06 00 00 07 00 14 0B          BF 06 00 00 07 00 54 48
+BF 06 00 00 16 00 00 CC          A5 02 00 MM
+BF 06 00 00 25 00 00 00          B0 01 00
+                                 BF 08 00 00 28 00 01 40 00 00
+```
+
+**Mode block**, after the connect-time block and on every mode change (on a
+mode change the Xi is disarmed first with B0 `[01 00]`):
+
+```
+BF 06 00 00 08 00 00 01          A5 02 00 MM
+B0 01 00                         B0 01 00
+BF 06 00 00 16 00 00 CC          BF 08 00 00 28 00 01 40 00 00
+BF 08 00 00 20 00 00 00 00 00    BF 06 00 00 16 00 00 CC
+BF 06 00 00 07 00 54 48          BF 08 00 00 20 00 00 00 00 00
+```
+
+Then ARM as in &sect;8.2.
+
+The params, with FS Golf's names where it has one:
+
+| Param | Name | Value |
+| ----- | ---- | ----- |
+| 0x01 | Altitude | 0 |
+| 0x02 | | 3 (read first) |
+| 0x07 | ProcessFlags (bitfield) | 0x140B on its first write, 0x5448 after |
+| 0x08 | TriggerOptions | 1 |
+| 0x14 | | 2 |
+| 0x16 | ClubType | session type (`CC`) |
+| 0x20 | | 0.0 |
+| 0x25 | OperationFlags | 0 |
+| 0x27 | OutdoorMinimumTrackPercentage | 30.0 (%) |
+| 0x28 | IndoorModelDragFraction | 1.0 |
+
+Values by FS Golf session:
+
+| Session | `MM` | `CC` (param 0x16) |
+| ------- | ---- | ----------------- |
+| Full swing | 9 (Limited flight) | 1 |
+| Pitching (chips and pitches) | 9 | 2 |
+| Full swing, Outdoor | 8 | 1 |
+
+FS Golf's own Outdoor configuration for the Xi has not been observed;
+ironsight sends the same frames with mode 8. FS Golf writes param 0x08 = 5
+instead of 1 for slow swings; ironsight always writes 1. FS Golf's "Chipping"
+selection on the Xi uses mode 1, in which every full result (D4) is zero;
+ironsight has no such session type.
+
+### 8.4 Keepalive
 
 Poll DSP and AVR only. The Xi's DSP status (0xAA) is 29 bytes (`payload[0]` =
 0x1C), a layout not decoded yet; its AVR status is the same 25-byte format as
 the Mevo+.
 
-### 8.4 Shot flow
+### 8.5 Shot flow
 
 As on the Mevo+ (&sect;4.1), the result set arrives before `PROCESSED`:
 
@@ -519,14 +612,27 @@ E5 "BALL TRIGGER" → 0xBA → E9 → E8 → E0 → E1 → D4 → ED → D9 → 
   → E5 "PROCESSED" → E5 "IDLE" → B1
 ```
 
-D4, E8, ED and EF use the Mevo+ layouts (D4 is 157 bytes). After `PROCESSED`
-the post-shot cycle of &sect;7.2 works unchanged: 0x69 &times;2, IDLE, 0x6D
-&rarr; ED, B0 `[01 01]` &rarr; 0x95, E3 `ARMED Xi`.
+D4, E8, ED and EF use the Mevo+ layouts (D4 is 157 bytes).
+
+The app acks each flight result the moment it arrives, with a 0x95 to the
+AVR in the layout the device uses for its own acks (`[02 bus type & 0x7F]`,
+bus 0x10 = APP):
+
+| Received | APP&rarr;AVR ack |
+| -------- | ---------------- |
+| 0xE8 | 0x95 `[02 10 68]` |
+| 0xD4 | 0x95 `[02 10 54]` |
+
+No other result is acked. ironsight sends these acks on the Xi only; the
+Mevo+ and Gen2 are sent none.
+
+After `PROCESSED` the post-shot cycle of &sect;7.2 works unchanged: 0x69
+&times;2, IDLE, 0x6D &rarr; ED, B0 `[01 01]` &rarr; 0x95, E3 `ARMED Xi`.
 
 The Xi often sends several frames in one TCP segment, so a client must handle
 more than one frame per read and keep them in arrival order.
 
-### 8.5 Unknown message types
+### 8.6 Unknown message types
 
 The Xi sends types with no known layout. Treat them as opaque and never fail on
 them:

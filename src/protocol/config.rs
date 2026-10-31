@@ -188,7 +188,7 @@ impl ParamValue {
 /// Radar calibration (7 bytes). Type 0xA4. Bidirectional.
 ///
 /// Format: `[06 range_hi range_lo 00 height_mm 00 00]`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RadarCal {
     /// Sensor-to-tee distance (mm)
     pub range_mm: u16,
