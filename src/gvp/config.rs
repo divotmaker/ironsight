@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 /// Camera calibration parameters (intrinsics + extrinsics).
 ///
-/// All zeros in observed traffic — the GVP uses its own stored calibration
-/// or derives it from the resolution mode.
+/// All zeros in practice: the GVP uses its own stored calibration or derives
+/// it from the resolution mode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CameraCalibration {
@@ -107,8 +107,7 @@ impl GvpConfig {
     /// All fields zeroed except metadata flags. The GVP uses its own stored
     /// configuration; the APP-sent CONFIG is metadata/hints, not the actual
     /// capture resolution (which is set via binary 0x82 CAM_CONFIG on port 5100).
-    ///
-    /// Matches observed five_strikes pcap: ROI 0×0, buffer 0/0.
+    /// ROI 0×0, buffer 0/0.
     #[must_use]
     pub fn standard() -> Self {
         Self {
@@ -143,9 +142,8 @@ impl GvpConfig {
 
     /// APP→GVP config for Fusion mode (face impact tracking).
     ///
-    /// ROI set to 640×480 as observed in the native FS Golf app's
-    /// face_impact_shot_id_4 pcap. The actual 1640×1232 capture resolution
-    /// is set via binary 0x82 CAM_CONFIG on port 5100, not here.
+    /// ROI set to 640×480. The actual 1640×1232 capture resolution is set
+    /// via binary 0x82 CAM_CONFIG on port 5100, not here.
     #[must_use]
     pub fn fusion() -> Self {
         let mut config = Self::standard();

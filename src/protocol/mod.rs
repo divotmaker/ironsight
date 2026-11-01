@@ -85,6 +85,62 @@ pub const TYPE_SPIN_RESULT: u8 = 0xEF;
 pub const TYPE_DSP_DEBUG: u8 = 0xF0;
 
 // ---------------------------------------------------------------------------
+// Message classification
+// ---------------------------------------------------------------------------
+
+/// Whether frames of this type can identify the unit, its owner's network or
+/// the host, in either direction. Keep such frames out of anything that is
+/// shared, such as logs attached to a public bug report.
+///
+/// | Type | Message | Why |
+/// | ---- | ------- | --- |
+/// | 0xAA | status (request and response) | hardware and application IDs; also the keepalive |
+/// | 0x67 / 0xE7 | device info | the DSP's text carries the serial number |
+/// | 0xFD | product info | serial number |
+/// | 0x48 / 0xC8 | DSP query | hardware information |
+/// | 0xDE | network config | the device's SSID and password |
+/// | 0x87 | WiFi scan | names of nearby networks |
+/// | 0xD0 / 0xD1, 0xD2 / 0xD3 | calibration parameters and data | factory calibration, unique to the unit |
+/// | 0x90 / 0x89 | sensor activation | a per-device certificate |
+/// | 0x9B | time sync | the host's clock |
+/// | 0x23 / 0xA2 | AVR config query | unit configuration, stored undecoded |
+///
+/// Shot results, shot texts, configuration writes and their acks are not on
+/// the list.
+#[must_use]
+pub fn carries_identity(type_id: u8) -> bool {
+    matches!(
+        type_id,
+        TYPE_STATUS
+            | TYPE_DEV_INFO_REQ
+            | TYPE_DEV_INFO_RESP
+            | TYPE_PROD_INFO
+            | TYPE_DSP_QUERY
+            | TYPE_DSP_QUERY_RESP
+            | TYPE_NET_CONFIG
+            | TYPE_WIFI_SCAN
+            | TYPE_CAL_PARAM_REQ
+            | TYPE_CAL_PARAM_RESP
+            | TYPE_CAL_DATA_REQ
+            | TYPE_CAL_DATA_RESP
+            | TYPE_SENSOR_ACT
+            | TYPE_SENSOR_ACT_RESP
+            | TYPE_TIME_SYNC
+            | TYPE_AVR_CONFIG_QUERY
+            | TYPE_AVR_CONFIG_RESP
+    )
+}
+
+/// Whether this type is bulk per-shot data: radar tracking points
+/// ([`TYPE_PRC_DATA`]), club tracking points ([`TYPE_CLUB_PRC`]) and the
+/// speed profile ([`TYPE_SPEED_PROFILE`]). They follow a shot in pages and
+/// add up to far more bytes than its results.
+#[must_use]
+pub fn is_bulk_shot_data(type_id: u8) -> bool {
+    matches!(type_id, TYPE_PRC_DATA | TYPE_CLUB_PRC | TYPE_SPEED_PROFILE)
+}
+
+// ---------------------------------------------------------------------------
 // Command — messages we send to the Mevo+
 // ---------------------------------------------------------------------------
 
@@ -315,6 +371,45 @@ impl Message {
                 src: frame.src,
                 payload: p.to_vec(),
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exactly these 17 types carry identity, and exactly these 3 are bulk
+    /// shot data, out of every possible type byte.
+    #[test]
+    fn identity_and_bulk_types() {
+        let identity: Vec<u8> = (0..=255).filter(|&t| carries_identity(t)).collect();
+        assert_eq!(
+            identity,
+            [
+                0x23, 0x48, 0x67, 0x87, 0x89, 0x90, 0x9B, 0xA2, 0xAA, 0xC8, 0xD0, 0xD1, 0xD2, 0xD3,
+                0xDE, 0xE7, 0xFD,
+            ]
+        );
+        let bulk: Vec<u8> = (0..=255).filter(|&t| is_bulk_shot_data(t)).collect();
+        assert_eq!(bulk, [0xD9, 0xEC, 0xEE]);
+        // Shot results, texts, configuration and acks are neither.
+        for t in [
+            TYPE_FLIGHT_RESULT,
+            TYPE_FLIGHT_RESULT_V1,
+            TYPE_CLUB_RESULT,
+            TYPE_SPIN_RESULT,
+            TYPE_SHOT_TEXT,
+            TYPE_TEXT,
+            TYPE_PARAM_VALUE,
+            TYPE_CONFIG_ACK,
+            TYPE_CONFIG_NACK,
+            TYPE_AVR_CONFIG_CMD,
+            TYPE_MODE_SET,
+            TYPE_RADAR_CAL,
+        ] {
+            assert!(!carries_identity(t), "0x{t:02X}");
+            assert!(!is_bulk_shot_data(t), "0x{t:02X}");
         }
     }
 }

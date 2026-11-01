@@ -423,9 +423,9 @@ impl<S: Read + Write> BinaryClient<S> {
         //    Keepalive gets special handling: only status responses
         //    (DspStatus/AvrStatus/PiStatus) are fed to it. All other
         //    messages skip the keepalive and fall through to shot
-        //    auto-detection (step 9). This mirrors FS Golf's native
-        //    getResponse() which only consumes messages matching the
-        //    expected response type. Without this, unsolicited shot
+        //    auto-detection (step 9), so an operation only consumes
+        //    messages of the response type it expects. Without this,
+        //    unsolicited shot
         //    messages (BALL TRIGGER, PROCESSED, E8, etc.) that arrive
         //    while a keepalive is in-flight would be silently consumed
         //    and the shot would never be detected.
@@ -534,8 +534,8 @@ impl<S: Read + Write> BinaryClient<S> {
         self.queue.push_back(QueuedOp::ConfigureAvr(avr));
     }
 
-    /// Enqueue the Xi's configuration, sent the way FS Golf sends it
-    /// (see [`XiConfigSequencer`]).
+    /// Enqueue the Xi's configuration (see [`XiSettings`] and
+    /// [`XiConfigSequencer`]).
     ///
     /// The first Xi configuration on a connection sends the connect-time
     /// block (parameter writes, radar calibration) followed by the mode
@@ -1022,46 +1022,13 @@ mod tests {
     ///
     /// D4 back/side 7127/-652 rpm, E8 backspin 7157 rpm.
     fn xi_shot() -> (Vec<(u8, Vec<u8>)>, Vec<u8>) {
-        let ed = hex(
-            "a62f002040000adb0007db000474fffa3f00028b000f220004f80002240008b50015380003f2fffed00002\
-             1f0000040028460000000000030000020009ea000000045a3bfffcf203ec210e3ea8fffcf203ebe9e12e7a\
-             000030ff23313d086c000030ff233a2a9ca70015de00f05d3531680015df00f041146dc2ffff02fffa6f00\
-             1f47ffff02fffa6f001f470016bb000dd80019820016bb000dd8001982fff3a0001080000102",
-        );
-        let frames = vec![
-            (0xE5, hex("1442414c4c20545249474745523a203633206d7300")),
-            (
-                0xE8,
-                hex(
-                    "5d000004000000008a28000ff5014c9f0034ef002f1b005209001fcd000000000000001bf50000\
-                     0000005600000001e00f0000003d08e0f5d3a3019570ffe4ea00000017ccdefb5b2eff6929001\
-                     2cb00000008bc60fe8a0e003a8afffc10",
-                ),
-            ),
-            (
-                0xD4,
-                hex(
-                    "9c00000400005600000000002700020a008a28001fcd005209014ca2000ff30034e30149f80000\
-                     00002a04001bd7fffd740000000003e9fffefbffe76d003c1affce900006f700000000000000000\
-                     0000000000000006c96002c8fffc66e004e9500d43600571500975a00197701df710000003d08eb\
-                     f5cc2b019bbcffe3fd00000017c8affb5496ff6c7f00126500000008b809fe35a1004bd6fffab0",
-                ),
-            ),
-            (0xED, ed.clone()),
-            (
-                0xEF,
-                hex(
-                    "8930040003520008266a000251000643e00001a500052eb000016c0005216300016600054b0800\
-                     0164000521e900028800072c0f000264000732e00001b600062ed500027900093329000223000\
-                     821cb000220000800000000000000000000000000000000000000000011111bf500741bf50000\
-                     000000000000030000051bf503691111000000000000",
-                ),
-            ),
-            (0xE5, hex("0a50524f43455353454400")),
-            (0xE5, hex("0549444c4500")),
-            (0xB1, vec![0x02, 0x00, 0x00]),
-        ];
-        (frames, ed)
+        let shot = crate::testing::Shot::xi_full_swing();
+        let frames = shot
+            .frames
+            .into_iter()
+            .map(|f| (f.type_id, f.payload))
+            .collect();
+        (frames, shot.club_reply)
     }
 
     #[derive(Default)]
@@ -1340,7 +1307,7 @@ mod tests {
         assert_eq!(dsp_bf.len(), 1);
         assert_eq!(dsp_bf[0].payload, hex("06000001000001"));
         assert_eq!(st.dsp_power_mode, 1);
-        // FS Golf's configuration: 19 param writes, param 0x02 read
+        // The Xi configuration: 19 param writes, param 0x02 read
         // after the handshake's 0x0C and 0x0D, one radar cal.
         assert_eq!(st.sent(BusAddr::Avr, 0xBF).len(), 19);
         let reads: Vec<u8> = st

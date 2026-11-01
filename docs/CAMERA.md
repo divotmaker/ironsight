@@ -19,7 +19,7 @@ configuration, shot triggering, image tracking, and results.
 
 ### 1.2 Message Types
 
-Nine message types observed across pcap captures:
+Nine message types:
 
 | Type | Version | Direction | Purpose |
 | ---- | ------- | --------- | ------- |
@@ -94,19 +94,19 @@ own stored calibration).
 the capture resolution. The actual capture resolution is set via binary 0x82
 CAM_CONFIG on port 5100. The APP→GVP CONFIG is metadata/hints only.
 
-Observed APP→GVP CONFIG values:
+APP→GVP CONFIG values (`GvpConfig::standard()`, `GvpConfig::fusion()`):
 
-| Pcap | ROI_width | ROI_height | Binary 0x82 mode |
+| Mode | ROI_width | ROI_height | Binary 0x82 mode |
 | ---- | --------- | ---------- | ---------------- |
-| five_strikes (standard) | 0 | 0 | 1024×768 |
-| face_impact_shot_id_4 (Fusion) | 640 | 480 | 1640×1232 |
+| Standard | 0 | 0 | 1024×768 |
+| Fusion | 640 | 480 | 1640×1232 |
 
-Observed GVP→APP CONFIG response (to CONFIG_REQUEST):
+GVP→APP CONFIG response (to CONFIG_REQUEST):
 
 | Mode | Width | Height | Notes |
 | ---- | ----- | ------ | ----- |
-| Standard | 1024 | 768 | Default (from five_strikes pcap) |
-| Fusion | 1640 | 1232 | Expected (not directly observed — face_impact pcap did not send CONFIG_REQUEST) |
+| Standard | 1024 | 768 | Default |
+| Fusion | 1640 | 1232 | Expected; not yet seen in a response |
 
 ### 1.5 STATUS
 
@@ -370,7 +370,7 @@ GVP→APP   LOG             "Free RAM: N MB" / storage stats
 GVP→APP   STATUS          {"status": "IDLE"}
 ```
 
-Timing (observed from face_impact_shot_id_4.pcapng, shot 2):
+Typical timing of a Fusion shot:
 - TRIGGER to CONVERTING: ~600ms (waiting for camera files)
 - CONVERTING to club track sent: ~290ms (image decode)
 - Club tracking: ~350ms
@@ -433,9 +433,10 @@ IDs, generate and send TRIGGER messages.
 
 ### Camera startup sequence
 
-The Pi camera requires a **two-phase startup** observed in the native app
-(five_strikes pcap). Skipping this causes "Failed to parse header.32k" errors
-from the GVP because the Fusion SHM buffer is never allocated.
+The Pi camera requires a **two-phase startup**. Skipping it causes "Failed to
+parse header.32k" errors from the GVP because the Fusion SHM buffer is never
+allocated. Unused raw-camera fields in every 0x82 config carry `-1` ("not
+set"); a `0` there reads as a real value and disturbs the buffer allocation.
 
 **Phase A: Standard mode warmup (~14s)**
 
@@ -469,8 +470,10 @@ CamState responses:
 - `[01 00]` = camera off / not ready
 - `[01 01]` = camera running / ready
 
-Use `CamConfig::standard_preset()` and `CamConfig::fusion_preset()` for the
-two phases. Total warmup is ~20-30 seconds before ARM.
+Use `CamConfig::warmup_preset()` (or `CamConfig::standard_preset()`) for
+phase A and `CamConfig::fusion_preset()` or `CamConfig::raw_fusion_preset()`
+for phase B, sent once `camera::WARMUP` (15 s) has passed. Total warmup is
+~20-30 seconds before ARM.
 
 ### Minimal camera setup
 

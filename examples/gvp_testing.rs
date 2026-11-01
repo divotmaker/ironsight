@@ -1,7 +1,7 @@
 //! Face impact smoke test: connect to Mevo+, enable Fusion mode, and print
 //! camera tracking results alongside radar data.
 //!
-//! Usage: cargo run --features gvp --example face_impact
+//! Usage: cargo run --features gvp --example gvp_testing
 //!
 //! Requires: connected to Mevo+ WiFi (SSID = device serial).
 //!

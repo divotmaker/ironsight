@@ -14,9 +14,8 @@ use crate::protocol::shot::{ClubResult, FlightResult};
 /// are computed from backspin and sidespin.
 #[must_use]
 pub fn ball_flight(f: &FlightResult) -> BallFlight {
-    // Wire sign convention (DSP) is opposite FRP for azimuth, sidespin and the
-    // lateral axis of position vectors.
-    // Wire: neg=right, neg=slice(RH). FRP: pos=right, pos=slice(RH).
+    // ironsight reports azimuth, sidespin and the lateral axis of position
+    // vectors positive = left (see `protocol::shot`); FRP positive = right.
     let mut ball = BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(f.launch_speed)),
         launch_azimuth: Some(-f.launch_azimuth),
@@ -65,8 +64,8 @@ fn descent_angle(f: &FlightResult) -> Option<f64> {
 /// Convert a [`ClubResult`] (0xED) to FRP [`ClubData`].
 #[must_use]
 pub fn club_data(c: &ClubResult) -> ClubData {
-    // Wire sign convention (DSP) is opposite FRP for path, face angle,
-    // and swing plane horizontal. DSP→PC negation per PROTOCOL.md §4.3.3.
+    // ironsight reports path, face angle and swing plane horizontal
+    // positive = left (see `protocol::shot`); FRP positive = right.
     ClubData {
         club_speed: Some(Velocity::MetersPerSecond(c.pre_club_speed)),
         club_speed_post: Some(Velocity::MetersPerSecond(c.post_club_speed)),

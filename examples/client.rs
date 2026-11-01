@@ -14,9 +14,9 @@ use ironsight::BinaryConnection;
 use ironsight::client::{BinaryClient, BinaryEvent};
 use ironsight::conn::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
-use ironsight::protocol::config::{MODE_CHIPPING, ParamData, ParamValue, RadarCal};
+use ironsight::protocol::config::{MODE_CHIPPING, RadarCal};
 use ironsight::protocol::handshake::DeviceModel;
-use ironsight::seq::{AvrSettings, XiSettings};
+use ironsight::seq::{AvrSettings, MevoSettings, XiSettings};
 
 fn ms_to_mph(ms: f64) -> f64 {
     ms * 2.23694
@@ -77,7 +77,7 @@ fn run() -> Result<(), ironsight::ConnError> {
                     );
 
                     if h.model == DeviceModel::Xi {
-                        // No camera; FS Golf's full-swing configuration in limited-flight mode.
+                        // No camera; full swing in limited-flight mode.
                         client.configure_xi(XiSettings::default());
                     } else {
                         client.configure_avr(default_avr_settings());
@@ -150,56 +150,19 @@ fn run() -> Result<(), ironsight::ConnError> {
 }
 
 fn default_avr_settings() -> AvrSettings {
-    AvrSettings {
-        mode: MODE_CHIPPING,
-        params: vec![
-            ParamValue {
-                param_id: 0x06,
-                value: ParamData::Int24(0),
-            },
-            ParamValue {
-                param_id: 0x0F,
-                value: ParamData::Float40(1.0),
-            },
-            ParamValue {
-                param_id: 0x26,
-                value: ParamData::Float40(0.0381),
-            },
-        ],
-        radar_cal: Some(RadarCal {
+    MevoSettings::new(
+        MODE_CHIPPING,
+        0,      // standard ball
+        1.0,    // minimum outdoor track 100 %
+        0.0381, // tee height 1.5 inches
+        RadarCal {
             range_mm: 2743,
             height_mm: 25,
-        }),
-    }
+        },
+    )
+    .into()
 }
 
 fn default_cam_config() -> CamConfig {
-    CamConfig {
-        dynamic_config: true,
-        resolution_width: 1024,
-        resolution_height: 768,
-        rotation: 0,
-        ev: 0,
-        quality: 80,
-        framerate: 20,
-        streaming_framerate: 1,
-        ringbuffer_pretime_ms: 1000,
-        ringbuffer_posttime_ms: 4000,
-        raw_camera_mode: 0,
-        fusion_camera_mode: false,
-        raw_shutter_speed_max: 0.0,
-        raw_ev_roi_x: -1,
-        raw_ev_roi_y: -1,
-        raw_ev_roi_width: -1,
-        raw_ev_roi_height: -1,
-        raw_x_offset: -1,
-        raw_bin44: false,
-        raw_live_preview_write_interval_ms: -1,
-        raw_y_offset: -1,
-        buffer_sub_sampling_pre_trigger_div: -1,
-        buffer_sub_sampling_post_trigger_div: -1,
-        buffer_sub_sampling_switch_time_offset: -1.0,
-        buffer_sub_sampling_total_buffer_size: -1,
-        buffer_sub_sampling_pre_trigger_buffer_size: -1,
-    }
+    CamConfig::warmup_preset()
 }

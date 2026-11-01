@@ -66,7 +66,7 @@ impl Track {
 
 /// Ball tracker result (RESULT message body).
 ///
-/// Contains the camera calibration used (all zeros in observed traffic)
+/// Contains the camera calibration used (all zeros in practice)
 /// and a variable number of tracks for detected objects.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

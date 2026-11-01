@@ -256,8 +256,8 @@ AVR→APP  0xE5   "PROCESSED"                                 ← end of Phase 1
 The three messages marked ★ contain the core shot data: ball speed, launch angles,
 carry distance, club speed, attack angle, face angle, spin rate, and spin axis.
 
-**Message ordering is not strict.** The sequence above is the *typical* order
-observed in pcap, but late-arriving messages (EC, EE, EF, D9, 0x84) may still be
+**Message ordering is not strict.** The sequence above is the *typical* order,
+but late-arriving messages (EC, EE, EF, D9, 0x84) may still be
 in flight when "PROCESSED" arrives. A robust client must drain all messages and
 not assume Phase 1 delivery is complete before "PROCESSED".
 
@@ -309,7 +309,7 @@ On E5 "IDLE":
 
 ### 4.3 Full Post-Shot Sequence (reference)
 
-The native app performs additional optional steps (pcap reference):
+A fuller post-shot exchange, with optional steps that ironsight does not take:
 
 ```
 APP→AVR  0x69   (empty) ×2             ShotDataAck
@@ -479,7 +479,7 @@ The three messages that carry the primary shot result:
 The Xi uses the same framing, checksum, bus addresses, address and port as the
 Mevo+. It has no camera Pi: nothing on the bus answers at address 0x12, so every
 step that waits for the PI is left out. Status: supported (connects, arms,
-reports shots; verified against FlightScope's own FS Golf app).
+reports shots on a real Xi).
 
 ### 8.1 Detection
 
@@ -493,10 +493,10 @@ The AVR status text after arming reads `ARMED Xi`.
 
 | Phase | Xi |
 | ----- | -- |
-| 1. DSP sync | As &sect;2.1. A 0x48 response from the Xi has not been observed, and ironsight does not rely on one: it moves on to 0x67 after a timeout (2 s) or a ConfigNack. After the 0x21 config query is answered, the DSP power-mode write: 0xBF `[06 00 00 01 00 00 01]` &rarr; 0x95 `[02 40 3F]`, with the same 2 s timeout (see below). |
+| 1. DSP sync | As &sect;2.1. The Xi's DSP may not answer 0x48, and ironsight does not rely on an answer: it moves on to 0x67 after a timeout (2 s) or a ConfigNack. After the 0x21 config query is answered, the DSP power-mode write: 0xBF `[06 00 00 01 00 00 01]` &rarr; 0x95 `[02 40 3F]`, with the same 2 s timeout (see below). |
 | 2. AVR sync | 0xAA &times;2, 0x67 &times;2, 0xBE 0x0C/0x0D, 0x21, then 0xD0 &rarr; 0xD1. Stop there: no 0xD2 factory cal, no 0x23 (the AVR rejects it with 0x94), no 0xBE 0x64, no 0x9B. For several seconds after power-on the AVR refuses the status poll with 0x94 `[02 30 2A]`; it is re-sent every second until answered (&sect;2.2). |
 | 3. PI sync | Skipped. |
-| 4. Post-sync config | FS Golf's connect-time block, then its mode block; see &sect;8.3. |
+| 4. Post-sync config | The connect-time block, then the mode block; see &sect;8.3. |
 | 5. PI post-config | Skipped. |
 | 6. ARM | 0xAA DSP, 0xAA AVR, B0 `[01 01]` &rarr; 0x95, then wait for the E3 `ARMED Xi` text (about 1 s). No PI poll. |
 
@@ -504,7 +504,7 @@ If the Xi is still armed from an earlier session, the first B0 `[01 00]` of the
 configure phase disarms it: the AVR sends 0x95, `ARMED CANCELLED` and 0xB1.
 
 **DSP power mode.** Param 0x01 on the DSP is its power mode: 1 = Normal,
-4 = Standby (FS Golf writes 4 when it exits). ironsight writes 1 to the DSP
+4 = Standby (another app may leave the DSP in Standby). ironsight writes 1 to the DSP
 on every connection, as its last DSP sync step:
 
 ```
@@ -521,8 +521,10 @@ parameter (Altitude, &sect;8.3). The Mevo+ and Gen2 are not sent this write.
 
 ### 8.3 Configuration
 
-ironsight (`BinaryClient::configure_xi`, `XiConfigSequencer`) sends the frames
-FS Golf sends, in the same order, one at a time. Each waits for its reply:
+ironsight (`BinaryClient::configure_xi`, `XiConfigSequencer`) sends the Xi its
+full parameter set, radar calibration and mode on connect, then the mode alone
+on a change. It sends the frames below in this order, one at a time. Each
+waits for its reply:
 
 | Frame | Reply |
 | ----- | ----- |
@@ -540,8 +542,8 @@ for another type does not end the step. A frame that gets no reply at all
 waits for the operation timeout (30 s by default).
 
 **Connect-time block**, once per connection. `RR RR` is the distance from the
-Xi to the ball and `HH` the surface height, both in mm (FS Golf's defaults:
-2438 mm, 25 mm); `CC` is the session type and `MM` the detection mode:
+Xi to the ball and `HH` the surface height, both in mm (`XiSettings::default()`:
+2438 mm, 25 mm); `CC` is the shot type and `MM` the detection mode:
 
 ```
 BF 06 00 00 01 00 00 00          BF 06 00 00 07 00 54 48
@@ -568,34 +570,32 @@ BF 06 00 00 07 00 54 48          BF 08 00 00 20 00 00 00 00 00
 
 Then ARM as in &sect;8.2.
 
-The params, with FS Golf's names where it has one:
+The params:
 
-| Param | Name | Value |
-| ----- | ---- | ----- |
-| 0x01 | Altitude | 0 |
+| Param | Meaning | Value |
+| ----- | ------- | ----- |
+| 0x01 | altitude | 0 |
 | 0x02 | | 3 (read first) |
-| 0x07 | ProcessFlags (bitfield) | 0x140B on its first write, 0x5448 after |
-| 0x08 | TriggerOptions | 1 |
+| 0x07 | processing flags (bitfield) | 0x140B on its first write, 0x5448 after |
+| 0x08 | trigger options | 1 (standard trigger) |
 | 0x14 | | 2 |
-| 0x16 | ClubType | session type (`CC`) |
+| 0x16 | club type | shot type (`CC`) |
 | 0x20 | | 0.0 |
-| 0x25 | OperationFlags | 0 |
-| 0x27 | OutdoorMinimumTrackPercentage | 30.0 (%) |
-| 0x28 | IndoorModelDragFraction | 1.0 |
+| 0x25 | operation flags | 0 |
+| 0x27 | minimum outdoor track percentage | 30.0 (%) |
+| 0x28 | indoor model drag fraction | 1.0 |
 
-Values by FS Golf session:
+Values by shot type (`XiSettings::full_swing`, `XiSettings::pitching`):
 
-| Session | `MM` | `CC` (param 0x16) |
-| ------- | ---- | ----------------- |
-| Full swing | 9 (Limited flight) | 1 |
+| Shot type | `MM` | `CC` (param 0x16) |
+| --------- | ---- | ----------------- |
+| Full swing | 9 (limited flight) | 1 |
 | Pitching (chips and pitches) | 9 | 2 |
-| Full swing, Outdoor | 8 | 1 |
+| Full swing, outdoor | 8 | 1 |
 
-FS Golf's own Outdoor configuration for the Xi has not been observed;
-ironsight sends the same frames with mode 8. FS Golf writes param 0x08 = 5
-instead of 1 for slow swings; ironsight always writes 1. FS Golf's "Chipping"
-selection on the Xi uses mode 1, in which every full result (D4) is zero;
-ironsight has no such session type.
+Full swing in mode 8 sends the same frames as in mode 9 with only the mode
+changed, and is untested on the Xi. In detection mode 1 every full result
+(D4) from the Xi is zero, so ironsight never selects it.
 
 ### 8.4 Keepalive
 
@@ -614,7 +614,7 @@ E5 "BALL TRIGGER" → 0xBA → E9 → E8 → E0 → E1 → D4 → ED → D9 → 
 
 D4, E8, ED and EF use the Mevo+ layouts (D4 is 157 bytes).
 
-The app acks each flight result the moment it arrives, with a 0x95 to the
+ironsight acks each flight result the moment it arrives, with a 0x95 to the
 AVR in the layout the device uses for its own acks (`[02 bus type & 0x7F]`,
 bus 0x10 = APP):
 

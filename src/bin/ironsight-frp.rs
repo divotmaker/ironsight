@@ -88,7 +88,7 @@ fn main() -> ExitCode {
                         }
 
                         if h.model == DeviceModel::Xi {
-                            // FS Golf's full-swing configuration, limited-flight mode (9)
+                            // Full swing, limited-flight mode (9)
                             client.configure_xi(XiSettings::default());
                         } else {
                             // Configure for indoor full-swing

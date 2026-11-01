@@ -56,14 +56,15 @@ This project is an exercise of the interoperability exception under
 The FlightScope Mevo+ uses a proprietary binary protocol over TCP to
 communicate shot data (ball speed, launch angle, spin, club data, etc.) to
 companion software. FlightScope does not publish this protocol or provide an
-SDK for third-party integration. The protocol was reverse-engineered from
-publicly broadcast WiFi traffic between the device and the official FS Golf
-app, solely to enable interoperability with third-party golf simulation
-software.
+SDK for third-party integration. The protocol was worked out from WiFi traffic
+between the researcher's own lawfully purchased device and the official FS Golf
+app, and from analysis of that app, solely to enable interoperability with
+third-party golf simulation software.
 
-No FlightScope code is reproduced here. No access controls were circumvented —
+No FlightScope code is reproduced here; the protocol is described and
+implemented in our own words and names. No access controls were circumvented —
 the device operates as an open WiFi access point, and all traffic was captured
-from the researcher's own lawfully purchased hardware.
+from the researcher's own hardware.
 
 ## Acceptable Use
 
@@ -123,8 +124,8 @@ Pi, so `BinaryClient` adapts once the handshake has identified it:
 - Nothing is ever sent to the PI bus address: no PI status polls in arming or
   keepalives, and `configure_cam()` sends nothing (it reports `Configured`
   straight away).
-- ironsight does not rely on the DSP query (`0x48`): a response from the Xi
-  has not been observed, and without one the handshake moves on after
+- ironsight does not rely on the DSP query (`0x48`): the Xi's DSP may not
+  answer it, and without an answer the handshake moves on after
   `DSP_QUERY_TIMEOUT` (2 s), leaving `DspSync::hw_info` as `None`.
 - The DSP sync ends with a power-mode write to the DSP,
   `BF [06 00 00 01 00 00 01]` (DSP param `0x01` = 1, Normal; 4 is Standby),
@@ -138,17 +139,17 @@ Pi, so `BinaryClient` adapts once the handshake has identified it:
   [02 30 2A]`); the handshake re-sends the poll every
   `STATUS_REPOLL_INTERVAL` (1 s) until the AVR answers. This applies to every
   model, and changes nothing when the AVR answers the first poll.
-- `BinaryClient::configure_xi(XiSettings)` sends the configuration FS Golf
-  sends to the Xi, frame for frame: on the first call of a connection a
-  connect-time block (parameter writes and the radar calibration from
-  `XiSettings::radar_cal`), then a mode block with the detection mode
-  (`MODE_LIMITED_FLIGHT` (9) for nets and simulator screens, or
-  `MODE_FULL_OUTDOOR` (8)) and the session type (`XiShotType::FullSwing`, or
-  `XiShotType::Pitching` for chips and pitches, which FS Golf pairs with
-  mode 9). Later calls send the mode block only, disarming first if the Xi is
-  armed. `XiSettings::default()` is full swing in mode 9 with FS Golf's
-  default radar calibration (2438 mm to the ball, 25 mm surface height).
-  Each frame waits for its reply. A `0x94` refusing a frame (or the DSP
+- `BinaryClient::configure_xi(XiSettings)` sends the Xi its full parameter
+  set, radar calibration and mode on the connection's first configuration
+  (the connect-time block, with the radar calibration from
+  `XiSettings::radar_cal`, followed by the mode block), then the mode block
+  alone on a later call, disarming first if the Xi is armed. The mode block
+  carries the detection mode and the shot type. Build the settings with
+  `XiSettings::full_swing(mode, radar_cal)`, in `MODE_LIMITED_FLIGHT` (9) for
+  nets and simulator screens or `MODE_FULL_OUTDOOR` (8), or
+  `XiSettings::pitching(radar_cal)` for chips and pitches, which always runs
+  in mode 9. `XiSettings::default()` is full swing in mode 9 with 2438 mm to
+  the ball and a 25 mm surface height. Each frame waits for its reply. A `0x94` refusing a frame (or the DSP
   power-mode write) ends that step too: `BinaryClient` reports it as
   `BinaryEvent::StepRefused`, carrying the `0x94` frame, and carries on.
 - `AvrSettings::xi()` and `AvrSettings::xi_with_mode(mode)` are deprecated:
@@ -156,14 +157,38 @@ Pi, so `BinaryClient` adapts once the handshake has identified it:
   calibration.
 - Shot results (`E8`, `D4`, `ED`, `EF`) decode with the Mevo+ layouts.
   `BinaryClient` acks every `E8` and `D4` with `0x95` the moment it arrives
-  (`[02 10 68]` / `[02 10 54]`), as FS Golf does; `seq::result_ack` builds the
-  ack for callers that drive the sequencers themselves.
+  (`[02 10 68]` / `[02 10 54]`); `seq::result_ack` builds the ack for callers
+  that drive the sequencers themselves.
 
-It connects, arms and reports shots, and has been verified against
-FlightScope's own FS Golf app on a real Xi. FS Golf's full-swing and pitching
-configurations in mode 9 are reproduced byte for byte; mode 8 uses the same
-frames with only the mode changed, and is untested. FS Golf's putting
-configuration for the Xi is not known. See [SEQUENCE.md](docs/SEQUENCE.md#8-flightscope-xi).
+It connects, arms and reports shots on a real Xi. Full swing and pitching in
+mode 9 are tested; mode 8 sends the same frames with only the mode changed,
+and is untested. ironsight has no putting configuration for the Xi. See
+[SEQUENCE.md](docs/SEQUENCE.md#8-flightscope-xi).
+
+### Mevo+ and Mevo Gen2 configuration
+
+`seq::MevoSettings` holds a full configuration: detection mode, ball type
+(param `0x06`), minimum track percentage as a fraction (written to param
+`0x0F`, whose exact use by the device is not yet confirmed), tee height in
+metres (param `0x26`) and the radar calibration. Build it with
+`MevoSettings::new`. It converts into
+the `AvrSettings` that `BinaryClient::configure_avr` takes. For a mode change,
+send `AvrSettings::mode_only(mode)`: the device re-arms sooner after the mode
+alone than after a full parameter set.
+
+Send `CamConfig::warmup_preset()` when the session starts. The camera accepts
+a Fusion configuration (`CamConfig::fusion_preset()`,
+`CamConfig::raw_fusion_preset()`) only after it has run in standard mode for
+`camera::WARMUP` (15 s).
+
+### Sign convention
+
+Shot results report directions as the device measures them: azimuth, lateral
+distances, sidespin, club path, face angle and swing plane direction are
+positive to the **left** of the target line and negative to the right. Positive
+sidespin curves the ball left. The usual convention in golf software (and in
+FRP) is positive to the right, so negate these when converting; the `frp`
+feature does. See the `protocol::shot` docs.
 
 ## Protocol Documentation
 
@@ -242,6 +267,27 @@ cargo run --features frp --bin ironsight-frp -- 192.168.2.1:5100 0.0.0.0:5880
 
 Pre-built binaries for Linux and Windows are attached to each
 [GitHub release](https://github.com/divotmaker/ironsight/releases).
+
+### Testing support
+
+The `testing` feature (off by default) adds `ironsight::testing` for the
+tests of applications built on ironsight:
+
+- `FakeDevice`: a scripted in-memory device (`Read + Write`) to hand to
+  `BinaryConnection::new`. It answers status polls, the arm and the
+  shot-completion requests itself; `FakeDevice::xi()` also answers the Xi's
+  handshake and configuration.
+- `Shot`: one shot's frames (`Shot::xi_full_swing()`, `Shot::xi_chip()`,
+  `Shot::xi_no_read()`, or your own results with
+  `Shot::new`), queued with `FakeDevice::push_shot`.
+- `fixtures`: result frames as an Xi sent them, none of which identifies a
+  unit.
+- Payload encoders for test frames: `avr_status`, `dev_info`, `shot_text`.
+
+```toml
+[dev-dependencies]
+ironsight = { version = "0.5.1", features = ["testing"] }
+```
 
 ## Dependencies
 

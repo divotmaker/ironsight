@@ -1,7 +1,21 @@
 //! Camera-related messages (APP ↔ PI).
+//!
+//! The camera starts in standard mode (1024x768). It accepts a Fusion
+//! configuration ([`CamConfig::fusion_preset`],
+//! [`CamConfig::raw_fusion_preset`]) only after it has run in standard mode
+//! for about [`WARMUP`]: the Fusion frame buffer cannot be allocated before
+//! then. A session therefore sends [`CamConfig::warmup_preset`] (or
+//! [`CamConfig::standard_preset`]) first, and a Fusion configuration once
+//! [`WARMUP`] has passed.
+
+use std::time::Duration;
 
 use crate::codec;
 use crate::error::{Result, WireError};
+
+/// How long the camera has to run in standard mode before it accepts a
+/// Fusion configuration (it needs about 14 s).
+pub const WARMUP: Duration = Duration::from_secs(15);
 
 /// Camera start/stop (2 bytes). Type 0x81.
 ///
@@ -26,6 +40,11 @@ impl CamState {
 }
 
 /// Camera configuration (52 bytes, S51 format). Type 0x82.
+///
+/// The raw-camera and buffer sub-sampling fields take `-1` for "not set".
+/// A `0` in one of them reads as a real value to the camera and disturbs
+/// its frame buffer allocation, which Fusion processing depends on; every
+/// preset sets the fields it does not use to `-1`.
 #[derive(Debug, Clone)]
 pub struct CamConfig {
     pub dynamic_config: bool,
@@ -66,11 +85,11 @@ pub struct CamConfig {
 }
 
 impl CamConfig {
-    /// Standard mode preset (1024x768).
+    /// Standard mode preset (1024x768), JPEG quality 20, streaming at 20
+    /// fps, 2000 ms / 1500 ms ring buffer.
     ///
-    /// Used during camera warmup before switching to Fusion. The Pi camera
-    /// subsystem needs to boot in standard mode first (~14s) before the Fusion
-    /// SHM buffer can be allocated.
+    /// A standard-mode configuration for the warmup before a Fusion
+    /// configuration (see the [module docs](self)).
     #[must_use]
     pub fn standard_preset() -> Self {
         Self {
@@ -86,9 +105,7 @@ impl CamConfig {
             ringbuffer_posttime_ms: 1500,
             raw_camera_mode: 0,
             fusion_camera_mode: false,
-            // Raw camera fields: -1 = disabled (matches native app wire encoding).
-            // Using 0 instead of -1 can cause the Pi to misinterpret these as
-            // real configuration values, affecting SHM buffer allocation.
+            // Unused raw-camera fields: -1 = not set (see `CamConfig`).
             raw_shutter_speed_max: 0.0,
             raw_ev_roi_x: -1,
             raw_ev_roi_y: -1,
@@ -106,10 +123,49 @@ impl CamConfig {
         }
     }
 
-    /// Fusion mode preset (1640x1232) — five_strikes pcap (older firmware).
+    /// Standard resolution (1024x768) at 20 fps, with the Fusion preset's
+    /// JPEG quality (80), streaming rate (1 fps) and ring buffer (1000 ms /
+    /// 4000 ms), and every unused raw-camera field `-1`.
+    ///
+    /// The configuration to send when a session starts, while the camera
+    /// warms up in standard mode (see the [module docs](self)). It is also a
+    /// complete configuration for a session that stays in standard mode.
+    #[must_use]
+    pub fn warmup_preset() -> Self {
+        Self {
+            dynamic_config: true,
+            resolution_width: 1024,
+            resolution_height: 768,
+            rotation: 0,
+            ev: 0,
+            quality: 80,
+            framerate: 20,
+            streaming_framerate: 1,
+            ringbuffer_pretime_ms: 1000,
+            ringbuffer_posttime_ms: 4000,
+            raw_camera_mode: 0,
+            fusion_camera_mode: false,
+            raw_shutter_speed_max: 0.0,
+            raw_ev_roi_x: -1,
+            raw_ev_roi_y: -1,
+            raw_ev_roi_width: -1,
+            raw_ev_roi_height: -1,
+            raw_x_offset: -1,
+            raw_bin44: false,
+            raw_live_preview_write_interval_ms: -1,
+            raw_y_offset: -1,
+            buffer_sub_sampling_pre_trigger_div: -1,
+            buffer_sub_sampling_post_trigger_div: -1,
+            buffer_sub_sampling_switch_time_offset: -1.0,
+            buffer_sub_sampling_total_buffer_size: -1,
+            buffer_sub_sampling_pre_trigger_buffer_size: -1,
+        }
+    }
+
+    /// Fusion mode preset (1640x1232), for older firmware.
     ///
     /// High-resolution JPEG Fusion mode where the APP controls the capture
-    /// resolution. Matches five_strikes pcap byte-for-byte.
+    /// resolution.
     #[must_use]
     pub fn fusion_preset() -> Self {
         Self {
@@ -142,11 +198,12 @@ impl CamConfig {
         }
     }
 
-    /// Raw Fusion mode preset (640x480, 180fps) — new_firmware pcap (BM17.04).
+    /// Raw Fusion mode preset (640x480, 180fps), for firmware BM17.04 and
+    /// newer.
     ///
     /// High-speed raw capture mode where the Pi handles Fusion processing
-    /// internally via `raw_camera_mode=7`. The native app reads this config
-    /// from the PI at boot and re-applies it after the standard warmup phase.
+    /// internally via `raw_camera_mode=7`. Apply it after the standard
+    /// warmup.
     #[must_use]
     pub fn raw_fusion_preset() -> Self {
         Self {
@@ -411,6 +468,48 @@ mod tests {
         let decoded = CamConfig::decode(&encoded).unwrap();
         assert!(!decoded.is_fusion());
         assert_eq!(decoded.encode(), encoded);
+    }
+
+    /// The warmup preset field by field, and its wire bytes.
+    #[test]
+    fn warmup_preset_values() {
+        let expected = CamConfig {
+            dynamic_config: true,
+            resolution_width: 1024,
+            resolution_height: 768,
+            rotation: 0,
+            ev: 0,
+            quality: 80,
+            framerate: 20,
+            streaming_framerate: 1,
+            ringbuffer_pretime_ms: 1000,
+            ringbuffer_posttime_ms: 4000,
+            raw_camera_mode: 0,
+            fusion_camera_mode: false,
+            raw_shutter_speed_max: 0.0,
+            raw_ev_roi_x: -1,
+            raw_ev_roi_y: -1,
+            raw_ev_roi_width: -1,
+            raw_ev_roi_height: -1,
+            raw_x_offset: -1,
+            raw_bin44: false,
+            raw_live_preview_write_interval_ms: -1,
+            raw_y_offset: -1,
+            buffer_sub_sampling_pre_trigger_div: -1,
+            buffer_sub_sampling_post_trigger_div: -1,
+            buffer_sub_sampling_switch_time_offset: -1.0,
+            buffer_sub_sampling_total_buffer_size: -1,
+            buffer_sub_sampling_pre_trigger_buffer_size: -1,
+        };
+        let preset = CamConfig::warmup_preset();
+        assert!(!preset.is_fusion());
+        assert_eq!(preset.encode(), expected.encode());
+        let hex: String = preset.encode().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "3301040003000000000050140103e80fa000000000000000ffffffffffffffffffff00ffffffffffffffff0001c00000ffffffff"
+        );
+        assert_eq!(WARMUP, Duration::from_secs(15));
     }
 
     #[test]

@@ -141,6 +141,40 @@ impl DevInfoResp {
     pub fn model(&self) -> DeviceModel {
         DeviceModel::from_dev_info(self)
     }
+
+    /// Firmware version: the first word of [`text`](Self::text) when it is a
+    /// version number (digits and dots, starting with a digit), e.g.
+    /// `"0.37"`.
+    ///
+    /// The AVR's response starts with its version; so does the Xi DSP's.
+    /// `None` when the text does not start with a version.
+    #[must_use]
+    pub fn version(&self) -> Option<&str> {
+        self.text.split_whitespace().next().filter(|t| {
+            t.starts_with(|c: char| c.is_ascii_digit())
+                && t.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
+    }
+
+    /// Firmware build date, the first `Mon D YYYY` in
+    /// [`text`](Self::text), with single spaces: `"Feb 3 2024"` for
+    /// `"Feb  3 2024"`.
+    ///
+    /// The AVR's and PI's responses carry a build date; the DSP's does not.
+    /// `None` when the text has no date.
+    #[must_use]
+    pub fn build_date(&self) -> Option<String> {
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let tokens: Vec<&str> = self.text.split_whitespace().collect();
+        tokens.windows(3).find_map(|w| {
+            let day_ok = w[1].len() <= 2 && w[1].parse::<u8>().is_ok_and(|d| (1..=31).contains(&d));
+            let year_ok = w[2].len() == 4 && w[2].chars().all(|c| c.is_ascii_digit());
+            (MONTHS.contains(&w[0]) && day_ok && year_ok)
+                .then(|| format!("{} {} {}", w[0], w[1], w[2]))
+        })
+    }
 }
 
 /// Launch monitor model family, detected from the DSP device info (0xE7).
@@ -270,8 +304,8 @@ impl NetConfigReq {
 
 /// Network config response (54 bytes). Type 0xDE (PI→APP).
 ///
-/// Layout: [0-1] length, [2-5] IP, [6-9] netmask, [10-20] binary,
-///         [21-36] 16B SSID slot, [37-52] 16B password slot, [53] flags.
+/// Layout: `[0-1]` length, `[2-5]` IP, `[6-9]` netmask, `[10-20]` binary,
+/// `[21-36]` 16B SSID slot, `[37-52]` 16B password slot, `[53]` flags.
 /// The SSID query (sub 0x00) returns IP/mask but empty text slots.
 /// The password query (sub 0x08) returns both SSID and password.
 #[derive(Debug, Clone)]
@@ -417,6 +451,56 @@ impl TimeSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dev_info_text(text: &str) -> DevInfoResp {
+        DevInfoResp {
+            text: text.to_string(),
+            payload: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dev_info_version_and_build_date() {
+        for (text, version, date) in [
+            (
+                "0.37   M2 TR 03 Jan 21 2026 11:29:54",
+                Some("0.37"),
+                Some("Jan 21 2026"),
+            ),
+            ("0.37   M2 TR 03", Some("0.37"), None),
+            (
+                "1.02 XY 7 Dec  9 2025 08:00:00",
+                Some("1.02"),
+                Some("Dec 9 2025"),
+            ),
+            (
+                "2.07    FSCOPE  Apr  2 2018 12:00:00",
+                Some("2.07"),
+                Some("Apr 2 2018"),
+            ),
+            ("", None, None),
+            ("FSCOPE Jan 32 2020", None, None),
+            ("v1.0 Feb 3 24", None, None),
+            ("Mar 1 2021", None, Some("Mar 1 2021")),
+        ] {
+            let info = dev_info_text(text);
+            assert_eq!(info.version(), version, "{text:?}");
+            assert_eq!(info.build_date().as_deref(), date, "{text:?}");
+        }
+    }
+
+    /// The accessors read the decoded text slots of an AVR response.
+    #[test]
+    fn dev_info_accessors_on_a_decoded_payload() {
+        let mut p = vec![0u8; 75];
+        p[0] = 0x4A;
+        p[27..41].copy_from_slice(b"3.18    FSCOPE");
+        p[43..54].copy_from_slice(b"Jan  1 2020");
+        p[59..67].copy_from_slice(b"12:00:00");
+        let info = DevInfoResp::decode(&p).unwrap();
+        assert_eq!(info.version(), Some("3.18"));
+        assert_eq!(info.build_date().as_deref(), Some("Jan 1 2020"));
+    }
 
     #[test]
     fn xi_dsp_dev_info() {

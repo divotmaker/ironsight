@@ -39,13 +39,13 @@ use crate::protocol::{
 pub const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long the DSP sequencer waits for the DSP query response (0xC8) before
-/// carrying on without it. A response from the Xi's DSP has not been
-/// observed, so the handshake does not depend on one.
+/// carrying on without it. The Xi's DSP may not answer it, so the handshake
+/// does not depend on one.
 pub const DSP_QUERY_TIMEOUT: Duration = TIMEOUT;
 
 /// How long the AVR sequencer waits before re-sending a status poll the
-/// AVR refused (0x94). FS Golf re-polls at about this interval while the
-/// Xi's AVR starts up.
+/// AVR refused (0x94). The Xi's AVR refuses status polls for several
+/// seconds after power-on.
 pub const STATUS_REPOLL_INTERVAL: Duration = Duration::from_secs(1);
 
 // ===========================================================================
@@ -984,19 +984,38 @@ impl Sequence for PiSequencer {
 // ===========================================================================
 
 /// Settings for Phase 4 — AVR configuration.
+///
+/// Build a Mevo+ / Mevo Gen2 configuration with [`MevoSettings`] (full
+/// settings) or [`AvrSettings::mode_only`] (a mode change).
 #[derive(Debug, Clone)]
 pub struct AvrSettings {
     /// Detection mode commsIndex (see `config::MODE_*` constants).
     pub mode: u8,
     /// BF parameter writes (ball type, tee height, track%, etc.).
     pub params: Vec<ParamValue>,
-    /// Radar calibration values. Optional — skip during mode changes
-    /// (the FS Golf app only sends RadarCal on initial configuration
-    /// or in the pre-disarm phase, never during the configure phase).
+    /// Radar calibration values. Optional: a mode change sends none.
     pub radar_cal: Option<RadarCal>,
 }
 
 impl AvrSettings {
+    /// The detection mode alone, for a mode change on a Mevo+ or Mevo Gen2
+    /// that already has its parameters and radar calibration.
+    /// [`AvrConfigSequencer`] sends B0 `[01 00]`, A5 `[02 00 mode]` and B0
+    /// `[01 00]`.
+    ///
+    /// After a full parameter set (see [`MevoSettings`]) the Mevo+ can
+    /// refuse the arm (0x94) for up to about 30 seconds before it accepts
+    /// it. After the mode alone it re-arms much sooner, though a few
+    /// refusals can still occur; [`ArmSequencer`] retries them.
+    #[must_use]
+    pub fn mode_only(mode: u8) -> Self {
+        Self {
+            mode,
+            params: vec![],
+            radar_cal: None,
+        }
+    }
+
     /// Mode-only configuration for the Xi in limited-flight mode
     /// ([`MODE_LIMITED_FLIGHT`](crate::protocol::config::MODE_LIMITED_FLIGHT),
     /// 9). Same as [`xi_with_mode`](Self::xi_with_mode) with that mode.
@@ -1015,16 +1034,123 @@ impl AvrSettings {
     /// calibration, so the Xi runs on whatever values it holds.
     ///
     /// [`BinaryClient::configure_xi`](crate::BinaryClient::configure_xi)
-    /// sends the full configuration FS Golf sends; see [`XiSettings`].
+    /// sends the Xi its full configuration; see [`XiSettings`].
     #[deprecated(
         note = "sends the detection mode only; use BinaryClient::configure_xi with XiSettings"
     )]
     #[must_use]
     pub fn xi_with_mode(mode: u8) -> Self {
+        Self::mode_only(mode)
+    }
+}
+
+/// Param 0x06: ball type (INT24).
+const MEVO_BALL_TYPE_ID: u8 = 0x06;
+/// Param 0x0F: written with the minimum track percentage, as a fraction
+/// (FLOAT40).
+const MEVO_TRACK_FRACTION_ID: u8 = 0x0F;
+/// Param 0x26: tee height in metres (FLOAT40).
+const MEVO_TEE_HEIGHT_ID: u8 = 0x26;
+
+/// Full configuration for a Mevo+ or Mevo Gen2: detection mode, ball type,
+/// minimum track percentage, tee height and radar calibration.
+///
+/// Build one with [`MevoSettings::new`]; the fields stay public for
+/// reading and adjusting.
+///
+/// Converts into [`AvrSettings`]. [`AvrConfigSequencer`] (and
+/// [`BinaryClient::configure_avr`](crate::BinaryClient::configure_avr))
+/// then sends B0 `[01 00]`, then each parameter write in this order, the
+/// mode and the radar calibration, each followed by B0 `[01 00]`:
+///
+/// | Param | Field | Encoding |
+/// | ----- | ----- | -------- |
+/// | 0x06 | `ball_type` | INT24 |
+/// | 0x0F | `track_fraction` | FLOAT40 |
+/// | 0x26 | `tee_height_m` | FLOAT40 |
+///
+/// For a mode change, send [`AvrSettings::mode_only`] instead: the device
+/// re-arms sooner after the mode alone.
+///
+/// ```
+/// use ironsight::protocol::config::{MODE_LIMITED_FLIGHT, RadarCal};
+/// use ironsight::seq::{AvrSettings, MevoSettings};
+///
+/// let settings: AvrSettings = MevoSettings::new(
+///     MODE_LIMITED_FLIGHT,
+///     1,
+///     0.8,
+///     0.0381,
+///     RadarCal { range_mm: 2438, height_mm: 0 },
+/// )
+/// .into();
+/// assert_eq!(settings.params.len(), 3);
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct MevoSettings {
+    /// Detection mode commsIndex (see `config::MODE_*` constants).
+    pub mode: u8,
+    /// Ball type, param 0x06: 0 = standard ball, 1 = RCT ball.
+    pub ball_type: u8,
+    /// Minimum outdoor track percentage as a fraction (0.8 = 80 %),
+    /// written to param 0x0F. The device's exact use of param 0x0F is not
+    /// yet confirmed; ironsight writes this value there unchanged.
+    pub track_fraction: f64,
+    /// Tee height in metres, param 0x26.
+    pub tee_height_m: f64,
+    /// Distance from the device to the ball and height of the hitting
+    /// surface (0xA4).
+    pub radar_cal: RadarCal,
+}
+
+impl MevoSettings {
+    /// A full configuration: detection mode (`config::MODE_*`), ball type
+    /// (0 = standard, 1 = RCT), minimum track percentage as a fraction,
+    /// tee height in metres and radar calibration.
+    #[must_use]
+    pub fn new(
+        mode: u8,
+        ball_type: u8,
+        track_fraction: f64,
+        tee_height_m: f64,
+        radar_cal: RadarCal,
+    ) -> Self {
         Self {
             mode,
-            params: vec![],
-            radar_cal: None,
+            ball_type,
+            track_fraction,
+            tee_height_m,
+            radar_cal,
+        }
+    }
+
+    /// The parameter writes, in the order they are sent.
+    #[must_use]
+    pub fn params(&self) -> Vec<ParamValue> {
+        vec![
+            ParamValue {
+                param_id: MEVO_BALL_TYPE_ID,
+                value: ParamData::Int24(i32::from(self.ball_type)),
+            },
+            ParamValue {
+                param_id: MEVO_TRACK_FRACTION_ID,
+                value: ParamData::Float40(self.track_fraction),
+            },
+            ParamValue {
+                param_id: MEVO_TEE_HEIGHT_ID,
+                value: ParamData::Float40(self.tee_height_m),
+            },
+        ]
+    }
+}
+
+impl From<MevoSettings> for AvrSettings {
+    fn from(settings: MevoSettings) -> Self {
+        Self {
+            mode: settings.mode,
+            params: settings.params(),
+            radar_cal: Some(settings.radar_cal),
         }
     }
 }
@@ -1061,10 +1187,9 @@ pub struct AvrConfigSequencer {
 impl AvrConfigSequencer {
     #[must_use]
     pub fn new(settings: AvrSettings) -> (Self, Vec<Action>) {
-        // Send a leading B0[01 00] config-gate before any params.
-        // The FS Golf app always opens the configure phase with this command;
-        // after disarm the device needs it to enter config mode before arm
-        // will be accepted.
+        // Send a leading B0[01 00] config-gate before any params: after a
+        // disarm the device needs it to enter config mode before it accepts
+        // the arm.
         let seq = Self {
             step: AvrConfigStep::WaitInitGateAck,
             settings,
@@ -1179,11 +1304,12 @@ impl Sequence for AvrConfigSequencer {
 // Phase 4 (Xi) — XiConfigSequencer
 // ===========================================================================
 
-/// Session type of an Xi configuration, written as param 0x16 (`ClubType`).
+/// Shot type of an Xi configuration, written as param 0x16 (club type).
 ///
-/// FS Golf writes 1 for its "Full swing" sessions and 2 for "Pitching"
-/// (chips and pitches). It pairs Pitching with detection mode 9
-/// ([`MODE_LIMITED_FLIGHT`](crate::protocol::config::MODE_LIMITED_FLIGHT)).
+/// Full swing is for full shots; pitching is for chips and pitches and
+/// always runs in detection mode 9
+/// ([`MODE_LIMITED_FLIGHT`](crate::protocol::config::MODE_LIMITED_FLIGHT));
+/// see [`XiSettings::pitching`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum XiShotType {
@@ -1195,7 +1321,7 @@ pub enum XiShotType {
 }
 
 impl XiShotType {
-    /// Value written to param 0x16 (`ClubType`).
+    /// Value written to param 0x16 (club type).
     #[must_use]
     pub fn param_value(self) -> i32 {
         match self {
@@ -1205,13 +1331,18 @@ impl XiShotType {
     }
 }
 
-/// Configuration for the Xi, sent the way FS Golf sends it.
+/// Configuration for the Xi: detection mode, shot type and radar
+/// calibration.
 ///
 /// [`XiConfigSequencer`] (and
-/// [`BinaryClient::configure_xi`](crate::BinaryClient::configure_xi)) turn
-/// this into FS Golf's frames: a connect-time block once per connection,
-/// then a mode block for every mode change. See [`XiConfigSequencer`] for
-/// the exact bytes.
+/// [`BinaryClient::configure_xi`](crate::BinaryClient::configure_xi)) send
+/// the Xi its full parameter set, radar calibration and mode on the
+/// connection's first configuration (the connect-time block), then the mode
+/// alone on a change (the mode block). See [`XiConfigSequencer`] for the
+/// exact bytes.
+///
+/// Build one with [`full_swing`](Self::full_swing) or
+/// [`pitching`](Self::pitching).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XiSettings {
     /// Detection mode commsIndex:
@@ -1219,15 +1350,44 @@ pub struct XiSettings {
     /// (9) for nets and simulator screens, or
     /// [`MODE_FULL_OUTDOOR`](crate::protocol::config::MODE_FULL_OUTDOOR) (8).
     pub mode: u8,
-    /// Full swing or pitching (param 0x16, `ClubType`).
+    /// Full swing or pitching (param 0x16, club type).
     pub shot_type: XiShotType,
     /// Distance from the Xi to the ball and surface height (0xA4).
     pub radar_cal: RadarCal,
 }
 
+impl XiSettings {
+    /// A full-swing session in detection mode `mode`:
+    /// [`MODE_LIMITED_FLIGHT`](crate::protocol::config::MODE_LIMITED_FLIGHT)
+    /// (9) for nets and simulator screens, or
+    /// [`MODE_FULL_OUTDOOR`](crate::protocol::config::MODE_FULL_OUTDOOR) (8)
+    /// for full flight outdoors. Any other mode is sent as given.
+    #[must_use]
+    pub fn full_swing(mode: u8, radar_cal: RadarCal) -> Self {
+        Self {
+            mode,
+            shot_type: XiShotType::FullSwing,
+            radar_cal,
+        }
+    }
+
+    /// A pitching session, for chips and pitches. Pitching always runs in
+    /// limited-flight mode
+    /// ([`MODE_LIMITED_FLIGHT`](crate::protocol::config::MODE_LIMITED_FLIGHT),
+    /// 9).
+    #[must_use]
+    pub fn pitching(radar_cal: RadarCal) -> Self {
+        Self {
+            mode: crate::protocol::config::MODE_LIMITED_FLIGHT,
+            shot_type: XiShotType::Pitching,
+            radar_cal,
+        }
+    }
+}
+
 impl Default for XiSettings {
-    /// Full swing in limited-flight mode, with FS Golf's default radar
-    /// calibration: 2438 mm (8 ft) to the ball, 25 mm (1 in) surface height.
+    /// Full swing in limited-flight mode with the radar calibration
+    /// 2438 mm (8 ft) to the ball and a 25 mm (1 in) surface height.
     fn default() -> Self {
         Self {
             mode: crate::protocol::config::MODE_LIMITED_FLIGHT,
@@ -1254,51 +1414,48 @@ enum XiReply {
     Param(u8),
 }
 
-// Xi parameters (0xBF writes), with FS Golf's names where it has one, and
-// the values ironsight writes. Every value is the one FS Golf writes.
+// Xi parameters (0xBF writes) and the values ironsight writes.
 
 /// Param 0x01, Altitude.
 const XI_ALTITUDE_ID: u8 = 0x01;
 /// Altitude: 0.
 const XI_ALTITUDE: i32 = 0;
-/// Param 0x02 (no FS Golf name). The connect-time block reads it before
-/// writing it.
+/// Param 0x02. The connect-time block reads it before writing it.
 const XI_PARAM_02_ID: u8 = 0x02;
 /// Param 0x02: 3.
 const XI_PARAM_02: i32 = 3;
-/// Param 0x07, `ProcessFlags` (a bitfield).
+/// Param 0x07, processing flags (a bitfield).
 const XI_PROCESS_FLAGS_ID: u8 = 0x07;
-/// `ProcessFlags`, first write of the connect-time block: 0x140B
+/// Processing flags, first write of the connect-time block: 0x140B
 /// (bits 0, 1, 3, 10, 12).
 const XI_PROCESS_FLAGS_INITIAL: i32 = 0x140B;
-/// `ProcessFlags`, every later write: 0x5448 (bits 3, 6, 10, 12, 14).
+/// Processing flags, every later write: 0x5448 (bits 3, 6, 10, 12, 14).
 const XI_PROCESS_FLAGS: i32 = 0x5448;
-/// Param 0x08, `TriggerOptions`.
+/// Param 0x08, trigger options.
 const XI_TRIGGER_OPTIONS_ID: u8 = 0x08;
-/// `TriggerOptions`: 1, the standard trigger. FS Golf writes 5 for its slow
-/// swing option, which ironsight does not offer.
+/// Trigger options: 1, the standard trigger.
 const XI_TRIGGER_OPTIONS: i32 = 1;
-/// Param 0x14 (no FS Golf name).
+/// Param 0x14.
 const XI_PARAM_14_ID: u8 = 0x14;
 /// Param 0x14: 2.
 const XI_PARAM_14: i32 = 2;
-/// Param 0x16, `ClubType`: the session type, from [`XiShotType`].
+/// Param 0x16, club type: the shot type, from [`XiShotType`].
 const XI_CLUB_TYPE_ID: u8 = 0x16;
-/// Param 0x20 (no FS Golf name), written after every `ClubType` write.
+/// Param 0x20, written after every club type write.
 const XI_PARAM_20_ID: u8 = 0x20;
 /// Param 0x20: 0.0.
 const XI_PARAM_20: f64 = 0.0;
-/// Param 0x25, `OperationFlags`.
+/// Param 0x25, operation flags.
 const XI_OPERATION_FLAGS_ID: u8 = 0x25;
-/// `OperationFlags`: 0, no flags set.
+/// Operation flags: 0, no flags set.
 const XI_OPERATION_FLAGS: i32 = 0;
-/// Param 0x27, `OutdoorMinimumTrackPercentage`.
+/// Param 0x27, minimum outdoor track percentage.
 const XI_OUTDOOR_MIN_TRACK_PCT_ID: u8 = 0x27;
-/// `OutdoorMinimumTrackPercentage`: 30 % (FLOAT40 `00 05 78 00 00`).
+/// Minimum outdoor track percentage: 30 % (FLOAT40 `00 05 78 00 00`).
 const XI_OUTDOOR_MIN_TRACK_PCT: f64 = 30.0;
-/// Param 0x28, `IndoorModelDragFraction`.
+/// Param 0x28, indoor model drag fraction.
 const XI_INDOOR_DRAG_FRACTION_ID: u8 = 0x28;
-/// `IndoorModelDragFraction`: 1.0 (FLOAT40 `00 01 40 00 00`).
+/// Indoor model drag fraction: 1.0 (FLOAT40 `00 01 40 00 00`).
 const XI_INDOOR_DRAG_FRACTION: f64 = 1.0;
 
 fn xi_int(param_id: u8, value: i32) -> (Command, XiReply) {
@@ -1334,7 +1491,7 @@ fn xi_gate() -> (Command, XiReply) {
 
 /// Pollable state machine for the Xi's configuration (Phase 4).
 ///
-/// Sends FS Golf's frames one at a time, each after the reply to the one
+/// Sends the frames one at a time, each after the reply to the one
 /// before: 0x95 for a 0xBF write or B0, the echo for A5 and A4, the 0xBF
 /// value for the 0xBE read. A 0x94 refusing the step's command (its
 /// `acked_cmd` is the command type & 0x7F) also ends any step, so the
@@ -1348,37 +1505,37 @@ fn xi_gate() -> (Command, XiReply) {
 /// the radar calibration's range and height in mm:
 ///
 /// ```text
-/// BF 06 00 00 01 00 00 00         Altitude = 0
+/// BF 06 00 00 01 00 00 00         altitude = 0
 /// A5 02 00 08                     mode 8
 /// BE 03 00 00 02                  read param 0x02
 /// A4 06 RR RR 00 HH 00 00         radar calibration
-/// BF 06 00 00 08 00 00 01         TriggerOptions = 1
-/// BF 06 00 00 07 00 14 0B         ProcessFlags = 0x140B
-/// BF 06 00 00 16 00 00 CC         ClubType = CC
-/// BF 06 00 00 25 00 00 00         OperationFlags = 0
-/// BF 06 00 00 07 00 54 48         ProcessFlags = 0x5448
+/// BF 06 00 00 08 00 00 01         trigger options = 1
+/// BF 06 00 00 07 00 14 0B         processing flags = 0x140B
+/// BF 06 00 00 16 00 00 CC         club type = CC
+/// BF 06 00 00 25 00 00 00         operation flags = 0
+/// BF 06 00 00 07 00 54 48         processing flags = 0x5448
 /// BF 06 00 00 02 00 00 03         param 0x02 = 3
 /// BF 06 00 00 14 00 00 02         param 0x14 = 2
-/// BF 08 00 00 27 00 05 78 00 00   OutdoorMinimumTrackPercentage = 30.0
-/// BF 08 00 00 28 00 01 40 00 00   IndoorModelDragFraction = 1.0
-/// BF 06 00 00 07 00 54 48         ProcessFlags = 0x5448
+/// BF 08 00 00 27 00 05 78 00 00   min. outdoor track % = 30.0
+/// BF 08 00 00 28 00 01 40 00 00   indoor drag fraction = 1.0
+/// BF 06 00 00 07 00 54 48         processing flags = 0x5448
 /// A5 02 00 MM                     mode MM
 /// B0 01 00
-/// BF 08 00 00 28 00 01 40 00 00   IndoorModelDragFraction = 1.0
+/// BF 08 00 00 28 00 01 40 00 00   indoor drag fraction = 1.0
 /// ```
 ///
 /// [`mode_change`](Self::mode_change) sends the mode block alone:
 ///
 /// ```text
-/// BF 06 00 00 08 00 00 01         TriggerOptions = 1
+/// BF 06 00 00 08 00 00 01         trigger options = 1
 /// B0 01 00
-/// BF 06 00 00 16 00 00 CC         ClubType = CC
+/// BF 06 00 00 16 00 00 CC         club type = CC
 /// BF 08 00 00 20 00 00 00 00 00   param 0x20 = 0.0
-/// BF 06 00 00 07 00 54 48         ProcessFlags = 0x5448
+/// BF 06 00 00 07 00 54 48         processing flags = 0x5448
 /// A5 02 00 MM                     mode MM
 /// B0 01 00
-/// BF 08 00 00 28 00 01 40 00 00   IndoorModelDragFraction = 1.0
-/// BF 06 00 00 16 00 00 CC         ClubType = CC
+/// BF 08 00 00 28 00 01 40 00 00   indoor drag fraction = 1.0
+/// BF 06 00 00 16 00 00 CC         club type = CC
 /// BF 08 00 00 20 00 00 00 00 00   param 0x20 = 0.0
 /// ```
 ///
@@ -1719,7 +1876,7 @@ enum ArmStep {
 
 /// Pollable state machine for the ARM phase (Phase 6).
 ///
-/// Sequence (from pcap):
+/// Sequence:
 ///   1. StatusPoll → DSP  → wait DspStatus
 ///   2. StatusPoll → AVR  → wait AvrStatus
 ///   3. AvrConfigCmd(arm=true) → AVR → wait ConfigAck
@@ -1732,9 +1889,8 @@ enum ArmStep {
 ///
 /// On ConfigNack (0x94), the sequencer restarts from step 1. The device
 /// may reject ARM for up to ~30 seconds after a full configuration
-/// (params + RadarCal). The FS Golf app uses different param IDs and
-/// gets zero ConfigNack on ARM. Mode-only configuration (no params,
-/// no RadarCal) still produces ConfigNack retries but typically fewer.
+/// (params + RadarCal). Mode-only configuration (no params, no RadarCal)
+/// can still produce ConfigNack retries, but typically fewer.
 /// The overall operation timeout (set by the caller) limits retries.
 ///
 /// On a model without a camera Pi ([`new_for(DeviceModel::Xi)`](Self::new_for))
@@ -1797,7 +1953,7 @@ impl Sequence for ArmSequencer {
                 if let Message::DspStatus(_) = env.message {
                     // Poll AVR status before arming. The device requires
                     // this step to transition the AVR into a state that
-                    // accepts the arm command (confirmed via pcap).
+                    // accepts the arm command.
                     self.step = ArmStep::WaitAvrStatus;
                     return vec![Action::Send(
                         Command::StatusPoll(StatusPoll { pi_mode: false }),
@@ -2058,11 +2214,10 @@ impl Sequence for ShotSequencer {
                 match &env.message {
                     Message::ShotText(st) if st.is_idle() => {
                         // After IDLE, go straight to requesting final results.
-                        // Gen1 FS Golf sends 0x21 ConfigQuery here and waits
-                        // for B1 ModeAck + A0 ConfigResp before proceeding,
-                        // but Gen2 firmware skips that exchange entirely. The
-                        // ConfigQuery is informational (re-reads radar params
-                        // we already have) and not required for re-arming.
+                        // No 0x21 ConfigQuery here: it only re-reads radar
+                        // params we already have, Gen2 firmware does not take
+                        // part in that exchange, and re-arming does not need
+                        // it.
                         // ModeAck arrives naturally during the device's
                         // shot-completion flow and is absorbed passively.
                         self.step = ShotStep::WaitingForClubResult;
@@ -2768,9 +2923,9 @@ mod tests {
             .collect()
     }
 
-    /// FS Golf's connect-time block for a session in `mode` with club type
+    /// The Xi connect-time block for a session in `mode` with club type
     /// `club`, radar cal 2438 mm / 25 mm.
-    fn fs_golf_connect(mode: &str, club: &str) -> Vec<(u8, String)> {
+    fn xi_connect_block(mode: &str, club: &str) -> Vec<(u8, String)> {
         let club = format!("BF 06000016 0000{club}");
         let mode = format!("A5 0200{mode}");
         frames(&[
@@ -2794,8 +2949,8 @@ mod tests {
         ])
     }
 
-    /// FS Golf's mode block for `mode` and club type `club`.
-    fn fs_golf_mode(mode: &str, club: &str) -> Vec<(u8, String)> {
+    /// The Xi mode block for `mode` and club type `club`.
+    fn xi_mode_block(mode: &str, club: &str) -> Vec<(u8, String)> {
         let club = format!("BF 06000016 0000{club}");
         let mode = format!("A5 0200{mode}");
         frames(&[
@@ -2821,7 +2976,7 @@ mod tests {
     }
 
     #[test]
-    fn xi_settings_default_is_fs_golf_full_swing() {
+    fn xi_settings_default_is_full_swing_limited_flight() {
         let s = XiSettings::default();
         assert_eq!(s.mode, 9);
         assert_eq!(s.shot_type, XiShotType::FullSwing);
@@ -2832,20 +2987,143 @@ mod tests {
     }
 
     #[test]
-    fn xi_connect_full_swing_matches_fs_golf() {
+    fn xi_settings_constructors() {
+        use crate::protocol::config::{MODE_FULL_OUTDOOR, MODE_LIMITED_FLIGHT};
+        let cal = RadarCal {
+            range_mm: 3048,
+            height_mm: 25,
+        };
+        for mode in [MODE_LIMITED_FLIGHT, MODE_FULL_OUTDOOR] {
+            assert_eq!(
+                XiSettings::full_swing(mode, cal.clone()),
+                XiSettings {
+                    mode,
+                    shot_type: XiShotType::FullSwing,
+                    radar_cal: cal.clone(),
+                }
+            );
+        }
+        assert_eq!(
+            XiSettings::pitching(cal.clone()),
+            XiSettings {
+                mode: MODE_LIMITED_FLIGHT,
+                shot_type: XiShotType::Pitching,
+                radar_cal: cal,
+            }
+        );
+        assert_eq!(
+            XiSettings::full_swing(MODE_LIMITED_FLIGHT, XiSettings::default().radar_cal),
+            XiSettings::default()
+        );
+    }
+
+    /// Run an AVR configuration against replies that ack every frame, and
+    /// return the frames sent as (type, payload hex).
+    fn run_avr(settings: AvrSettings) -> Vec<(u8, String)> {
+        let (mut seq, mut pending) = AvrConfigSequencer::new(settings);
+        let mut wire = Vec::new();
+        while let Some(Action::Send(cmd, dest)) = pending.pop() {
+            assert!(pending.is_empty());
+            assert_eq!(dest, BusAddr::Avr);
+            let f = cmd.encode(dest);
+            wire.push((f.type_id, hex_of(&f.payload)));
+            assert!(wire.len() < 32, "did not finish");
+            pending = seq.feed(&xi_reply(f.type_id, &f.payload));
+        }
+        assert!(seq.is_complete());
+        wire
+    }
+
+    /// The Mevo+ full configuration: ball type, track fraction and tee
+    /// height, each followed by B0, then the mode and the radar
+    /// calibration, each followed by B0.
+    #[test]
+    fn mevo_settings_frames() {
+        use crate::protocol::config::MODE_LIMITED_FLIGHT;
+        let settings = MevoSettings {
+            mode: MODE_LIMITED_FLIGHT,
+            ball_type: 1,
+            track_fraction: 0.8,
+            tee_height_m: 0.0381,
+            radar_cal: RadarCal {
+                range_mm: 2438,
+                height_mm: 0,
+            },
+        };
+        assert_eq!(
+            run_avr(settings.into()),
+            frames(&[
+                "B0 0100",
+                "BF 06000006 000001",
+                "B0 0100",
+                "BF 0800000f 0000666666",
+                "B0 0100",
+                "BF 08000026 fffc4e075f",
+                "B0 0100",
+                "A5 020009",
+                "B0 0100",
+                "A4 06 0986 00 00 0000",
+                "B0 0100",
+            ])
+        );
+    }
+
+    #[test]
+    fn mevo_settings_params_in_order() {
+        let settings = MevoSettings {
+            mode: 5,
+            ball_type: 0,
+            track_fraction: 0.6,
+            tee_height_m: 0.05,
+            radar_cal: RadarCal {
+                range_mm: 3048,
+                height_mm: 25,
+            },
+        };
+        let avr: AvrSettings = settings.clone().into();
+        assert_eq!(avr.mode, 5);
+        assert_eq!(avr.radar_cal, Some(settings.radar_cal.clone()));
+        let params: Vec<(u8, String)> = avr
+            .params
+            .iter()
+            .map(|p| (p.param_id, format!("{:?}", p.value)))
+            .collect();
+        assert_eq!(
+            params,
+            [
+                (0x06, "Int24(0)".to_string()),
+                (0x0F, "Float40(0.6)".to_string()),
+                (0x26, "Float40(0.05)".to_string()),
+            ]
+        );
+    }
+
+    /// A mode change sends the mode alone between two config gates.
+    #[test]
+    fn mode_only_frames() {
+        for (mode, hex) in [(3, "020003"), (5, "020005"), (8, "020008"), (9, "020009")] {
+            assert_eq!(
+                run_avr(AvrSettings::mode_only(mode)),
+                frames(&["B0 0100", &format!("A5 {hex}"), "B0 0100"])
+            );
+        }
+    }
+
+    #[test]
+    fn xi_connect_full_swing_frames() {
         let (mut seq, actions) = XiConfigSequencer::connect(&XiSettings::default());
-        let mut expected = fs_golf_connect("09", "01");
-        expected.extend(fs_golf_mode("09", "01"));
+        let mut expected = xi_connect_block("09", "01");
+        expected.extend(xi_mode_block("09", "01"));
         assert_eq!(run_xi(&mut seq, actions), expected);
     }
 
     #[test]
-    fn xi_connect_pitching_matches_fs_golf() {
+    fn xi_connect_pitching_frames() {
         use crate::protocol::config::MODE_LIMITED_FLIGHT;
         let settings = xi(MODE_LIMITED_FLIGHT, XiShotType::Pitching);
         let (mut seq, actions) = XiConfigSequencer::connect(&settings);
-        let mut expected = fs_golf_connect("09", "02");
-        expected.extend(fs_golf_mode("09", "02"));
+        let mut expected = xi_connect_block("09", "02");
+        expected.extend(xi_mode_block("09", "02"));
         assert_eq!(run_xi(&mut seq, actions), expected);
     }
 
@@ -2854,16 +3132,16 @@ mod tests {
         use crate::protocol::config::MODE_FULL_OUTDOOR;
         let settings = xi(MODE_FULL_OUTDOOR, XiShotType::FullSwing);
         let (mut seq, actions) = XiConfigSequencer::connect(&settings);
-        let mut expected = fs_golf_connect("08", "01");
-        expected.extend(fs_golf_mode("08", "01"));
+        let mut expected = xi_connect_block("08", "01");
+        expected.extend(xi_mode_block("08", "01"));
         assert_eq!(run_xi(&mut seq, actions), expected);
     }
 
     #[test]
-    fn xi_mode_change_matches_fs_golf() {
+    fn xi_mode_change_frames() {
         for (shot_type, club) in [(XiShotType::FullSwing, "01"), (XiShotType::Pitching, "02")] {
             let (mut seq, actions) = XiConfigSequencer::mode_change(&xi(9, shot_type));
-            assert_eq!(run_xi(&mut seq, actions), fs_golf_mode("09", club));
+            assert_eq!(run_xi(&mut seq, actions), xi_mode_block("09", club));
         }
     }
 
@@ -2903,8 +3181,8 @@ mod tests {
     /// refusal, finishes, and keeps the 0x94 for the caller.
     #[test]
     fn xi_config_nack_continues_every_step_type() {
-        let mut expected = fs_golf_connect("09", "01");
-        expected.extend(fs_golf_mode("09", "01"));
+        let mut expected = xi_connect_block("09", "01");
+        expected.extend(xi_mode_block("09", "01"));
         for refused_type in [0xA5, 0xA4, 0xBE, 0xBF, 0xB0] {
             let (mut seq, mut pending) = XiConfigSequencer::connect(&XiSettings::default());
             let mut wire = Vec::new();
@@ -2956,7 +3234,7 @@ mod tests {
     }
 
     #[test]
-    fn xi_param_floats_encode_as_fs_golf_writes_them() {
+    fn xi_param_floats_encode_as_written() {
         use crate::codec::{read_float40, write_float40};
         for (value, wire) in [
             (XI_OUTDOOR_MIN_TRACK_PCT, hex("0005780000")),

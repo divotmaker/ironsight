@@ -2,7 +2,7 @@
 //!
 //! The GVP communicates via null-terminated JSON over TCP. Nine message types
 //! are defined. The critical one for face impact fusion is `RESULT`
-//! ([`BallTrackerResult`](result::BallTrackerResult)), which carries raw pixel
+//! ([`result::BallTrackerResult`]), which carries raw pixel
 //! tracking data for the club head and ball.
 //!
 //! # Message types
@@ -59,7 +59,7 @@ const TYPE_RESULT: &str = "RESULT";
 const TYPE_VIDEO_AVAILABLE: &str = "MT_VIDEO_AVAILABLE";
 
 // -------------------------------------------------------------------------
-// Protocol versions for commands we send (observed from pcap)
+// Protocol versions for commands we send
 // -------------------------------------------------------------------------
 
 const VERSION_CONFIG_REQUEST: i32 = 1;

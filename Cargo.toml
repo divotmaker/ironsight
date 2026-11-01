@@ -15,6 +15,9 @@ exclude = ["docs/"]
 serde = ["dep:serde"]
 gvp = ["dep:serde", "dep:serde_json"]
 frp = ["dep:flightrelay"]
+# Test support: `ironsight::testing` (a scripted in-memory device, result
+# frames recorded from an Xi, payload encoders). Off by default.
+testing = []
 
 [dependencies]
 thiserror = "2"
@@ -26,3 +29,7 @@ flightrelay = { version = "0.3.1", features = ["transport"], optional = true }
 name = "ironsight-frp"
 path = "src/bin/ironsight-frp.rs"
 required-features = ["frp"]
+
+[[example]]
+name = "gvp_testing"
+required-features = ["gvp"]

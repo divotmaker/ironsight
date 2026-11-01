@@ -715,12 +715,15 @@ Key writable parameters (APP &rarr; AVR):
 | Param ID | Type    | Description                                |
 | -------- | ------- | ------------------------------------------ |
 | 0x0006   | INT24   | Ball type (0 = Standard, 1 = RCT)          |
-| 0x000F   | FLOAT40 | Outdoor minimum track percentage (0.6-1.0) |
+| 0x000F   | FLOAT40 | Written with the outdoor minimum track percentage (0.6-1.0); exact use not yet confirmed |
 | 0x0026   | FLOAT40 | Driver tee height (meters)                 |
-| 0x0007   | INT24   | Radar config (mode-dependent)              |
-| 0x0008   | INT24   | Surface firmness index                     |
-| 0x0016   | INT24   | Mode sub-index                             |
-| 0x0025   | INT24   | Config flags                               |
+| 0x0007   | INT24   | Processing flags (bitfield)                |
+| 0x0008   | INT24   | Trigger options                            |
+| 0x0016   | INT24   | Club type (Xi shot type)                   |
+| 0x0025   | INT24   | Operation flags                            |
+
+`seq::MevoSettings` writes 0x0006, 0x000F and 0x0026 on the Mevo+ and Gen2.
+The Xi's parameters are listed in [SEQUENCE.md &sect;8.3](SEQUENCE.md#83-configuration).
 
 #### 0xA4 &mdash; RADAR_CAL (7 bytes)
 
@@ -756,8 +759,8 @@ Format: `[02 bus_addr acked_cmd]`
 #### 0x48 / 0xC8 &mdash; DSP_QUERY / DSP_QUERY_RESP
 
 Request: empty (0 bytes), APP &rarr; DSP.
-Response: 3 bytes, DSP &rarr; APP. A response from the Xi's DSP has not been
-observed; ironsight does not rely on one (see `DSP_QUERY_TIMEOUT`, 2 s).
+Response: 3 bytes, DSP &rarr; APP. The Xi's DSP may not answer; ironsight
+does not rely on a response (see `DSP_QUERY_TIMEOUT`, 2 s).
 
 ```
 [0]  version   (0x02)
@@ -996,23 +999,23 @@ Request format: `[03 00 XX 02]` where `XX` is the page offset.
 
 The commsIndex value is sent via 0xA5 `[02 00 XX]` to set the detection mode.
 
-| commsIndex | Mode                  | App label           | Notes                                           |
-| ---------- | --------------------- | ------------------- | ----------------------------------------------- |
-| 1          | Indoor                | Indoor              | Never observed in pcap                          |
-| **2**      | **LongIndoor**        | **Long Indoor**     | Observed in pcap (transient, never armed alone) |
-| **3**      | **ShortIndoor**       | **Putting**         | MaxVel=30, Fs=9868.4, GainInit=1                |
-| 4          | ClubSwing             | Club Swing Only     | No ball tracking. Never observed in pcap        |
-| **5**      | **SimulatorChipping** | **Chipping**        | MaxVel=120, Fs=37500.0                          |
-| 6          | SimulatorPutting      | Sim Putting         | Never observed in pcap                          |
-| **8**      | &mdash;               | **Outdoor**         | Full flight; needs unobstructed flight          |
-| **9**      | **Outdoor**           | **Limited flight**  | MaxVel=120, Fs=37500.0, club trigger off        |
-| 13         | RawSampling           | Environmental       | Never observed in pcap                          |
-| 14         | Putting               | Putting (dedicated) | Never observed in pcap                          |
-| 15         | ShortGameChipIn       | Chipping Indoor     | Never observed in pcap                          |
-| 16         | ShortGameChipOut      | Chipping Outdoor    | Never observed in pcap                          |
+| commsIndex | Mode                     | App label           | Notes                                    |
+| ---------- | ------------------------ | ------------------- | ---------------------------------------- |
+| 1          | Indoor                   | Indoor              | Untested                                 |
+| **2**      | **Long indoor**          | **Long Indoor**     | Transient only, never armed alone        |
+| **3**      | **Short indoor**         | **Putting**         | MaxVel=30, Fs=9868.4, GainInit=1         |
+| 4          | Club swing only          | Club Swing Only     | No ball tracking. Untested               |
+| **5**      | **Simulator chipping**   | **Chipping**        | MaxVel=120, Fs=37500.0                   |
+| 6          | Simulator putting        | Sim Putting         | Untested                                 |
+| **8**      | &mdash;                  | **Outdoor**         | Full flight; needs unobstructed flight   |
+| **9**      | **Outdoor, limited**     | **Limited flight**  | MaxVel=120, Fs=37500.0, club trigger off |
+| 13         | Raw sampling             | Environmental       | Untested                                 |
+| 14         | Putting                  | Putting (dedicated) | Untested                                 |
+| 15         | Short-game chip, indoor  | Chipping Indoor     | Untested                                 |
+| 16         | Short-game chip, outdoor | Chipping Outdoor    | Untested                                 |
 
-Bold entries have been observed in pcap captures. Modes 3, 5, and 9 are the
-primary operating modes for indoor and simulator use. Mode 2 (LongIndoor) only
+Bold entries are the modes in use. Modes 3, 5, and 9 are the
+primary operating modes for indoor and simulator use. Mode 2 (long indoor) only
 appears as a transient intermediate step during configuration &mdash; it is set
 and then immediately overwritten by the final target mode before arming.
 
@@ -1026,8 +1029,9 @@ produces the early result (0xE8), but the full result (0xD4) carries a launch
 speed and elevation of 0, and the AVR sends a text such as
 `Distance Model Error: 38 (ERROR_MODEL_TOO_LITTLE_TIME)`.
 
-When FS Golf switches to mode 8 it also writes params 0x0028, 0x0007, 0x0025
-and 0x0001 alongside the 0xA5 mode set.
+On the Mevo+, a switch to mode 8 may also need params 0x0028, 0x0007, 0x0025
+and 0x0001 set for outdoor use; ironsight's mode change sends the 0xA5 mode set
+alone, so its outdoor configuration may be incomplete.
 
 ---
 
@@ -1039,7 +1043,25 @@ Wire values use DSP coordinates:
 
 - **X** = forward (range, toward target)
 - **Y** = vertical (height)
-- **Z** = lateral (left/right)
+- **Z** = lateral, positive = left of the target line
+
+### Sign Convention
+
+Every direction is positive to the left and negative to the right, for both
+hands:
+
+| Field | Message | Positive |
+| ----- | ------- | -------- |
+| lateral (Z) of positions and velocities | D4 | left |
+| `lateral` | E8 | left |
+| launch azimuth | D4, E8 | left |
+| sidespin | D4 | ball curves left (a draw for a right-hander) |
+| strike direction (club path) | D4, ED | left |
+| face angle | D4, ED | left |
+| swing plane horizontal / rotation | ED, D4 | left |
+
+Golf software and the Flight Relay Protocol usually take positive = right;
+negate these fields for them.
 
 ### Units
 
@@ -1064,5 +1086,6 @@ Applied to all Vector3 fields (positions, velocities, spin vectors) and polynomi
 arrays. Several scalar angular fields are also negated: launch azimuth, sidespin,
 club strike direction, swing plane rotation, club face angle, spin axis.
 
-**For display purposes, wire values can be used directly.** The DSP-to-PC
-transform is only relevant for internal trajectory computation.
+The DSP-to-PC transform is only relevant for trajectory computation; for
+display, negate the fields of the sign convention table when the display takes
+positive = right.

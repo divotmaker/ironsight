@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 
 use ironsight::conn::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
-use ironsight::protocol::config::{MODE_CHIPPING, ParamData, ParamValue, RadarCal};
-use ironsight::seq::{self, Action, AvrSettings, AvrSync, DspSync, PiSync, ShotSequencer};
+use ironsight::protocol::config::{MODE_CHIPPING, RadarCal};
+use ironsight::seq::{
+    self, Action, AvrSettings, AvrSync, DspSync, MevoSettings, PiSync, ShotSequencer,
+};
 use ironsight::{BinaryConnection, ConnError, Message, Sequence};
 
 // ---------------------------------------------------------------------------
@@ -43,61 +45,21 @@ fn m_to_in(m: f64) -> f64 {
 // ---------------------------------------------------------------------------
 
 fn default_avr_settings() -> AvrSettings {
-    AvrSettings {
-        mode: MODE_CHIPPING,
-        params: vec![
-            // Ball type: 1 = RCT
-            ParamValue {
-                param_id: 0x06,
-                value: ParamData::Int24(1),
-            },
-            // Outdoor minimum track %: 1.0
-            ParamValue {
-                param_id: 0x0F,
-                value: ParamData::Float40(1.0),
-            },
-            // Driver tee height: 1.5 inches = 0.0381m
-            ParamValue {
-                param_id: 0x26,
-                value: ParamData::Float40(0.0381),
-            },
-        ],
-        radar_cal: Some(RadarCal {
+    MevoSettings::new(
+        MODE_CHIPPING,
+        1,      // RCT
+        1.0,    // minimum outdoor track 100 %
+        0.0381, // tee height 1.5 inches
+        RadarCal {
             range_mm: 2743, // 9 feet
             height_mm: 25,  // floor(1.0 inches * 25.4) = 25
-        }),
-    }
+        },
+    )
+    .into()
 }
 
 fn default_cam_config() -> CamConfig {
-    CamConfig {
-        dynamic_config: true,
-        resolution_width: 1024,
-        resolution_height: 768,
-        rotation: 0,
-        ev: 0,
-        quality: 80,
-        framerate: 20,
-        streaming_framerate: 1,
-        ringbuffer_pretime_ms: 1000,
-        ringbuffer_posttime_ms: 4000,
-        raw_camera_mode: 0,
-        fusion_camera_mode: false,
-        raw_shutter_speed_max: 0.0,
-        raw_ev_roi_x: -1,
-        raw_ev_roi_y: -1,
-        raw_ev_roi_width: -1,
-        raw_ev_roi_height: -1,
-        raw_x_offset: -1,
-        raw_bin44: false,
-        raw_live_preview_write_interval_ms: -1,
-        raw_y_offset: -1,
-        buffer_sub_sampling_pre_trigger_div: -1,
-        buffer_sub_sampling_post_trigger_div: -1,
-        buffer_sub_sampling_switch_time_offset: -1.0,
-        buffer_sub_sampling_total_buffer_size: -1,
-        buffer_sub_sampling_pre_trigger_buffer_size: -1,
-    }
+    CamConfig::warmup_preset()
 }
 
 // ---------------------------------------------------------------------------

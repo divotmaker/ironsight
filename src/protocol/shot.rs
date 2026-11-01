@@ -1,4 +1,24 @@
 //! Shot result messages (AVR → APP).
+//!
+//! # Sign convention
+//!
+//! Directions are reported as the device measures them, positive to the
+//! left of the target line (seen from behind the ball) and negative to the
+//! right, for both hands:
+//!
+//! - lateral positions and velocities (the third element of
+//!   `[forward, vertical, lateral]`, [`FlightResultV1::lateral`]);
+//! - launch azimuth ([`FlightResult::launch_azimuth`],
+//!   [`FlightResultV1::azimuth`]);
+//! - sidespin ([`FlightResult::sidespin_rpm`]): positive curves the ball
+//!   left (a draw for a right-hander), negative curves it right;
+//! - club path, face angle and swing plane direction
+//!   ([`ClubResult::strike_direction`], [`ClubResult::face_angle`],
+//!   [`ClubResult::swing_plane_horizontal`], and the club fields of
+//!   [`FlightResult`]).
+//!
+//! The usual convention in golf software (and in the Flight Relay Protocol)
+//! is positive to the right, so negate these when converting.
 
 use crate::codec;
 use crate::error::{Result, WireError};
@@ -18,11 +38,12 @@ pub struct FlightResult {
     pub total: i32,
     /// Tracked time (s)
     pub track_time: f64,
-    /// Start position [forward, vertical, lateral] (m)
+    /// Start position [forward, vertical, lateral] (m, lateral positive =
+    /// left)
     pub start_position: [f64; 3],
     /// Launch speed (m/s)
     pub launch_speed: f64,
-    /// Launch azimuth (deg, neg = right)
+    /// Launch azimuth (deg, positive = left, negative = right)
     pub launch_azimuth: f64,
     /// Launch elevation / VLA (deg)
     pub launch_elevation: f64,
@@ -32,17 +53,19 @@ pub struct FlightResult {
     pub flight_time: f64,
     /// Maximum height (m)
     pub max_height: f64,
-    /// Landing position [forward, vertical, lateral] (m)
+    /// Landing position [forward, vertical, lateral] (m, lateral positive =
+    /// left)
     pub landing_position: [f64; 3],
     /// Backspin (RPM)
     pub backspin_rpm: i32,
-    /// Sidespin (RPM)
+    /// Sidespin (RPM, positive = curves left, negative = curves right)
     pub sidespin_rpm: i32,
     /// Riflespin (RPM)
     pub riflespin_rpm: i32,
     /// Landing spin [0, 1, 2] (RPM)
     pub landing_spin_rpm: [i32; 3],
-    /// Landing velocity [forward, vertical, lateral] (m/s)
+    /// Landing velocity [forward, vertical, lateral] (m/s, lateral positive
+    /// = left)
     pub landing_velocity: [f64; 3],
     /// Total distance (m) — not populated by DSP; contains diagnostic values.
     pub total_distance: f64,
@@ -52,7 +75,7 @@ pub struct FlightResult {
     pub final_position: [f64; 3],
     /// Club head speed (m/s)
     pub clubhead_speed: f64,
-    /// Club strike direction (deg)
+    /// Club strike direction / path (deg, positive = left)
     pub club_strike_direction: f64,
     /// Club attack angle (deg)
     pub club_attack_angle: f64,
@@ -60,11 +83,11 @@ pub struct FlightResult {
     pub clubhead_speed_post: f64,
     /// Club swing plane tilt (deg)
     pub club_swing_plane_tilt: f64,
-    /// Club swing plane rotation (deg)
+    /// Club swing plane rotation (deg, positive = left)
     pub club_swing_plane_rotation: f64,
     /// Club effective loft (deg)
     pub club_effective_loft: f64,
-    /// Club face angle (deg)
+    /// Club face angle (deg, positive = left)
     pub club_face_angle: f64,
     /// Polynomial scale factor (raw integer, divide poly coefficients by this)
     pub poly_scale: i32,
@@ -77,6 +100,16 @@ pub struct FlightResult {
 }
 
 impl FlightResult {
+    /// Whether this is the device's "distance model failed" result: launch
+    /// speed 0 (or not a number). In full-flight outdoor mode
+    /// ([`MODE_FULL_OUTDOOR`](crate::protocol::config::MODE_FULL_OUTDOOR))
+    /// a shot into a net or screen produces it; the 0xE8 sent before it is
+    /// still valid.
+    #[must_use]
+    pub fn is_model_failure(&self) -> bool {
+        self.launch_speed.is_nan() || self.launch_speed <= 0.0
+    }
+
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 157 {
             return Err(WireError::payload_too_short(
@@ -177,11 +210,11 @@ pub struct FlightResultV1 {
     pub distance: f64,
     /// Height (m)
     pub height: f64,
-    /// Lateral (m)
+    /// Lateral landing distance (m, positive = left)
     pub lateral: f64,
     /// Elevation / VLA (deg)
     pub elevation: f64,
-    /// Azimuth / HLA (deg)
+    /// Azimuth / HLA (deg, positive = left)
     pub azimuth: f64,
     /// Tracked time (s)
     pub tracked_time: f64,
@@ -206,6 +239,14 @@ pub struct FlightResultV1 {
 }
 
 impl FlightResultV1 {
+    /// Whether this is a "no read": ball velocity 0 (or not a number). The
+    /// device sends it when it triggered but tracked no ball; its other
+    /// fields are zero too.
+    #[must_use]
+    pub fn is_no_read(&self) -> bool {
+        self.ball_velocity.is_nan() || self.ball_velocity <= 0.0
+    }
+
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() < 94 {
             return Err(WireError::payload_too_short(
@@ -271,11 +312,11 @@ pub struct ClubResult {
     pub pre_club_speed: f64,
     /// Post-impact club speed (m/s)
     pub post_club_speed: f64,
-    /// Strike direction / path angle (deg)
+    /// Strike direction / path angle (deg, positive = left)
     pub strike_direction: f64,
     /// Attack angle (deg)
     pub attack_angle: f64,
-    /// Face angle (deg)
+    /// Face angle (deg, positive = left)
     pub face_angle: f64,
     /// Dynamic loft (deg)
     pub dynamic_loft: f64,
@@ -283,7 +324,7 @@ pub struct ClubResult {
     pub smash_factor: f64,
     /// Dispersion correction
     pub dispersion_correction: f64,
-    /// Swing plane horizontal (deg)
+    /// Swing plane horizontal direction (deg, positive = left)
     pub swing_plane_horizontal: f64,
     /// Swing plane vertical (deg)
     pub swing_plane_vertical: f64,
