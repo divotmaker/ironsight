@@ -255,6 +255,11 @@ standard [FlightRelay](https://github.com/flightrelay/spec) device. Any FRP
 controller (flighthook, dashboards, etc.) can connect over WebSocket and receive
 shot data without knowing anything about the Mevo+ binary protocol.
 
+`FrpDevice::check_controller()` returns the controller's `set_detection_mode`
+request as a `ControllerCommand` (`mode`, `handed`, `club`, each `None` when
+absent or unrecognized). The Mevo+ and Gen2 apply the detection mode via
+`frp::detection_mode_to_avr`; the radar has no club or handedness setting.
+
 A standalone binary is included:
 
 ```sh

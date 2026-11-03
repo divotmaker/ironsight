@@ -55,6 +55,33 @@ pub fn detection_mode_to_avr(mode: DetectionMode) -> u8 {
     }
 }
 
+/// What a controller's `set_detection_mode` asked for. Each field is `None` when the
+/// controller didn't send it (or sent a value this SDK doesn't know).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ControllerCommand {
+    /// The requested detection mode.
+    pub mode: Option<flightrelay::DetectionMode>,
+    /// The player's handedness.
+    pub handed: Option<flightrelay::Handedness>,
+    /// The club in play.
+    pub club: Option<flightrelay::Club>,
+}
+
+/// The [`ControllerCommand`] a message carries, if it is a `set_detection_mode`.
+fn controller_command(msg: &FrpMessage) -> Option<ControllerCommand> {
+    match msg {
+        FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode, handed, club }) => {
+            Some(ControllerCommand {
+                mode: *mode,
+                handed: *handed,
+                club: *club,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// An FRP device backed by an ironsight connection.
 ///
 /// Converts [`BinaryEvent`]s into FRP envelopes and streams them to the
@@ -192,18 +219,19 @@ impl FrpDevice {
 
     /// Poll for incoming controller commands (non-blocking).
     ///
-    /// Returns a [`DetectionMode`] if the controller sent `set_detection_mode`.
-    pub fn check_controller(&mut self) -> Option<DetectionMode> {
+    /// Returns a [`ControllerCommand`] if the controller sent `set_detection_mode`;
+    /// other messages yield `None`. The Mevo+/Gen2 apply `mode` through
+    /// [`detection_mode_to_avr`]; the radar has no club or handedness setting, so
+    /// `club` and `handed` are informational.
+    pub fn check_controller(&mut self) -> Option<ControllerCommand> {
         let conn = self.conn.as_mut()?;
         match conn.try_recv() {
-            Ok(Some(FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
-                mode, ..
-            }))) => mode,
+            Ok(Some(msg)) => controller_command(&msg),
             Err(_) => {
                 self.drop_connection();
                 None
             }
-            _ => None,
+            Ok(None) => None,
         }
     }
 
@@ -414,4 +442,66 @@ fn uuid_v4() -> String {
         bytes[14],
         bytes[15],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(json: &str) -> Option<ControllerCommand> {
+        controller_command(&FrpMessage::parse(json).unwrap())
+    }
+
+    #[test]
+    fn mode_handed_and_club_are_all_reported() {
+        let cmd =
+            command(r#"{"kind":"set_detection_mode","mode":"full","handed":"lh","club":"7I"}"#);
+        assert_eq!(
+            cmd,
+            Some(ControllerCommand {
+                mode: Some(flightrelay::DetectionMode::Full),
+                handed: Some(flightrelay::Handedness::Left),
+                club: Some(flightrelay::Club::Iron7),
+            })
+        );
+    }
+
+    #[test]
+    fn club_only() {
+        let cmd = command(r#"{"kind":"set_detection_mode","club":"PT"}"#);
+        assert_eq!(
+            cmd,
+            Some(ControllerCommand {
+                club: Some(flightrelay::Club::Putter),
+                ..ControllerCommand::default()
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_club_is_none_and_the_rest_applies() {
+        let cmd =
+            command(r#"{"kind":"set_detection_mode","mode":"putting","handed":"rh","club":"ZZ"}"#);
+        assert_eq!(
+            cmd,
+            Some(ControllerCommand {
+                mode: Some(flightrelay::DetectionMode::Putting),
+                handed: Some(flightrelay::Handedness::Right),
+                club: None,
+            })
+        );
+    }
+
+    #[test]
+    fn empty_set_detection_mode_is_still_a_command() {
+        assert_eq!(
+            command(r#"{"kind":"set_detection_mode"}"#),
+            Some(ControllerCommand::default())
+        );
+    }
+
+    #[test]
+    fn other_messages_are_not_commands() {
+        assert_eq!(command(r#"{"kind":"shot_trigger","shot_number":1}"#), None);
+    }
 }

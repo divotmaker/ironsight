@@ -142,21 +142,28 @@ fn main() -> ExitCode {
                 }
 
                 // Check for controller commands
-                if let Some(mode) = frp.check_controller() {
-                    if client.model() == DeviceModel::Xi {
-                        eprintln!(
-                            "ironsight-frp: detection mode → {mode} ignored (Xi stays in limited-flight mode)"
-                        );
-                    } else {
-                        eprintln!("ironsight-frp: detection mode → {mode}");
-                        let avr_mode = ironsight::frp::detection_mode_to_avr(mode);
-                        client.configure_avr(AvrSettings {
-                            mode: avr_mode,
-                            params: vec![],
-                            radar_cal: None,
-                        });
-                        client.arm();
-                        armed = false;
+                if let Some(cmd) = frp.check_controller() {
+                    eprintln!(
+                        "ironsight-frp: controller command: mode {:?}, hand {:?}, club {:?}",
+                        cmd.mode, cmd.handed, cmd.club
+                    );
+                    // The radar has no club or handedness setting; only the mode applies.
+                    if let Some(mode) = cmd.mode {
+                        if client.model() == DeviceModel::Xi {
+                            eprintln!(
+                                "ironsight-frp: detection mode → {mode} ignored (Xi stays in limited-flight mode)"
+                            );
+                        } else {
+                            eprintln!("ironsight-frp: detection mode → {mode}");
+                            let avr_mode = ironsight::frp::detection_mode_to_avr(mode);
+                            client.configure_avr(AvrSettings {
+                                mode: avr_mode,
+                                params: vec![],
+                                radar_cal: None,
+                            });
+                            client.arm();
+                            armed = false;
+                        }
                     }
                 }
 
