@@ -310,25 +310,27 @@ impl NetConfigReq {
 /// The password query (sub 0x08) returns both SSID and password.
 #[derive(Debug, Clone)]
 pub struct NetConfigResp {
+    /// The SSID slot, then a NUL and the password slot when the password is
+    /// not empty: `"ssid\0password"`, `"ssid"`, `"\0password"` or `""`.
+    /// The SSID is always the text before the first NUL.
     pub text: String,
 }
 
 impl NetConfigResp {
     pub fn decode(payload: &[u8]) -> Result<Self> {
-        // Extract the first non-empty text slot (SSID at 21, password at 37).
-        // Callers distinguish SSID vs password by which sub-query was sent.
-        let mut parts = Vec::new();
-        for offset in [21, 37] {
-            if offset + 16 <= payload.len() {
-                let s = decode_cstr(&payload[offset..offset + 16]);
-                if !s.is_empty() {
-                    parts.push(s);
-                }
-            }
-        }
-        Ok(Self {
-            text: parts.join("\0"),
-        })
+        let slot = |offset: usize| {
+            payload
+                .get(offset..offset + 16)
+                .map(decode_cstr)
+                .unwrap_or_default()
+        };
+        let (ssid, password) = (slot(21), slot(37));
+        let text = if password.is_empty() {
+            ssid
+        } else {
+            format!("{ssid}\0{password}")
+        };
+        Ok(Self { text })
     }
 }
 
@@ -451,6 +453,27 @@ impl TimeSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn net_config(ssid: &str, password: &str) -> Vec<u8> {
+        let mut p = vec![0u8; 54];
+        p[21..21 + ssid.len()].copy_from_slice(ssid.as_bytes());
+        p[37..37 + password.len()].copy_from_slice(password.as_bytes());
+        p
+    }
+
+    #[test]
+    fn net_config_keeps_the_ssid_before_the_first_nul() {
+        for (ssid, password, text) in [
+            ("FS M2-TEST01", "M2-TEST01", "FS M2-TEST01\0M2-TEST01"),
+            ("FS M2-TEST01", "", "FS M2-TEST01"),
+            ("", "M2-TEST01", "\0M2-TEST01"),
+            ("", "", ""),
+        ] {
+            let r = NetConfigResp::decode(&net_config(ssid, password)).unwrap();
+            assert_eq!(r.text, text);
+            assert_eq!(r.text.split('\0').next(), Some(ssid));
+        }
+    }
 
     fn dev_info_text(text: &str) -> DevInfoResp {
         DevInfoResp {

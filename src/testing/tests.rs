@@ -1,8 +1,7 @@
 //! `FakeDevice` and `Shot` driven through `BinaryConnection` and
 //! `BinaryClient`, pinning the frames ironsight sends.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -21,17 +20,19 @@ fn hex(b: &[u8]) -> String {
 type Seen = (&'static str, BusAddr, BusAddr, u8, String);
 
 /// Record every frame sent and received on `conn`, in order.
-fn record(conn: &mut BinaryConnection<FakeDevice>) -> Rc<RefCell<Vec<Seen>>> {
-    let seen: Rc<RefCell<Vec<Seen>>> = Rc::default();
-    let tx = Rc::clone(&seen);
+fn record(conn: &mut BinaryConnection<FakeDevice>) -> Arc<Mutex<Vec<Seen>>> {
+    let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+    let tx = Arc::clone(&seen);
     conn.set_on_send(move |cmd, dest| {
         let f = cmd.encode(dest);
-        tx.borrow_mut()
+        tx.lock()
+            .unwrap()
             .push(("tx", f.src, dest, f.type_id, hex(&f.payload)));
     });
-    let rx = Rc::clone(&seen);
+    let rx = Arc::clone(&seen);
     conn.set_on_recv(move |env| {
-        rx.borrow_mut()
+        rx.lock()
+            .unwrap()
             .push(("rx", env.src, BusAddr::App, env.type_id, hex(&env.raw)));
     });
     seen
@@ -151,7 +152,7 @@ fn shot_sequence_through_the_client() {
     let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::ShotComplete(_)));
     assert!(events.iter().any(|e| matches!(e, BinaryEvent::Trigger)));
 
-    let got: Vec<(&str, u8)> = seen.borrow().iter().map(|s| (s.0, s.3)).collect();
+    let got: Vec<(&str, u8)> = seen.lock().unwrap().iter().map(|s| (s.0, s.3)).collect();
     assert_eq!(
         got,
         [
@@ -176,7 +177,8 @@ fn shot_sequence_through_the_client() {
         ]
     );
     let tx: Vec<(BusAddr, BusAddr, u8, String)> = seen
-        .borrow()
+        .lock()
+        .unwrap()
         .iter()
         .filter(|s| s.0 == "tx")
         .map(|s| (s.1, s.2, s.3, s.4.clone()))
@@ -191,7 +193,7 @@ fn shot_sequence_through_the_client() {
             (App, Avr, 0xB0, "0101".into()),
         ]
     );
-    let replies: Vec<(u8, String)> = seen.borrow()[16..]
+    let replies: Vec<(u8, String)> = seen.lock().unwrap()[16..]
         .iter()
         .map(|s| (s.3, s.4.clone()))
         .collect();

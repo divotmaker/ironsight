@@ -1,11 +1,13 @@
 pub mod addr;
 pub mod client;
 pub mod codec;
+#[cfg(feature = "config")]
+pub mod config;
 pub mod conn;
+#[cfg(feature = "driver")]
+pub mod driver;
 pub mod error;
 pub mod frame;
-#[cfg(feature = "frp")]
-pub mod frp;
 #[cfg(feature = "gvp")]
 pub mod gvp;
 pub mod protocol;

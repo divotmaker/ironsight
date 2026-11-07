@@ -86,6 +86,21 @@ impl std::error::Error for ConnError {
     }
 }
 
+impl ConnError {
+    /// The error as text without any payload bytes, for an alert or a log
+    /// line that may be shared (see [`WireError::describe`]). A protocol
+    /// error's text can quote the frame it did not expect, so it is
+    /// described by its kind alone.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            ConnError::Wire(e) => format!("wire error: {}", e.describe()),
+            ConnError::Protocol(_) => "protocol error: unexpected message in a sequence".into(),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl From<io::Error> for ConnError {
     fn from(e: io::Error) -> Self {
         ConnError::Io(e)
@@ -129,10 +144,10 @@ pub struct BinaryConnection<S: Read + Write> {
     pending: Vec<Vec<u8>>,
     /// Called at the top of `send()` with the command and destination.
     #[allow(clippy::type_complexity)]
-    on_send: Option<Box<dyn FnMut(&Command, BusAddr)>>,
+    on_send: Option<Box<dyn FnMut(&Command, BusAddr) + Send>>,
     /// Called after each successful frame decode in `recv()`.
     #[allow(clippy::type_complexity)]
-    on_recv: Option<Box<dyn FnMut(&Envelope)>>,
+    on_recv: Option<Box<dyn FnMut(&Envelope) + Send>>,
 }
 
 // -- Generic methods (any Read + Write stream) --------------------------------
@@ -161,12 +176,12 @@ impl<S: Read + Write> BinaryConnection<S> {
     }
 
     /// Register a callback invoked at the top of every [`send()`](Self::send) call.
-    pub fn set_on_send(&mut self, f: impl FnMut(&Command, BusAddr) + 'static) {
+    pub fn set_on_send(&mut self, f: impl FnMut(&Command, BusAddr) + Send + 'static) {
         self.on_send = Some(Box::new(f));
     }
 
     /// Register a callback invoked after every successful frame decode.
-    pub fn set_on_recv(&mut self, f: impl FnMut(&Envelope) + 'static) {
+    pub fn set_on_recv(&mut self, f: impl FnMut(&Envelope) + Send + 'static) {
         self.on_recv = Some(Box::new(f));
     }
 

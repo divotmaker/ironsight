@@ -98,6 +98,14 @@ impl DspStatus {
         }
     }
 
+    /// Whether the battery, power and temperature fields are decoded (the
+    /// Mevo+ layout). When `false` their accessors return defaults, not
+    /// readings.
+    #[must_use]
+    pub fn is_decoded(&self) -> bool {
+        matches!(self, DspStatus::V80(_))
+    }
+
     /// Battery percentage (0-100). Returns 0 for Gen2 (field offsets TBD).
     pub fn battery_percent(&self) -> u8 {
         match self {

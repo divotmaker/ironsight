@@ -14,7 +14,13 @@ exclude = ["docs/"]
 [features]
 serde = ["dep:serde"]
 gvp = ["dep:serde", "dep:serde_json"]
-frp = ["dep:flightrelay"]
+# The driver's settings (`ironsight::config`): serde types only, no device
+# stack, for settings forms and WebAssembly UIs.
+config = ["dep:flightrelay", "flightrelay/config", "dep:serde"]
+# The `DeviceDriver` for FlightScope devices (`ironsight::driver`).
+driver = ["config", "flightrelay/driver"]
+# The `ironsight-frp` binary: the driver served over FRP.
+frp = ["driver", "flightrelay/server", "flightrelay/main"]
 # Test support: `ironsight::testing` (a scripted in-memory device, result
 # frames recorded from an Xi, payload encoders). Off by default.
 testing = []
@@ -23,7 +29,10 @@ testing = []
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-flightrelay = { version = "0.4", features = ["transport"], optional = true }
+flightrelay = { version = "0.5", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
 
 [[bin]]
 name = "ironsight-frp"

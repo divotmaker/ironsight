@@ -30,12 +30,12 @@ pub struct GvpConnection<S: Read + Write> {
     pending: Vec<String>,
     /// Called at the top of `send()` with the command.
     #[allow(clippy::type_complexity)]
-    on_send: Option<Box<dyn FnMut(&GvpCommand)>>,
+    on_send: Option<Box<dyn FnMut(&GvpCommand) + Send>>,
     /// Called after each successful message decode in `recv()`.
     /// Receives the raw JSON string (hex-first: for JSON protocol, raw JSON
     /// IS the canonical form).
     #[allow(clippy::type_complexity)]
-    on_recv: Option<Box<dyn FnMut(&str, &GvpMessage)>>,
+    on_recv: Option<Box<dyn FnMut(&str, &GvpMessage) + Send>>,
 }
 
 // -- Generic methods (any Read + Write stream) --------------------------------
@@ -64,7 +64,7 @@ impl<S: Read + Write> GvpConnection<S> {
     }
 
     /// Register a callback invoked at the top of every [`send()`](Self::send) call.
-    pub fn set_on_send(&mut self, f: impl FnMut(&GvpCommand) + 'static) {
+    pub fn set_on_send(&mut self, f: impl FnMut(&GvpCommand) + Send + 'static) {
         self.on_send = Some(Box::new(f));
     }
 
@@ -73,7 +73,7 @@ impl<S: Read + Write> GvpConnection<S> {
     /// The callback receives the raw JSON string and the decoded message.
     /// Per the hex-first logging policy: for JSON protocol, the raw JSON
     /// string IS the canonical representation.
-    pub fn set_on_recv(&mut self, f: impl FnMut(&str, &GvpMessage) + 'static) {
+    pub fn set_on_recv(&mut self, f: impl FnMut(&str, &GvpMessage) + Send + 'static) {
         self.on_recv = Some(Box::new(f));
     }
 

@@ -14,11 +14,15 @@
 //! - each shot result request (0x6D) with the club result (0xED) of the
 //!   oldest shot whose request is still unanswered;
 //! - with [`FakeDevice::xi`], also the Xi's handshake and configuration,
-//!   with made-up identity frames.
+//!   with made-up identity frames;
+//! - with [`FakeDevice::mevo_plus`] and [`FakeDevice::mevo_gen2`], also the
+//!   Mevo handshake (DSP, AVR and camera Pi), the AVR configuration and the
+//!   camera configuration, with made-up identity frames.
 //!
 //! [`FakeDevice::new`] answers nothing else of the handshake, so
 //! [`BinaryClient::handshake`](crate::BinaryClient::handshake) completes on
-//! [`FakeDevice::xi`] only.
+//! [`FakeDevice::xi`], [`FakeDevice::mevo_plus`] and
+//! [`FakeDevice::mevo_gen2`] only.
 //!
 //! ```
 //! use ironsight::testing::{FakeDevice, Shot};
@@ -36,6 +40,8 @@
 //! };
 //! assert!(completed.flight.is_some());
 //! ```
+// "FlightScope" and "WiFi" in the docs are names, not code.
+#![allow(clippy::doc_markdown)]
 
 pub mod fixtures;
 
@@ -73,6 +79,14 @@ struct State {
     club_replies: VecDeque<Vec<u8>>,
     /// Answer the Xi's handshake and configuration.
     xi: bool,
+    /// Answer a Mevo's handshake and configuration, as this generation.
+    mevo: Option<MevoGen>,
+    /// The camera Pi's WiFi name, for a Mevo.
+    ssid: String,
+    /// The DSP status a Mevo answers polls with, when set.
+    dsp_status: Option<Vec<u8>>,
+    /// The camera config the Pi reports, as last written.
+    cam_config: Vec<u8>,
     /// Armed by B0 `[01 01]`, disarmed by B0 `[01 00]`.
     armed: bool,
     /// DSP power mode (DSP param 0x01); 0 until written.
@@ -98,6 +112,50 @@ impl FakeDevice {
         let device = Self::default();
         device.0.borrow_mut().xi = true;
         device
+    }
+
+    /// A Mevo+ that also answers the Mevo handshake and configuration: DSP,
+    /// AVR and camera Pi device info, product info, configuration queries,
+    /// calibration, parameter reads and writes, mode and radar calibration
+    /// echoes, the time sync, the camera config, and the Pi's WiFi name
+    /// `FS M2-TEST01`. Its DSP status (version 0x80) reports a battery at
+    /// 87 %, 31.0 °C and no external power. Every identity value is made up.
+    #[must_use]
+    pub fn mevo_plus() -> Self {
+        Self::mevo(MevoGen::Plus, "FS M2-TEST01")
+    }
+
+    /// A Mevo Gen2, answering as [`mevo_plus`](Self::mevo_plus) does, with a
+    /// Gen2 DSP status (version 0x46, no decoded battery, temperature or
+    /// power) and the WiFi name `FS MG2-TEST01`.
+    #[must_use]
+    pub fn mevo_gen2() -> Self {
+        Self::mevo(MevoGen::Gen2, "FS MG2-TEST01")
+    }
+
+    fn mevo(gen_: MevoGen, ssid: &str) -> Self {
+        let device = Self::default();
+        {
+            let mut st = device.0.borrow_mut();
+            st.mevo = Some(gen_);
+            ssid.clone_into(&mut st.ssid);
+            st.cam_config = crate::protocol::camera::CamConfig::standard_preset().encode();
+        }
+        device
+    }
+
+    /// This device with the camera Pi's WiFi name set to `ssid` (empty for
+    /// a Pi that reports none).
+    #[must_use]
+    pub fn with_ssid(self, ssid: &str) -> Self {
+        ssid.clone_into(&mut self.0.borrow_mut().ssid);
+        self
+    }
+
+    /// Answer later DSP status polls of a Mevo with `payload` (see
+    /// [`mevo_plus_dsp_status`]).
+    pub fn set_dsp_status(&self, payload: impl Into<Vec<u8>>) {
+        self.0.borrow_mut().dsp_status = Some(payload.into());
     }
 
     /// A connection over a clone of this device.
@@ -153,8 +211,14 @@ impl State {
             (BusAddr::Dsp, 0xAA) => {
                 let status = if self.xi {
                     xi_dsp_status()
+                } else if let Some(status) = &self.dsp_status {
+                    status.clone()
                 } else {
-                    mevo_dsp_status()
+                    match self.mevo {
+                        Some(MevoGen::Plus) => mevo_plus_dsp_status(87, 31.0, false),
+                        Some(MevoGen::Gen2) => gen2_dsp_status(),
+                        None => mevo_dsp_status(),
+                    }
                 };
                 self.push(BusAddr::Dsp, 0xAA, status);
             }
@@ -183,6 +247,89 @@ impl State {
                 }
             }
             _ if self.xi => self.respond_xi(f),
+            _ if self.mevo.is_some() => self.respond_mevo(f),
+            _ => {}
+        }
+    }
+
+    /// A Mevo's answers to its handshake and configuration.
+    fn respond_mevo(&mut self, f: &RawFrame) {
+        let p = f.payload.as_slice();
+        let gen2 = self.mevo == Some(MevoGen::Gen2);
+        match (f.dest, f.type_id) {
+            (BusAddr::Dsp, 0x48) => {
+                let dsp_type = if gen2 { 0xC0 } else { 0x80 };
+                self.push(BusAddr::Dsp, 0xC8, vec![0x02, dsp_type, 0x0E]);
+            }
+            (BusAddr::Dsp, 0x67) => {
+                let mut info = vec![0u8; 76];
+                info[0] = 0x4B;
+                for (i, text) in ["1.00", "TEST-SERIAL-01", "FAKE"].iter().enumerate() {
+                    let start = 28 + i * 16;
+                    info[start..start + text.len()].copy_from_slice(text.as_bytes());
+                }
+                self.push(BusAddr::Dsp, 0xE7, info);
+            }
+            (BusAddr::Dsp, 0xFD) => {
+                let mut r = vec![0u8; 34];
+                r[0] = 0x21;
+                r[1] = p.get(1).copied().unwrap_or(0);
+                self.push(BusAddr::Dsp, 0xFD, r);
+            }
+            (dest @ (BusAddr::Dsp | BusAddr::Avr), 0x21) => {
+                let mut r = vec![0u8; 69];
+                r[0] = 0x44;
+                self.push(dest, 0xA0, r);
+            }
+            (BusAddr::Avr, 0x67) => {
+                let version = if gen2 {
+                    "4.56    FSCOPE"
+                } else {
+                    "1.23    FSCOPE"
+                };
+                let info = dev_info([version, "Feb  3 2024", "12:00:00"]);
+                self.push(BusAddr::Avr, 0xE7, info);
+            }
+            (dest @ (BusAddr::Avr | BusAddr::Pi), 0xBE) => {
+                let id = p.get(3).copied().unwrap_or(0);
+                self.push(dest, 0xBF, vec![0x06, 0x00, 0x00, id, 0, 0, 0]);
+            }
+            (dest @ (BusAddr::Avr | BusAddr::Pi), 0xBF) => {
+                self.push(dest, 0x95, vec![0x02, dest as u8, 0x3F]);
+            }
+            (BusAddr::Avr, 0xD2) => self.push(BusAddr::Avr, 0xD3, vec![0u8; 16]),
+            (BusAddr::Avr, 0xD0) => self.push(BusAddr::Avr, 0xD1, vec![0u8; 171]),
+            (BusAddr::Avr, 0x23) => {
+                let mut r = vec![0u8; 17];
+                r[0] = 0x10;
+                r[1] = if gen2 { 2 } else { 1 };
+                self.push(BusAddr::Avr, 0xA2, r);
+            }
+            (BusAddr::Avr, 0x9B) => self.push(BusAddr::Avr, 0x9B, p.to_vec()),
+            (BusAddr::Avr, 0xA5 | 0xA4) => self.push(BusAddr::Avr, f.type_id, p.to_vec()),
+            (BusAddr::Pi, 0x67) => {
+                let info = dev_info(["2.00", "Jan  1 2021", "12:00:00"]);
+                self.push(BusAddr::Pi, 0xE7, info);
+            }
+            (BusAddr::Pi, 0x83) => {
+                let config = self.cam_config.clone();
+                self.push(BusAddr::Pi, 0x82, config);
+            }
+            (BusAddr::Pi, 0x82) => {
+                self.cam_config = p.to_vec();
+                self.push(BusAddr::Pi, 0x95, vec![0x02, 0x12, 0x02]);
+            }
+            (BusAddr::Pi, 0x81) => self.push(BusAddr::Pi, 0x95, vec![0x02, 0x12, 0x01]),
+            (BusAddr::Pi, 0xDE) => {
+                let mut r = vec![0u8; 54];
+                r[0] = 0x35;
+                if p.get(1) == Some(&0x08) {
+                    let ssid = &self.ssid.as_bytes()[..self.ssid.len().min(15)];
+                    r[21..21 + ssid.len()].copy_from_slice(ssid);
+                    r[37..37 + 9].copy_from_slice(b"TEST-PASS");
+                }
+                self.push(BusAddr::Pi, 0xDE, r);
+            }
             _ => {}
         }
     }
@@ -404,6 +551,27 @@ pub fn dev_info(slots: [&str; 3]) -> Vec<u8> {
     p
 }
 
+/// Payload of a Mevo+ DSP status (0xAA, 129 bytes, version 0x80, idle)
+/// reporting `battery_pct`, `temp_c` and whether external power is
+/// connected; every other byte 0.
+#[must_use]
+pub fn mevo_plus_dsp_status(battery_pct: u8, temp_c: f64, external_power: bool) -> Vec<u8> {
+    let mut p = mevo_dsp_status();
+    #[allow(clippy::cast_possible_truncation)] // a test temperature fits
+    let temp = (temp_c * 100.0).round() as i16;
+    p[40..42].copy_from_slice(&temp.to_be_bytes());
+    p[61] = battery_pct;
+    p[63] = u8::from(external_power);
+    p
+}
+
+/// A Mevo generation the fake answers as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MevoGen {
+    Plus,
+    Gen2,
+}
+
 /// Made-up serial number in the Xi's identity frames.
 const FAKE_SERIAL: [u8; 4] = [0x01, 0x23, 0x45, 0x67];
 
@@ -411,6 +579,13 @@ const FAKE_SERIAL: [u8; 4] = [0x01, 0x23, 0x45, 0x67];
 fn mevo_dsp_status() -> Vec<u8> {
     let mut p = vec![0u8; 129];
     p[0] = 0x80;
+    p
+}
+
+/// Mevo Gen2 DSP status (71 bytes, version byte 0x46, idle).
+fn gen2_dsp_status() -> Vec<u8> {
+    let mut p = vec![0u8; 71];
+    p[0] = 0x46;
     p
 }
 

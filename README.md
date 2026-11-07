@@ -18,10 +18,11 @@ non-blocking clients share the same `poll()` pattern:
   handshake, configuration, arming, keepalives, and shot detection.
 - **`GvpClient`** — GVP camera protocol (TCP port 1258, `gvp` feature). Handles
   trigger, trajectory hints, and ball tracker results.
-- **`FrpDevice`** — [Flight Relay Protocol](https://github.com/flightrelay/spec)
-  device (`frp` feature). Bridges `BinaryClient` shot data to an FRP controller
-  over WebSocket, either serving controllers on a local port (default 5880) or
-  dialing a central controller such as flighthook.
+- **`driver::Mevo`** — a device driver for the
+  [Flight Relay Protocol](https://github.com/flightrelay/spec) SDK's driver
+  contract (`driver` feature): connect, configure, arm, reconnect and report
+  shots as FRP events. The `ironsight-frp` binary (`frp` feature) serves it to
+  FRP controllers over WebSocket.
 
 Both clients are generic over any `Read + Write` stream. Blocking convenience
 wrappers and low-level sequencer state machines are also available. No async
@@ -187,8 +188,8 @@ Shot results report directions as the device measures them: azimuth, lateral
 distances, sidespin, club path, face angle and swing plane direction are
 positive to the **left** of the target line and negative to the right. Positive
 sidespin curves the ball left. The usual convention in golf software (and in
-FRP) is positive to the right, so negate these when converting; the `frp`
-feature does. See the `protocol::shot` docs.
+FRP) is positive to the right, so negate these when converting; the driver's
+conversions (`driver::convert`) do. See the `protocol::shot` docs.
 
 ## Protocol Documentation
 
@@ -248,26 +249,101 @@ exposes the underlying pollable state machines. Each sequencer has `feed()`
 function runs any sequencer to completion on a blocking stream. See
 [`examples/event_loop.rs`](examples/event_loop.rs).
 
-### FRP device server
+### Device driver and FRP binary
 
-The `frp` feature adds an FRP device server that makes the Mevo+ appear as a
-standard [FlightRelay](https://github.com/flightrelay/spec) device. Any FRP
-controller (flighthook, dashboards, etc.) can connect over WebSocket and receive
-shot data without knowing anything about the Mevo+ binary protocol.
+Three features build on the [flightrelay](https://crates.io/crates/flightrelay)
+SDK (0.5, FRP 0.2.0):
 
-`FrpDevice::check_controller()` returns the controller's `set_detection_mode`
-request as a `ControllerCommand` (`mode`, `handed`, `club`, each `None` when
-absent or unrecognized). The Mevo+ and Gen2 apply the detection mode via
-`frp::detection_mode_to_avr`; the radar has no club or handedness setting.
+- **`config`**: `ironsight::config::Config`, the driver's settings as a serde
+  struct (flightrelay's `DriverConfig`), with `validate()` and the mapping to
+  `MevoSettings` / `XiSettings`. It needs no device stack and builds for
+  `wasm32-unknown-unknown`, so a settings form can use it.
+- **`driver`**: `ironsight::driver::Mevo`, flightrelay's `DeviceDriver` for the
+  Mevo+, Gen2 and Xi, and `driver::convert` (shot results to FRP types).
+- **`frp`**: the `ironsight-frp` binary.
 
-A standalone binary is included:
+The driver configures the device for the detected model in the detection mode
+the host has latched, and re-arms it when a controller's
+`set_detection_mode` changes what is sent to the device (on the Xi, chipping
+and putting are one session). Full swing runs in mode 9 (limited flight) or 8
+(`environment = "outdoor"`); on the Xi, chipping and putting use the pitching
+shot type. The radar has no club or handedness setting.
+
+What it sends:
+
+- **Identity:** manufacturer `FlightScope`, model `Mevo+`, `Mevo Gen2` or
+  `Xi`, firmware from the AVR device info (version and build date). The FRP
+  `device` id is the Mevo's WiFi SSID, or `FlightScope Xi (<address>)`
+  (`FlightScope Mevo (<address>)` for a Mevo that reports no SSID). The Xi's
+  `label` is `Xi`.
+- **Telemetry:** `ready`, `tilt`, `roll`, and on the Mevo+ `battery_pct`,
+  `temp_c` and `external_power` (the Gen2's and Xi's status layout has no
+  decoded values for them, so they are left out).
+- **Shots:** `shot_trigger` with a timestamp, then `launch` and
+  `flight_result` (`basis: modeled`: carry, offline, apex, flight time,
+  descent, and total and roll when the device reports them) as soon as the
+  full result (`D4`) arrives, `club_path` once the shot has a ball, and
+  `shot_finished` when the device is done. Each goes out once.
+  - A launch-only full result (no spin and no flight, launched at 5° or more,
+    as the Xi sends for very short chips) sends a `launch` without spin and no
+    `flight_result`. Below 5° the same result is a ball that stayed on the
+    ground, and goes out as measured (apex 0).
+  - Without a full result, the early result (`E8`) makes the shot when
+    `use_estimated = true`; a shot the device did not read raises an alert
+    and sends no ball.
+  - Xi only, `spin_source`: `d4` (the default, the spin FS Golf displays),
+    `e8` (the early result's total spin, split by the full result's axis when
+    the shot has club data, otherwise sent alone with no axis) or `auto`
+    (`e8` in full swing). It applies without a new session.
+- **Raw frames** when a controller asks for them, once the handshake is
+  done: one message each, the payload as `data` and `"<type> <src>><dst>"`
+  as `label` (e.g. `"D4 AVR>APP"`). The handshake's messages, those that can
+  identify the unit, its network or the host (`protocol::carries_identity`),
+  and the device's free text (`0xE3`) and DSP debug output (`0xF0`) are never
+  sent; they go to the host's log as hex trace lines.
+
+A message the driver cannot decode raises an alert naming the error (never
+the message's bytes, which go to the trace log) and the session goes on.
+A closed connection, an operation timeout or 10 s without a message ends the
+session, and the host reconnects (1 s, growing by 1 s per failed attempt to
+15 s, back to 1 s after a session that lasted 10 s).
+
+#### `ironsight-frp`
+
+```text
+ironsight-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
+              [--set <key>=<value>]... [--log <info|debug|trace>] [--help]
+```
+
+- `--config`: a TOML file with the settings below at the top level.
+- `--set key=value`: one setting, over the file; repeatable.
+- `--target`: an address to listen on for controllers (default
+  `0.0.0.0:5880`; several controllers at once), or a `ws://` URL of a
+  controller to dial, such as flighthook.
+- `--log`: the lowest level of the driver's log lines on stderr (default
+  `info`).
+- `--help`: usage and every setting with its default.
+
+| Key | Default | |
+|---|---|---|
+| `address` | `192.168.2.1:5100` | the device's IP address and port |
+| `environment` | `limited_flight` | or `outdoor` (full flight, about 40 yd needed) |
+| `range` | `8ft` | distance from the device to the ball |
+| `surface_height` | `0in` | height of the hitting surface |
+| `tee_height` | `1.5in` | Mevo+ and Gen2 |
+| `ball_type` | `1` | Mevo+ and Gen2: 0 = standard, 1 = RCT |
+| `track_pct` | `80` | Mevo+ and Gen2, 0 to 100 |
+| `camera_mode` | `standard` | Mevo+ and Gen2: `fusion` or `raw_fusion` (Pro Package) |
+| `use_estimated` | `false` | send a shot from the early result when the full one is missing |
+| `spin_source` | `d4` | Xi: `e8` or `auto` |
 
 ```sh
-# Connect to Mevo+ at default address, serve FRP on port 5880
+# Mevo+ at the default address, serve controllers on port 5880
 cargo run --features frp --bin ironsight-frp
 
-# Custom addresses
-cargo run --features frp --bin ironsight-frp -- 192.168.2.1:5100 0.0.0.0:5880
+# Another address, bridged to flighthook
+cargo run --features frp --bin ironsight-frp -- \
+    --set address=10.0.0.20:5100 --target ws://flighthook:5880/frp
 ```
 
 Pre-built binaries for Linux and Windows are attached to each
@@ -281,13 +357,19 @@ tests of applications built on ironsight:
 - `FakeDevice`: a scripted in-memory device (`Read + Write`) to hand to
   `BinaryConnection::new`. It answers status polls, the arm and the
   shot-completion requests itself; `FakeDevice::xi()` also answers the Xi's
-  handshake and configuration.
+  handshake and configuration, and `FakeDevice::mevo_plus()` /
+  `FakeDevice::mevo_gen2()` the Mevo handshake, AVR and camera
+  configuration (`with_ssid` sets the camera Pi's WiFi name,
+  `set_dsp_status` the status it reports).
 - `Shot`: one shot's frames (`Shot::xi_full_swing()`, `Shot::xi_chip()`,
   `Shot::xi_no_read()`, or your own results with
   `Shot::new`), queued with `FakeDevice::push_shot`.
 - `fixtures`: result frames as an Xi sent them, none of which identifies a
   unit.
-- Payload encoders for test frames: `avr_status`, `dev_info`, `shot_text`.
+- Payload encoders for test frames: `avr_status`, `dev_info`, `shot_text`,
+  `mevo_plus_dsp_status`.
+- With the `driver` feature, `driver::Mevo::connect_with` runs a whole
+  driver session (handshake, configuration, shots) on any of these fakes.
 
 ```toml
 [dev-dependencies]
@@ -301,6 +383,7 @@ Minimal by design:
 - **`thiserror`** — error enum derives
 - **`serde`** (optional, `serde` feature) — serialization support
 - **`serde_json`** (optional, `gvp` feature) — camera protocol support
-- **`flightrelay`** (optional, `frp` feature) — FRP WebSocket server
+- **`flightrelay`** (optional, `config`, `driver` and `frp` features) — FRP
+  driver contract, settings and server
 
 No async runtime. No logging framework. Standard library TCP only.
