@@ -170,7 +170,7 @@ and is untested. ironsight has no putting configuration for the Xi. See
 `seq::MevoSettings` holds a full configuration: detection mode, ball type
 (param `0x06`), minimum track percentage as a fraction (written to param
 `0x0F`, whose exact use by the device is not yet confirmed), tee height in
-metres (param `0x26`) and the radar calibration. Build it with
+meters (param `0x26`) and the radar calibration. Build it with
 `MevoSettings::new`. It converts into
 the `AvrSettings` that `BinaryClient::configure_avr` takes. For a mode change,
 send `AvrSettings::mode_only(mode)`: the device re-arms sooner after the mode

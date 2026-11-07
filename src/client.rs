@@ -542,7 +542,7 @@ impl<S: Read + Write> BinaryClient<S> {
     /// block; later ones send the mode block only, for a mode change. If
     /// the device is armed when this operation starts executing, it is
     /// disarmed first. Emits [`BinaryEvent::Disarmed`] (when it disarmed)
-    /// then [`BinaryEvent::Configured`]. Arm afterwards with
+    /// then [`BinaryEvent::Configured`]. Arm afterward with
     /// [`arm()`](Self::arm).
     pub fn configure_xi(&mut self, xi: XiSettings) {
         self.queue.push_back(QueuedOp::ConfigureXi(xi));
@@ -956,7 +956,7 @@ impl BinaryClient<TcpStream> {
 mod tests {
     //! Drive `BinaryClient` against a scripted Xi on an in-memory stream.
     //!
-    //! Device identity frames (status, device info) are synthesised with a
+    //! Device identity frames (status, device info) are synthesized with a
     //! made-up serial. Per-shot frames follow the Xi's per-shot format and
     //! carry no device identity.
 
@@ -978,7 +978,7 @@ mod tests {
             .collect()
     }
 
-    /// Made-up device serial used in every synthesised identity frame.
+    /// Made-up device serial used in every synthesized identity frame.
     const FAKE_SERIAL: [u8; 4] = [0x01, 0x23, 0x45, 0x67];
 
     /// Xi DSP status (29 bytes, version byte 0x1C).
@@ -1719,7 +1719,7 @@ mod tests {
 
     /// The same shot on a Mevo sends no 0x95: only the post-shot cycle
     /// (0x69 x2, 0x6D, B0 `[01 01]`). The scripted device is the Xi with
-    /// the handshake outcome relabelled, so only the model differs.
+    /// the handshake outcome relabeled, so only the model differs.
     #[test]
     fn mevo_shot_sends_no_result_ack() {
         let (mut client, state) = armed_xi();

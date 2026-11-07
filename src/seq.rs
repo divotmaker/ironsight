@@ -320,7 +320,7 @@ impl DspSequencer {
     /// Check whether the DSP query or the Xi power-mode write has gone
     /// unanswered for [`DSP_QUERY_TIMEOUT`]. A timed-out query moves on to
     /// DevInfoReq; a timed-out power-mode write completes the sequence
-    /// (check [`is_complete()`](Sequence::is_complete) afterwards).
+    /// (check [`is_complete()`](Sequence::is_complete) afterward).
     /// Call this periodically in the event loop.
     pub fn check_timeout(&mut self) -> Vec<Action> {
         let Some(deadline) = self.deadline else {
@@ -1049,7 +1049,7 @@ const MEVO_BALL_TYPE_ID: u8 = 0x06;
 /// Param 0x0F: written with the minimum track percentage, as a fraction
 /// (FLOAT40).
 const MEVO_TRACK_FRACTION_ID: u8 = 0x0F;
-/// Param 0x26: tee height in metres (FLOAT40).
+/// Param 0x26: tee height in meters (FLOAT40).
 const MEVO_TEE_HEIGHT_ID: u8 = 0x26;
 
 /// Full configuration for a Mevo+ or Mevo Gen2: detection mode, ball type,
@@ -1097,7 +1097,7 @@ pub struct MevoSettings {
     /// written to param 0x0F. The device's exact use of param 0x0F is not
     /// yet confirmed; ironsight writes this value there unchanged.
     pub track_fraction: f64,
-    /// Tee height in metres, param 0x26.
+    /// Tee height in meters, param 0x26.
     pub tee_height_m: f64,
     /// Distance from the device to the ball and height of the hitting
     /// surface (0xA4).
@@ -1107,7 +1107,7 @@ pub struct MevoSettings {
 impl MevoSettings {
     /// A full configuration: detection mode (`config::MODE_*`), ball type
     /// (0 = standard, 1 = RCT), minimum track percentage as a fraction,
-    /// tee height in metres and radar calibration.
+    /// tee height in meters and radar calibration.
     #[must_use]
     pub fn new(
         mode: u8,
@@ -1539,7 +1539,7 @@ fn xi_gate() -> (Command, XiReply) {
 /// BF 08 00 00 20 00 00 00 00 00   param 0x20 = 0.0
 /// ```
 ///
-/// Arm afterwards with [`ArmSequencer`]. The mode block expects a disarmed
+/// Arm afterward with [`ArmSequencer`]. The mode block expects a disarmed
 /// device; [`BinaryClient`](crate::BinaryClient) disarms first when needed.
 pub struct XiConfigSequencer {
     steps: Vec<(Command, XiReply)>,
