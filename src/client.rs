@@ -69,6 +69,23 @@ pub enum BinaryEvent {
     /// refusing bus and the refused command. Worth logging as a warning
     /// with that hex. Emitted before the operation's own completion event.
     StepRefused(Envelope),
+    /// A camera configuration ended without the device finishing it: the
+    /// device refused a step (0x94), or did not answer one within
+    /// [`CAMERA_SETUP_TIMEOUT`]. The session is intact; the client goes on
+    /// with the next queued operation, so a queued arm still runs. The
+    /// camera is left as the device has it (a Fusion configuration that
+    /// did not finish leaves it in standard mode).
+    CameraSetupUnfinished {
+        /// The step the configuration stopped at, in words
+        /// ([`CameraConfigSequencer::step_name`]).
+        step: &'static str,
+        /// The configuration was for a Fusion mode
+        /// ([`CamConfig::is_fusion`]).
+        fusion: bool,
+        /// The 0x94 that refused the step; `None` when the device did not
+        /// answer in time. Log its hex.
+        refused: Option<Envelope>,
+    },
     /// Any message not consumed by the active operation.
     Message(Envelope),
 }
@@ -184,6 +201,14 @@ const DEFAULT_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long a camera configuration may take before the client gives up on
+/// it and reports [`BinaryEvent::CameraSetupUnfinished`]. The camera's
+/// replies come within a second or two. It is shorter than the driver's
+/// 10 s silence limit, so an unfinished setup is reported before a silent
+/// device ends the session; the other operations keep the operation
+/// timeout, whose expiry ends the session.
+pub const CAMERA_SETUP_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Maximum time between TRIGGER and PROCESSED before we give up on the
 /// shot and resume keepalives. Without this, a lost PROCESSED message
 /// permanently suppresses keepalives (shot_in_progress stuck true),
@@ -238,6 +263,7 @@ pub struct BinaryClient<S: Read + Write> {
 
     // Configuration
     op_timeout: Duration,
+    camera_timeout: Duration,
 
     // Cached state
     status: StatusSnapshot,
@@ -284,6 +310,7 @@ impl<S: Read + Write> BinaryClient<S> {
             last_keepalive: Instant::now(),
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             op_timeout: DEFAULT_OP_TIMEOUT,
+            camera_timeout: CAMERA_SETUP_TIMEOUT,
             status: StatusSnapshot::default(),
             device: None,
             armed: false,
@@ -318,6 +345,13 @@ impl<S: Read + Write> BinaryClient<S> {
         if let Some(deadline) = self.op_deadline
             && Instant::now() >= deadline
         {
+            if matches!(
+                self.active,
+                Some(ActiveOp::Configure(ConfigurePhase::Camera(_)))
+            ) {
+                // A camera setup the device never finishes is non-fatal.
+                return Ok(self.give_up_camera());
+            }
             if matches!(self.active, Some(ActiveOp::Keepalive(_))) {
                 // Keepalive timeout is non-fatal. Update last_keepalive
                 // so we don't immediately re-queue another one.
@@ -445,6 +479,7 @@ impl<S: Read + Write> BinaryClient<S> {
                     FeedResult::Intermediate(event) => Some(*event),
                     FeedResult::PhaseComplete => self.advance_phase()?,
                     FeedResult::Done => self.finish_op()?,
+                    FeedResult::CameraRefused => self.give_up_camera(),
                 };
                 let Some(refused) = refused else {
                     return Ok(event);
@@ -550,7 +585,10 @@ impl<S: Read + Write> BinaryClient<S> {
 
     /// Enqueue camera configuration.
     ///
-    /// Emits [`BinaryEvent::Configured`] on completion. On a model without a
+    /// Emits [`BinaryEvent::Configured`] on completion. A configuration the
+    /// device refuses or does not finish within [`CAMERA_SETUP_TIMEOUT`]
+    /// emits [`BinaryEvent::CameraSetupUnfinished`] instead, and the next
+    /// queued operation runs. On a model without a
     /// camera Pi (the Xi) nothing is sent and `Configured` is emitted when the
     /// operation is reached.
     pub fn configure_cam(&mut self, cam: CamConfig) {
@@ -597,9 +635,17 @@ impl<S: Read + Write> BinaryClient<S> {
     }
 
     /// Set the operation timeout (default: 30s). Does not affect keepalives
-    /// (which always use a 3s timeout).
+    /// (which always use a 3s timeout) or camera configuration (see
+    /// [`set_camera_setup_timeout`](Self::set_camera_setup_timeout)).
     pub fn set_operation_timeout(&mut self, timeout: Duration) {
         self.op_timeout = timeout;
+    }
+
+    /// Set how long a camera configuration may take (default:
+    /// [`CAMERA_SETUP_TIMEOUT`]) before the client reports
+    /// [`BinaryEvent::CameraSetupUnfinished`] and goes on.
+    pub fn set_camera_setup_timeout(&mut self, timeout: Duration) {
+        self.camera_timeout = timeout;
     }
 
     // -- Internal: start an operation ---------------------------------------
@@ -607,6 +653,7 @@ impl<S: Read + Write> BinaryClient<S> {
     fn start_op(&mut self, op: QueuedOp) -> Result<(), ConnError> {
         let timeout = match &op {
             QueuedOp::Keepalive => KEEPALIVE_TIMEOUT,
+            QueuedOp::ConfigureCam(_) => self.camera_timeout,
             _ => self.op_timeout,
         };
         self.op_deadline = Some(Instant::now() + timeout);
@@ -707,6 +754,21 @@ impl<S: Read + Write> BinaryClient<S> {
         }
     }
 
+    /// End the active camera configuration, which the device refused or did
+    /// not finish, and report where it stopped. The next queued operation
+    /// starts on the next poll.
+    fn give_up_camera(&mut self) -> Option<BinaryEvent> {
+        let Some(ActiveOp::Configure(ConfigurePhase::Camera(mut seq))) = self.active.take() else {
+            return None;
+        };
+        self.op_deadline = None;
+        Some(BinaryEvent::CameraSetupUnfinished {
+            step: seq.step_name(),
+            fusion: seq.is_fusion(),
+            refused: seq.take_refused(),
+        })
+    }
+
     fn feed_active(
         active: &mut ActiveOp,
         env: &Envelope,
@@ -760,6 +822,8 @@ impl<S: Read + Write> BinaryClient<S> {
                 };
                 if complete {
                     Ok(FeedResult::Done)
+                } else if matches!(config_phase, ConfigurePhase::Camera(seq) if seq.is_refused()) {
+                    Ok(FeedResult::CameraRefused)
                 } else {
                     Ok(FeedResult::Consumed)
                 }
@@ -935,6 +999,8 @@ enum FeedResult {
     PhaseComplete,
     /// The entire operation finished.
     Done,
+    /// The device refused a step of the camera configuration.
+    CameraRefused,
 }
 
 // -- TcpStream convenience --------------------------------------------------

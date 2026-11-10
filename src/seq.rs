@@ -1679,60 +1679,128 @@ enum CamConfigStep {
 }
 
 /// Pollable state machine for camera configuration (Phase 5).
+///
+/// Sends the camera config, reads it back, starts the camera and writes the
+/// PI keepalive parameter, each after the reply to the one before. A 0x94
+/// refusing the step's command ends the sequence at that step
+/// ([`is_refused()`](Self::is_refused)); a step that gets no reply at all
+/// waits for the caller's timeout. Either way
+/// [`step_name()`](Self::step_name) names the step the sequence stopped at.
 pub struct CameraConfigSequencer {
     step: CamConfigStep,
+    /// The type of the command the current step waits on a reply to,
+    /// without the reply bit (what a 0x94 carries as `acked_cmd`).
+    sent_type: u8,
+    fusion: bool,
+    /// The device refused (0x94) the current step; nothing more is sent.
+    stopped: bool,
+    /// 0x94 that refused the current step, not yet taken.
+    refused: Option<Box<Envelope>>,
 }
 
 impl CameraConfigSequencer {
     #[must_use]
     pub fn new(config: &CamConfig) -> (Self, Vec<Action>) {
+        let command = Command::CamConfig(config.clone());
         let seq = Self {
             step: CamConfigStep::WaitConfigAck,
+            sent_type: Self::type_of(&command),
+            fusion: config.is_fusion(),
+            stopped: false,
+            refused: None,
         };
-        let actions = vec![Action::Send(
-            Command::CamConfig(config.clone()),
-            BusAddr::Pi,
-        )];
-        (seq, actions)
+        (seq, vec![Action::Send(command, BusAddr::Pi)])
+    }
+
+    fn type_of(command: &Command) -> u8 {
+        command.encode(BusAddr::Pi).type_id & 0x7F
+    }
+
+    /// Move to `step`, which waits on a reply to `command`.
+    fn send(&mut self, step: CamConfigStep, command: Command) -> Vec<Action> {
+        self.step = step;
+        self.sent_type = Self::type_of(&command);
+        vec![Action::Send(command, BusAddr::Pi)]
+    }
+
+    /// Whether the configuration is a Fusion mode
+    /// ([`CamConfig::is_fusion`]).
+    #[must_use]
+    pub fn is_fusion(&self) -> bool {
+        self.fusion
+    }
+
+    /// The step the sequence is waiting at (or stopped at), in words:
+    /// `"camera config ack"`, `"camera config readback"`,
+    /// `"camera start ack"`, `"camera parameter ack"` or `"done"`.
+    #[must_use]
+    pub fn step_name(&self) -> &'static str {
+        match self.step {
+            CamConfigStep::WaitConfigAck => "camera config ack",
+            CamConfigStep::WaitReadback => "camera config readback",
+            CamConfigStep::WaitCamStateAck => "camera start ack",
+            CamConfigStep::WaitParamAck => "camera parameter ack",
+            CamConfigStep::Done => "done",
+        }
+    }
+
+    /// Whether the device refused a step with a 0x94. The sequence stopped
+    /// there.
+    #[must_use]
+    pub fn is_refused(&self) -> bool {
+        self.stopped
+    }
+
+    /// The 0x94 with which the device refused a step, once.
+    #[must_use]
+    pub fn take_refused(&mut self) -> Option<Envelope> {
+        self.refused.take().map(|env| *env)
     }
 }
 
 impl Sequence for CameraConfigSequencer {
     fn feed(&mut self, env: &Envelope) -> Vec<Action> {
-        if should_skip_with_mode_ack(env, BusAddr::Pi) {
+        if let Message::ConfigNack(nack) = &env.message
+            && env.src == BusAddr::Pi
+            && nack.acked_cmd == self.sent_type
+            && !self.stopped
+            && !self.is_complete()
+        {
+            self.refused = Some(Box::new(env.clone()));
+            self.stopped = true;
+            return vec![];
+        }
+        if self.stopped || should_skip_with_mode_ack(env, BusAddr::Pi) {
             return vec![];
         }
         match self.step {
             CamConfigStep::WaitConfigAck => {
                 if let Message::ConfigAck(_) = env.message {
-                    self.step = CamConfigStep::WaitReadback;
-                    return vec![Action::Send(
+                    return self.send(
+                        CamConfigStep::WaitReadback,
                         Command::CamConfigReq(CamConfigReq),
-                        BusAddr::Pi,
-                    )];
+                    );
                 }
                 vec![]
             }
             CamConfigStep::WaitReadback => {
                 if let Message::CamConfig(_) = env.message {
-                    self.step = CamConfigStep::WaitCamStateAck;
-                    return vec![Action::Send(
+                    return self.send(
+                        CamConfigStep::WaitCamStateAck,
                         Command::CamState(CamState { state: 0x01 }),
-                        BusAddr::Pi,
-                    )];
+                    );
                 }
                 vec![]
             }
             CamConfigStep::WaitCamStateAck => {
                 if let Message::ConfigAck(_) = env.message {
-                    self.step = CamConfigStep::WaitParamAck;
-                    return vec![Action::Send(
+                    return self.send(
+                        CamConfigStep::WaitParamAck,
                         Command::ParamValue(ParamValue {
                             param_id: 0x02,
                             value: crate::protocol::config::ParamData::Int24(10),
                         }),
-                        BusAddr::Pi,
-                    )];
+                    );
                 }
                 vec![]
             }

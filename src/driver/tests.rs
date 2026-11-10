@@ -18,7 +18,7 @@ use super::*;
 use crate::addr::BusAddr;
 use crate::config::{Config, SpinSource};
 use crate::protocol::{TYPE_CLUB_RESULT, TYPE_FLIGHT_RESULT, TYPE_FLIGHT_RESULT_V1};
-use crate::testing::{FakeDevice, Shot as FakeShot, fixtures};
+use crate::testing::{CameraFault, FakeDevice, Shot as FakeShot, fixtures};
 
 struct Host(DeviceCommand);
 
@@ -1671,6 +1671,212 @@ fn the_fusion_camera_config_follows_the_warmup_and_waits_for_an_open_shot() {
         e,
         DeviceEvent::Log(Level::Info, l) if l.starts_with("camera warmup complete")
     )));
+}
+
+const CAMERA_GIVE_UP: Duration = Duration::from_millis(80);
+
+fn warns<'a>(events: &'a [DeviceEvent], needle: &str) -> Vec<&'a str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            DeviceEvent::Log(Level::Warn, l) if l.contains(needle) => Some(l.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn phases(events: &[DeviceEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            DeviceEvent::Phase(p) => Some(*p),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A Fusion setup the device never finishes, or refuses, raises one alert
+/// and one warning with the step; the session carries on armed and ready,
+/// the Fusion config is not sent again, and the next shot is reported.
+#[test]
+fn a_fusion_camera_setup_the_device_does_not_finish_alerts_and_the_session_carries_on() {
+    let faults = [
+        (CameraFault::Ignore(0x82), "camera config ack", "no answer"),
+        (
+            CameraFault::Ignore(0x83),
+            "camera config readback",
+            "no answer",
+        ),
+        (CameraFault::Ignore(0x81), "camera start ack", "no answer"),
+        (
+            CameraFault::Ignore(0xBF),
+            "camera parameter ack",
+            "no answer",
+        ),
+        (
+            CameraFault::Refuse(0x82),
+            "camera config ack",
+            "refused: PI 0x94 021202",
+        ),
+        (
+            CameraFault::Refuse(0x81),
+            "camera start ack",
+            "refused: PI 0x94 021201",
+        ),
+    ];
+    for mode in [CameraMode::Fusion, CameraMode::RawFusion] {
+        for (fault, step, how) in faults {
+            let mut run = Run::new();
+            let mut mevo = driver(Config {
+                camera_mode: Some(mode),
+                ..Config::default()
+            });
+            let device = FakeDevice::mevo_plus();
+            let mut session = run
+                .connect(&mut mevo, device.clone(), full())
+                .expect("connect");
+            run.armed(&mut session);
+            let cam = match mode {
+                CameraMode::Fusion => CamConfig::fusion_preset(),
+                _ => CamConfig::raw_fusion_preset(),
+            }
+            .encode();
+            let fusion_configs = |device: &FakeDevice| {
+                device
+                    .sent()
+                    .iter()
+                    .filter(|f| f.dest == BusAddr::Pi && f.type_id == 0x82 && f.payload == cam)
+                    .count()
+            };
+
+            device.set_camera_fault(Some(fault));
+            session.client.set_camera_setup_timeout(CAMERA_GIVE_UP);
+            session.warmup = Duration::ZERO;
+            let start = run.events.len();
+            run.poll_until(&mut session, |e| {
+                matches!(e, DeviceEvent::Frp(FrpEvent::Alert { .. }))
+            });
+            run.armed(&mut session);
+
+            let events = &run.events[start..];
+            assert_eq!(
+                alerts(events),
+                [
+                    "The Mevo+ didn't finish the Fusion camera setup, so it stays in standard camera mode. Check that the Pro Package is on, or try the other Fusion camera mode."
+                ],
+                "{mode:?} {fault:?}"
+            );
+            let warned = warns(events, "did not finish");
+            assert_eq!(warned.len(), 1, "{mode:?} {fault:?}");
+            assert!(warned[0].contains(step), "{}", warned[0]);
+            assert!(warned[0].contains(how), "{}", warned[0]);
+            assert_eq!(
+                phases(events),
+                ["configuring", "measuring"],
+                "{mode:?} {fault:?}"
+            );
+            assert_eq!(fusion_configs(&device), 1);
+            assert!(!device.sent().is_empty() && arms(&device) == 2);
+
+            // No retry, no error, and a shot still goes through.
+            for _ in 0..10 {
+                run.poll(&mut session).expect("poll");
+            }
+            assert_eq!(fusion_configs(&device), 1);
+            device.set_camera_fault(None);
+            let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
+            assert_eq!(
+                kinds(&shot),
+                ["trigger", "launch", "flight", "club", "finished"],
+                "{mode:?} {fault:?}"
+            );
+            assert_eq!(alerts(&run.events[start..]).len(), 1);
+        }
+    }
+}
+
+/// The warmup config the device does not finish: an alert that says the
+/// camera stays as it started, and the arm follows.
+#[test]
+fn a_camera_warmup_the_device_does_not_finish_alerts_and_arms() {
+    for fault in [CameraFault::Ignore(0x82), CameraFault::Refuse(0x82)] {
+        for mode in [CameraMode::Standard, CameraMode::Fusion] {
+            let mut run = Run::new();
+            let mut mevo = driver(Config {
+                camera_mode: Some(mode),
+                ..Config::default()
+            });
+            let device = FakeDevice::mevo_plus();
+            device.set_camera_fault(Some(fault));
+            let mut session = run
+                .connect(&mut mevo, device.clone(), full())
+                .expect("connect");
+            session.client.set_camera_setup_timeout(CAMERA_GIVE_UP);
+            run.armed(&mut session);
+            // The Fusion config, when configured, follows the warmup.
+            session.warmup = Duration::ZERO;
+            for _ in 0..5 {
+                run.poll(&mut session).expect("poll");
+            }
+            let warned = warns(&run.events, "did not finish the camera setup");
+            assert_eq!(warned.len(), 1, "{fault:?} {mode:?}");
+            assert!(warned[0].contains("camera config ack"), "{}", warned[0]);
+            assert_eq!(
+                alerts(&run.events)[0],
+                "The Mevo+ didn't finish the camera setup, so the camera stays as it started.",
+                "{fault:?} {mode:?}"
+            );
+            assert!(session.client.is_armed());
+        }
+    }
+}
+
+/// The last `ready` telemetry value is true.
+fn ready_last(events: &[DeviceEvent]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| telemetry(e, "ready"))
+        .is_some_and(|v| v == "true")
+}
+
+/// A device that finishes the camera setup raises nothing, in every camera
+/// mode.
+#[test]
+fn a_camera_setup_the_device_finishes_raises_no_alert() {
+    for mode in [
+        CameraMode::Standard,
+        CameraMode::Fusion,
+        CameraMode::RawFusion,
+    ] {
+        let mut run = Run::new();
+        let mut mevo = driver(Config {
+            camera_mode: Some(mode),
+            ..Config::default()
+        });
+        let device = FakeDevice::mevo_plus();
+        let mut session = run
+            .connect(&mut mevo, device.clone(), full())
+            .expect("connect");
+        run.armed(&mut session);
+        session.warmup = Duration::ZERO;
+        // The Fusion config and its re-arm.
+        let wanted_arms = if mode == CameraMode::Standard { 1 } else { 2 };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && (arms(&device) < wanted_arms || !ready_last(&run.events))
+        {
+            run.poll(&mut session).expect("poll");
+        }
+        assert_eq!(arms(&device), wanted_arms, "{mode:?}");
+        assert!(ready_last(&run.events), "{mode:?}");
+        assert!(alerts(&run.events).is_empty(), "{mode:?}");
+        assert!(warns(&run.events, "did not finish").is_empty(), "{mode:?}");
+        let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
+        assert_eq!(
+            kinds(&shot),
+            ["trigger", "launch", "flight", "club", "finished"]
+        );
+    }
 }
 
 #[test]

@@ -475,6 +475,13 @@ phase A and `CamConfig::fusion_preset()` or `CamConfig::raw_fusion_preset()`
 for phase B, sent once `camera::WARMUP` (15 s) has passed. Total warmup is
 ~20-30 seconds before ARM.
 
+`BinaryClient::configure_cam` gives up on a configuration the Pi refuses
+(0x94) or does not finish within `client::CAMERA_SETUP_TIMEOUT` (8 s) and
+emits `BinaryEvent::CameraSetupUnfinished` with the step it stopped at (config
+ack, readback, start ack or parameter ack). The session is intact and the next
+queued operation runs; a Fusion configuration that did not finish leaves the
+camera in standard mode.
+
 ### Minimal camera setup
 
 If port 1258 is not needed, you can still start the camera via the binary

@@ -19,6 +19,9 @@
 //!   Mevo handshake (DSP, AVR and camera Pi), the AVR configuration and the
 //!   camera configuration, with made-up identity frames.
 //!
+//! [`FakeDevice::set_camera_fault`] makes the camera Pi leave a camera
+//! configuration step unanswered or refuse it.
+//!
 //! [`FakeDevice::new`] answers nothing else of the handshake, so
 //! [`BinaryClient::handshake`](crate::BinaryClient::handshake) completes on
 //! [`FakeDevice::xi`], [`FakeDevice::mevo_plus`] and
@@ -91,6 +94,20 @@ struct State {
     armed: bool,
     /// DSP power mode (DSP param 0x01); 0 until written.
     dsp_power_mode: u8,
+    /// How the camera Pi mishandles a camera configuration step.
+    camera_fault: Option<CameraFault>,
+}
+
+/// How a [`FakeDevice`]'s camera Pi mishandles a frame sent to it, by the
+/// frame's type: 0x82 the camera config, 0x83 its readback request, 0x81
+/// the camera start, 0xBF the parameter write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CameraFault {
+    /// Never answer a frame of this type.
+    Ignore(u8),
+    /// Refuse a frame of this type with a 0x94.
+    Refuse(u8),
 }
 
 impl FakeDevice {
@@ -158,6 +175,13 @@ impl FakeDevice {
         self.0.borrow_mut().dsp_status = Some(payload.into());
     }
 
+    /// Make the camera Pi mishandle the frames of one type (`None` answers
+    /// them again). Applies to the frames the client sends from now on,
+    /// the camera warmup's included.
+    pub fn set_camera_fault(&self, fault: Option<CameraFault>) {
+        self.0.borrow_mut().camera_fault = fault;
+    }
+
     /// A connection over a clone of this device.
     #[must_use]
     pub fn connection(&self) -> BinaryConnection<FakeDevice> {
@@ -207,6 +231,16 @@ impl State {
 
     fn respond(&mut self, f: &RawFrame) {
         let p = f.payload.as_slice();
+        if f.dest == BusAddr::Pi {
+            match self.camera_fault {
+                Some(CameraFault::Ignore(t)) if t == f.type_id => return,
+                Some(CameraFault::Refuse(t)) if t == f.type_id => {
+                    self.push(BusAddr::Pi, 0x94, vec![0x02, 0x12, f.type_id & 0x7F]);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match (f.dest, f.type_id) {
             (BusAddr::Dsp, 0xAA) => {
                 let status = if self.xi {

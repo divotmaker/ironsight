@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::client::{BinaryClient, BinaryEvent};
+use crate::protocol::camera::CamConfig;
 use crate::protocol::handshake::DeviceModel;
 use crate::protocol::status::AvrStatus;
 use crate::protocol::{TYPE_DEV_INFO_RESP, TYPE_STATUS};
@@ -409,4 +410,157 @@ fn club_replies_follow_the_shots() {
             (TYPE_CLUB_RESULT, fixtures::XI_CHIP_ED.to_vec()),
         ]
     );
+}
+
+/// The camera steps a fault can hit: the frame type the Pi mishandles, and
+/// the step the client reports.
+const CAMERA_STEPS: [(u8, &str); 4] = [
+    (0x82, "camera config ack"),
+    (0x83, "camera config readback"),
+    (0x81, "camera start ack"),
+    (0xBF, "camera parameter ack"),
+];
+
+const SHORT_CAMERA_TIMEOUT: Duration = Duration::from_millis(60);
+
+fn unfinished(events: &[BinaryEvent]) -> Vec<(&'static str, bool, Option<String>)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            BinaryEvent::CameraSetupUnfinished {
+                step,
+                fusion,
+                refused,
+            } => Some((*step, *fusion, refused.as_ref().map(|env| hex(&env.raw)))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A camera setup the Pi never finishes ends after the camera timeout, at
+/// the step it stopped at; the queued arm runs and a shot still completes.
+#[test]
+fn a_camera_setup_the_device_never_finishes_gives_up_and_the_arm_runs() {
+    for (frame_type, step) in CAMERA_STEPS {
+        for (config, fusion) in [
+            (CamConfig::warmup_preset(), false),
+            (CamConfig::fusion_preset(), true),
+            (CamConfig::raw_fusion_preset(), true),
+        ] {
+            let device = FakeDevice::mevo_plus();
+            device.set_camera_fault(Some(CameraFault::Ignore(frame_type)));
+            let mut client = BinaryClient::new(device.connection());
+            client.set_camera_setup_timeout(SHORT_CAMERA_TIMEOUT);
+            let started = Instant::now();
+            client.configure_cam(config);
+            client.arm();
+            let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::Armed));
+            assert!(
+                started.elapsed() >= SHORT_CAMERA_TIMEOUT,
+                "0x{frame_type:02X}"
+            );
+            assert_eq!(
+                unfinished(&events),
+                [(step, fusion, None)],
+                "0x{frame_type:02X}"
+            );
+            assert!(
+                !events.iter().any(|e| matches!(e, BinaryEvent::Configured)),
+                "0x{frame_type:02X}"
+            );
+            assert!(client.is_armed());
+
+            device.push_shot(&Shot::xi_full_swing());
+            let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::ShotComplete(_)));
+            assert!(unfinished(&events).is_empty());
+            assert!(client.is_armed());
+        }
+    }
+}
+
+/// A 0x94 refusing a camera step ends the setup at once, with the frame.
+#[test]
+fn a_refused_camera_step_gives_up_at_once_and_the_arm_runs() {
+    for (frame_type, step) in CAMERA_STEPS {
+        let device = FakeDevice::mevo_plus();
+        device.set_camera_fault(Some(CameraFault::Refuse(frame_type)));
+        let mut client = BinaryClient::new(device.connection());
+        client.set_camera_setup_timeout(Duration::from_secs(60));
+        client.configure_cam(CamConfig::fusion_preset());
+        client.arm();
+        let started = Instant::now();
+        let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::Armed));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let raw = hex(&[0x02, 0x12, frame_type & 0x7F]);
+        assert_eq!(
+            unfinished(&events),
+            [(step, true, Some(raw))],
+            "0x{frame_type:02X}"
+        );
+        assert!(client.is_armed());
+    }
+}
+
+/// A refusal of a camera frame the setup did not send, or from another
+/// bus, does not end it.
+#[test]
+fn a_nack_of_another_command_does_not_end_a_camera_setup() {
+    let device = FakeDevice::mevo_plus();
+    // The Pi refuses a frame the setup never sends.
+    device.set_camera_fault(Some(CameraFault::Refuse(0xB0)));
+    device.push(BusAddr::Avr, 0x94, vec![0x02, 0x30, 0x02]);
+    let mut client = BinaryClient::new(device.connection());
+    client.configure_cam(CamConfig::fusion_preset());
+    client.arm();
+    let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::Armed));
+    assert!(unfinished(&events).is_empty());
+    assert!(events.iter().any(|e| matches!(e, BinaryEvent::Configured)));
+}
+
+/// A device that finishes the setup reports `Configured`, then arms, with no
+/// unfinished event, whatever the camera mode.
+#[test]
+fn a_camera_setup_the_device_finishes_is_unchanged() {
+    for config in [
+        CamConfig::standard_preset(),
+        CamConfig::warmup_preset(),
+        CamConfig::fusion_preset(),
+        CamConfig::raw_fusion_preset(),
+    ] {
+        let device = FakeDevice::mevo_plus();
+        let mut client = BinaryClient::new(device.connection());
+        client.set_camera_setup_timeout(Duration::from_secs(60));
+        client.configure_cam(config);
+        client.arm();
+        let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::Armed));
+        assert!(unfinished(&events).is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, BinaryEvent::Configured))
+                .count(),
+            1
+        );
+    }
+}
+
+/// The camera deadline applies to camera configuration only: another
+/// operation that gets no reply still ends in the operation timeout.
+#[test]
+fn the_camera_deadline_does_not_apply_to_other_operations() {
+    let device = FakeDevice::new();
+    // `new()` answers nothing of the Xi configuration.
+    let mut client = BinaryClient::new(device.connection());
+    client.set_camera_setup_timeout(Duration::ZERO);
+    client.set_operation_timeout(SHORT_CAMERA_TIMEOUT);
+    client.configure_xi(XiSettings::default());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match client.poll() {
+            Err(crate::ConnError::Timeout) => return,
+            Err(e) => panic!("{e}"),
+            Ok(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    panic!("no timeout");
 }

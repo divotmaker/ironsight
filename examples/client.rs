@@ -141,6 +141,12 @@ fn run() -> Result<(), ironsight::ConnError> {
                         env.type_id
                     );
                 }
+                BinaryEvent::CameraSetupUnfinished { step, refused, .. } => {
+                    println!(
+                        "  WARNING: camera setup unfinished at {step}{}, continuing",
+                        if refused.is_some() { " (refused)" } else { "" }
+                    );
+                }
                 BinaryEvent::ShotDatum(_) | BinaryEvent::Keepalive(_) | BinaryEvent::Message(_) => {
                     // on_recv callback already printed it
                 }

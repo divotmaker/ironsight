@@ -770,7 +770,8 @@ fn run() -> Result<(), ConnError> {
                 | BinaryEvent::Handshake(_)
                 | BinaryEvent::ShotDatum(_)
                 | BinaryEvent::Keepalive(_)
-                | BinaryEvent::StepRefused(_) => {}
+                | BinaryEvent::StepRefused(_)
+                | BinaryEvent::CameraSetupUnfinished { .. } => {}
             }
         }
 

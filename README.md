@@ -180,7 +180,11 @@ alone than after a full parameter set.
 Send `CamConfig::warmup_preset()` when the session starts. The camera accepts
 a Fusion configuration (`CamConfig::fusion_preset()`,
 `CamConfig::raw_fusion_preset()`) only after it has run in standard mode for
-`camera::WARMUP` (15 s).
+`camera::WARMUP` (15 s). A camera configuration the device refuses (0x94) or
+does not finish within `client::CAMERA_SETUP_TIMEOUT` (8 s) ends with
+`BinaryEvent::CameraSetupUnfinished`, which names the step it stopped at; the
+session goes on with the next queued operation (the arm), and the camera stays
+as the device has it.
 
 ### Sign convention
 
@@ -334,7 +338,7 @@ ironsight-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
 | `tee_height` | `1.5in` | Mevo+ and Gen2 |
 | `ball_type` | `1` | Mevo+ and Gen2: 0 = standard, 1 = RCT |
 | `track_pct` | `80` | Mevo+ and Gen2, 0 to 100 |
-| `camera_mode` | `standard` | Mevo+ and Gen2: `fusion` or `raw_fusion` (Pro Package) |
+| `camera_mode` | `standard` | Mevo+ and Gen2: `fusion` or `raw_fusion` (Pro Package); a Fusion setup the device doesn't finish raises an alert and the camera stays in standard mode |
 | `use_estimated` | `false` | send a shot from the early result when the full one is missing |
 | `spin_source` | `d4` | Xi: `e8` or `auto` |
 

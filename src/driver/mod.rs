@@ -17,9 +17,12 @@
 //!   A launch-only full result (see [`convert::launch_only`]) sends a launch
 //!   without spin and no flight result. Without a full result, the early
 //!   result makes the shot when [`Config::use_estimated`] is on;
-//! - an alert for a shot the device did not read, and for a message it could
+//! - an alert for a shot the device did not read, for a message it could
 //!   not decode (the session carries on; the alert names the error, never
-//!   the message's bytes);
+//!   the message's bytes), and for a camera setup it refused or did not
+//!   finish within [`CAMERA_SETUP_TIMEOUT`](crate::client::CAMERA_SETUP_TIMEOUT)
+//!   (the session arms anyway; the camera stays as it was, in standard mode
+//!   for a Fusion setup, and the Fusion setup is not retried);
 //! - `raw_frame`s while the host wants them, once the handshake is done: one
 //!   framed message each, `data` the payload, `label` `"<type> <src>><dst>"`
 //!   (e.g. `"D4 AVR>APP"`). The handshake's messages, those that can
@@ -57,7 +60,7 @@ use flightrelay::{DetectionMode, FrpEvent, RawDir, RawFrame, Severity, ShotKey, 
 use crate::addr::BusAddr;
 use crate::client::{BinaryClient, BinaryEvent, HandshakeOutcome};
 use crate::config::{CameraMode, Config, SpinSource};
-use crate::conn::{BinaryConnection, ConnError};
+use crate::conn::{BinaryConnection, ConnError, Envelope};
 use crate::protocol::camera::{self, CamConfig};
 use crate::protocol::handshake::{DeviceGen, DeviceModel};
 use crate::protocol::shot::{FlightResult, FlightResultV1};
@@ -808,12 +811,56 @@ impl<S: Read + Write> MevoSession<S> {
                     ),
                 );
             }
+            BinaryEvent::CameraSetupUnfinished {
+                step,
+                fusion,
+                refused,
+            } => self.camera_setup_unfinished(step, fusion, refused.as_ref(), out),
             BinaryEvent::Message(env) => match &env.message {
                 Message::DspStatus(dsp) => self.send_telemetry(out, dsp_telemetry(dsp)),
                 Message::AvrStatus(avr) => self.send_telemetry(out, avr_telemetry(avr)),
                 _ => {}
             },
         }
+    }
+
+    /// The device did not finish a camera setup: the session carries on
+    /// (the arm that follows it runs), with the camera as the device has it.
+    /// Neither Fusion mode is retried in this session.
+    fn camera_setup_unfinished(
+        &mut self,
+        step: &str,
+        fusion: bool,
+        refused: Option<&Envelope>,
+        out: &mut Events<'_>,
+    ) {
+        let how = refused.map_or_else(
+            || "no answer".to_owned(),
+            |env| {
+                format!(
+                    "refused: {} 0x{:02X} {}",
+                    env.src,
+                    env.type_id,
+                    hex(&env.raw)
+                )
+            },
+        );
+        let kind = if fusion { "Fusion camera" } else { "camera" };
+        out.log(
+            Level::Warn,
+            format!("device did not finish the {kind} setup at {step} ({how}), continuing"),
+        );
+        let device = self.identity.model.as_deref().unwrap_or("device");
+        let text = if fusion {
+            format!(
+                "The {device} didn't finish the Fusion camera setup, so it stays in standard camera mode. Check that the Pro Package is on, or try the other Fusion camera mode."
+            )
+        } else {
+            format!(
+                "The {device} didn't finish the camera setup, so the camera stays as it started."
+            )
+        };
+        out.alert(Severity::Warn, text);
     }
 
     fn on_trigger(&mut self, out: &mut Events<'_>) {
