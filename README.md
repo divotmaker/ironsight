@@ -274,8 +274,9 @@ What it sends:
 - **Identity:** manufacturer `FlightScope`, model `Mevo+`, `Mevo Gen2` or
   `Xi`, firmware from the AVR device info (version and build date). The FRP
   `device` id is the Mevo's WiFi SSID, or `FlightScope Xi (<address>)`
-  (`FlightScope Mevo (<address>)` for a Mevo that reports no SSID). The Xi's
-  `label` is `Xi`.
+  (`FlightScope Mevo (<address>)` for a Mevo that reports no SSID). No
+  `label` is set, so the card text is manufacturer and model
+  (`FlightScope Xi`).
 - **Telemetry:** `ready`, `tilt`, `roll`, and on the Mevo+ `battery_pct`,
   `temp_c` and `external_power` (the Gen2's and Xi's status layout has no
   decoded values for them, so they are left out).

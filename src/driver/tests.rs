@@ -275,7 +275,8 @@ fn a_whole_xi_session_identifies_arms_and_reports_a_shot_once() {
     assert_eq!(id.device, "FlightScope Xi (192.168.2.1:5100)");
     assert_eq!(id.manufacturer.as_deref(), Some("FlightScope"));
     assert_eq!(id.model.as_deref(), Some("Xi"));
-    assert_eq!(id.label.as_deref(), Some("Xi"));
+    assert_eq!(id.label, None);
+    assert_eq!(id.label(), "FlightScope Xi");
     // The AVR's firmware, never the DSP device info.
     assert_eq!(id.firmware.as_deref(), Some("3.18 (Jan 1 2020)"));
     assert_eq!(session.model(), DeviceModel::Xi);

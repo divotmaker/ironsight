@@ -296,8 +296,8 @@ fn is_bulk_frame(frame: &RawFrame) -> bool {
 /// on a model without one (the Xi). The model is `"Mevo+"`, `"Mevo Gen2"`,
 /// `"Mevo"` or `"Xi"`; the firmware is the AVR device info's version and
 /// build date, `"1.23 (Feb 3 2024)"`. Nothing else of the device info is
-/// used: the DSP's carries the serial number. The Xi's label is its model,
-/// `"Xi"`.
+/// used: the DSP's carries the serial number. No label is set, so the card
+/// text is manufacturer and model for every model (`"FlightScope Xi"`).
 fn identity(h: &HandshakeOutcome, addr: SocketAddr) -> DeviceIdentity {
     let device = match &h.pi {
         Some(pi) if !pi.ssid.is_empty() => pi.ssid.clone(),
@@ -321,12 +321,9 @@ fn identity(h: &HandshakeOutcome, addr: SocketAddr) -> DeviceIdentity {
         (None, Some(d)) => Some(format!("built {d}")),
         (None, None) => None,
     };
-    let mut identity = DeviceIdentity::new(device)
+    let identity = DeviceIdentity::new(device)
         .with_manufacturer("FlightScope")
         .with_model(model);
-    if h.model == DeviceModel::Xi {
-        identity = identity.with_label(model);
-    }
     match firmware {
         Some(f) => identity.with_firmware(f),
         None => identity,
