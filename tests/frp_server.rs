@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use flightrelay::driver::{DeviceDriver, Stop};
 use flightrelay::{
-    EndpointConfig, FrpEndpoint, FrpEvent, FrpMessage, FrpServer, Role, ServerConfig, ServerEvent,
-    Source, Transport,
+    EndpointConfig, FrpEndpoint, FrpEvent, FrpMessage, FrpProtocolMessage, FrpServer, Role,
+    ServerConfig, ServerEvent, Source, Transport,
 };
 use ironsight::config::Config;
 use ironsight::driver::Mevo;
@@ -171,20 +171,21 @@ fn a_controller_reads_an_xi_shot_and_the_driver_reconnects() {
     while !(lost && reconnected(&states)) {
         assert!(Instant::now() < give_up, "saw {states:?}");
         match conn.recv().expect("recv") {
-            FrpMessage::Envelope(env) => match env.event {
-                FrpEvent::DeviceTelemetry {
+            FrpMessage::Envelope(env) => {
+                if let FrpEvent::DeviceTelemetry {
                     telemetry: Some(t), ..
-                } => {
-                    if let Some(r) = t.get("ready") {
-                        states.push(r.clone());
-                    }
+                } = env.event
+                    && let Some(r) = t.get("ready")
+                {
+                    states.push(r.clone());
                 }
-                FrpEvent::Alert { message, .. } => {
-                    assert!(message.starts_with("Connection lost"), "{message}");
-                    lost = true;
-                }
-                _ => {}
-            },
+            }
+            // The driver's alert about the loss; the server relays it as a
+            // protocol alert.
+            FrpMessage::Protocol(FrpProtocolMessage::Alert { message, .. }) => {
+                assert!(message.contains("closed"), "{message}");
+                lost = true;
+            }
             FrpMessage::Protocol(_) => {}
         }
     }
