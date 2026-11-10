@@ -1663,14 +1663,55 @@ fn the_fusion_camera_config_follows_the_warmup_and_waits_for_an_open_shot() {
         .iter()
         .rposition(|f| f.type_id == 0xB0 && f.payload == [0x01, 0x01])
         .expect("arm");
+    let disarm = device.sent()[..cam]
+        .iter()
+        .rposition(|f| f.type_id == 0xB0 && f.payload == [0x01, 0x00])
+        .expect("disarm");
     assert!(
-        result_request < cam && cam < rearm,
-        "{result_request} {cam} {rearm}"
+        result_request < disarm && disarm < cam && cam < rearm,
+        "{result_request} {disarm} {cam} {rearm}"
     );
     assert!(run.events.iter().any(|e| matches!(
         e,
         DeviceEvent::Log(Level::Info, l) if l.starts_with("camera warmup complete")
     )));
+}
+
+/// The armed device is disarmed before the raw Fusion config and armed again
+/// after it.
+#[test]
+fn the_raw_fusion_camera_config_is_sent_disarmed() {
+    let mut run = Run::new();
+    let mut mevo = driver(Config {
+        camera_mode: Some(CameraMode::RawFusion),
+        ..Config::default()
+    });
+    let device = FakeDevice::mevo_plus();
+    let mut session = run
+        .connect(&mut mevo, device.clone(), full())
+        .expect("connect");
+    run.armed(&mut session);
+    let armed = arms(&device);
+    session.warmup = Duration::ZERO;
+    run.poll_until(&mut session, |_| arms(&device) == armed + 1);
+    run.armed(&mut session);
+    let raw = CamConfig::raw_fusion_preset().encode();
+    let sent = device.sent();
+    let cam = sent
+        .iter()
+        .position(|f| f.dest == BusAddr::Pi && f.type_id == 0x82 && f.payload == raw)
+        .expect("raw fusion config");
+    let disarm = sent[..cam]
+        .iter()
+        .rposition(|f| f.type_id == 0xB0)
+        .expect("B0 before the config");
+    assert_eq!(sent[disarm].payload, [0x01, 0x00]);
+    assert!(
+        sent[cam..]
+            .iter()
+            .any(|f| f.type_id == 0xB0 && f.payload == [0x01, 0x01])
+    );
+    assert_eq!(warns(&run.events, "camera"), Vec::<&str>::new());
 }
 
 const CAMERA_GIVE_UP: Duration = Duration::from_millis(80);
@@ -1813,6 +1854,7 @@ fn a_camera_warmup_the_device_does_not_finish_alerts_and_arms() {
                 .expect("connect");
             session.client.set_camera_setup_timeout(CAMERA_GIVE_UP);
             run.armed(&mut session);
+            assert!(session.client.is_armed());
             // The Fusion config, when configured, follows the warmup.
             session.warmup = Duration::ZERO;
             for _ in 0..5 {
@@ -1826,7 +1868,6 @@ fn a_camera_warmup_the_device_does_not_finish_alerts_and_arms() {
                 "The Mevo+ didn't finish the camera setup, so the camera stays as it started.",
                 "{fault:?} {mode:?}"
             );
-            assert!(session.client.is_armed());
         }
     }
 }

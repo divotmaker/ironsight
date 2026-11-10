@@ -585,7 +585,9 @@ impl<S: Read + Write> BinaryClient<S> {
 
     /// Enqueue camera configuration.
     ///
-    /// Emits [`BinaryEvent::Configured`] on completion. A configuration the
+    /// An armed device is disarmed first ([`BinaryEvent::Disarmed`]); queue
+    /// [`arm`](Self::arm) after it to arm again. Emits
+    /// [`BinaryEvent::Configured`] on completion. A configuration the
     /// device refuses or does not finish within [`CAMERA_SETUP_TIMEOUT`]
     /// emits [`BinaryEvent::CameraSetupUnfinished`] instead, and the next
     /// queued operation runs. On a model without a
@@ -703,6 +705,10 @@ impl<S: Read + Write> BinaryClient<S> {
             QueuedOp::ConfigureCam(_) if !self.model().has_camera() => {
                 self.op_deadline = None;
                 self.ready_event = Some(BinaryEvent::Configured);
+            }
+            QueuedOp::ConfigureCam(cam_config) if self.armed => {
+                self.queue.push_front(QueuedOp::ConfigureCam(cam_config));
+                self.start_disarm()?;
             }
             QueuedOp::ConfigureCam(cam_config) => {
                 let (cam_seq, actions) = CameraConfigSequencer::new(&cam_config);

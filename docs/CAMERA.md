@@ -473,7 +473,9 @@ CamState responses:
 Use `CamConfig::warmup_preset()` (or `CamConfig::standard_preset()`) for
 phase A and `CamConfig::fusion_preset()` or `CamConfig::raw_fusion_preset()`
 for phase B, sent once `camera::WARMUP` (15 s) has passed. Total warmup is
-~20-30 seconds before ARM.
+~20-30 seconds before ARM. `BinaryClient::configure_cam` disarms an armed
+device before it sends the configuration (the device refuses to arm after a
+raw Fusion configuration sent while armed), so queue `arm()` after it.
 
 `BinaryClient::configure_cam` gives up on a configuration the Pi refuses
 (0x94) or does not finish within `client::CAMERA_SETUP_TIMEOUT` (8 s) and
