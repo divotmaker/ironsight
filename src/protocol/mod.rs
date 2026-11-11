@@ -18,8 +18,7 @@
 //!    on variants directly. Unknown variants return defaults (0, false, 0.0).
 //! 5. Unknown versions store raw payload bytes with hex `Debug` output.
 //!
-//! Reference: [`status::DspStatus`]. See also CLAUDE.md "Versioned Enum
-//! Compatibility Policy".
+//! Reference: [`status::DspStatus`].
 
 pub mod ack;
 pub mod camera;
