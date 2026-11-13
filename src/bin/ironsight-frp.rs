@@ -7,9 +7,10 @@
 //! ```
 //!
 //! Connects to the device (`--set address=<ip:port>`, default
-//! `192.168.2.1:5100`), configures and arms it, and serves its shots to FRP
-//! controllers on `0.0.0.0:5880`, or bridges to the controller at a `ws://`
-//! target. `--help` lists every setting with its default.
+//! `192.168.2.1:5100`), configures and arms it, and runs it as a launch
+//! monitor actor on an FRP bus: listening for peers on `0.0.0.0:5880`, or
+//! bridged to the hub at a `ws://` target. `--help` lists every setting with
+//! its default.
 
 use std::process::ExitCode;
 

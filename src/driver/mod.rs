@@ -6,24 +6,28 @@
 //! application with its own host loop.
 //!
 //! A session connects over TCP, runs the handshake, then configures and arms
-//! the device for the detected model in the detection mode the host has
-//! latched. It sends:
+//! the device for the detected model in the mode of the host's `golfer.turn`
+//! hints (full swing when there is no mode hint). A later mode hint
+//! reconfigures it; no mode hint keeps the mode it has. The device has no
+//! handedness or club setting. It sends:
 //!
-//! - telemetry: `ready`, `tilt`, `roll`, and on a Mevo+ `battery_pct`,
-//!   `temp_c` and `external_power`; only values that changed;
-//! - for each shot: `shot_trigger` (with the host's clock), `launch` and
-//!   `flight_result` as soon as the full result arrives, `club_path` once
-//!   the shot has a ball result, and `shot_finished` when the device is done.
+//! - status for its `bus.actor`: the `not_armed` blocker until it is armed
+//!   and from each trigger until it re-arms, tilt and roll, and on a Mevo+
+//!   the battery charge and the `temp_c` and `external_power` telemetry
+//!   keys; only values that changed;
+//! - for each shot: `shot.trigger` (with the host's clock), `shot.launch` and
+//!   `shot.flight` as soon as the full result arrives, `shot.club` once the
+//!   shot has a ball result, and `shot.finished` when the device is done.
 //!   A launch-only full result (see [`convert::launch_only`]) sends a launch
 //!   without spin and no flight result. Without a full result, the early
 //!   result makes the shot when [`Config::use_estimated`] is on;
-//! - an alert for a shot the device did not read, for a message it could
+//! - a `bus.alert` for a shot the device did not read, for a message it could
 //!   not decode (the session carries on; the alert names the error, never
 //!   the message's bytes), and for a camera setup it refused or did not
 //!   finish within [`CAMERA_SETUP_TIMEOUT`](crate::client::CAMERA_SETUP_TIMEOUT)
 //!   (the session arms anyway; the camera stays as it was, in standard mode
 //!   for a Fusion setup, and the Fusion setup is not retried);
-//! - `raw_frame`s while the host wants them, once the handshake is done: one
+//! - `shot.raw` frames while the host's configuration turns them on, once the handshake is done: one
 //!   framed message each, `data` the payload, `label` `"<type> <src>><dst>"`
 //!   (e.g. `"D4 AVR>APP"`). The handshake's messages, those that can
 //!   identify the unit, its network or the host ([`carries_identity`]), and
@@ -42,7 +46,6 @@
 
 pub mod convert;
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -51,11 +54,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flightrelay::config::{ConfigError, DriverConfig};
 use flightrelay::driver::{
-    ConnectCtx, DeviceCommand, DeviceDriver, DeviceEvent, DeviceIdentity, DeviceSession,
-    DriverInfo, Events, HostFlags, Level, Live, NoAction, RawProfile, ShotIds, Stopped,
+    ConnectCtx, DeviceDriver, DeviceEvent, DeviceIdentity, DeviceSession, DeviceStatus, DriverInfo,
+    Events, HostFlags, Level, Live, NoAction, RawProfile, ShotIds, Stopped, TurnHints,
 };
-use flightrelay::types::{ClubData, Launch};
-use flightrelay::{DetectionMode, FrpEvent, RawDir, RawFrame, Severity, ShotKey, Source};
+use flightrelay::types::{ClubData, Launch, blockers};
+use flightrelay::{FrpBody, Mode, RawDir, RawFrame, Severity, ShotKey, Source};
 
 use crate::addr::BusAddr;
 use crate::client::{BinaryClient, BinaryEvent, HandshakeOutcome};
@@ -253,7 +256,7 @@ impl Mevo {
 
         let identity = identity(&handshake, addr);
         let model = handshake.model;
-        let mode = ctx.latched().mode.unwrap_or(DetectionMode::Full);
+        let mode = ctx.hints().mode.unwrap_or(Mode::Full);
         let mut session = MevoSession {
             client,
             identity,
@@ -270,7 +273,7 @@ impl Mevo {
             session_start: Instant::now(),
             warmup: camera::WARMUP,
             last_event: Instant::now(),
-            telemetry: HashMap::new(),
+            status: DeviceStatus::not_armed(),
             backlog: Vec::new(),
         };
         session.handshake_done(&handshake, &mut ctx.out);
@@ -384,8 +387,8 @@ impl Wire {
             .push(frame);
     }
 
-    /// Emit the collected frames: as `raw_frame`s while the host wants them
-    /// and `raw` allows them (after the handshake), or as audit lines for a
+    /// Emit the collected frames: as `shot.raw` frames while raw frames are
+    /// on and `raw` allows them (after the handshake), or as audit lines for a
     /// frame that is audit-only ([`audit_only`]) and every frame while `raw`
     /// is false. Keeps the latest full and early result payloads in
     /// `results`. Returns whether a frame from the device was among them.
@@ -405,7 +408,7 @@ impl Wire {
             if !raw || audit_only(f.type_id) {
                 out.audit(f.dir, &label, &f.payload);
             } else if out.wants_raw() {
-                out.frp(FrpEvent::raw_frame(RawFrame {
+                out.frp(FrpBody::ShotRaw(RawFrame {
                     timestamp: f.at_ms,
                     label: Some(label),
                     ..RawFrame::new(f.dir, 0, f.payload)
@@ -434,8 +437,8 @@ struct LastResults {
 /// The shot in progress.
 struct Shot {
     key: ShotKey,
-    /// The detection mode at the trigger.
-    mode: DetectionMode,
+    /// The mode at the trigger.
+    mode: Mode,
     /// A full result was accepted and its launch sent.
     had_d4: bool,
     /// The latest early result.
@@ -460,10 +463,10 @@ pub struct MevoSession<S: Read + Write> {
     ids: ShotIds,
     wire: Wire,
     results: LastResults,
-    /// The detection mode the device is set to (or being set to).
-    mode: DetectionMode,
+    /// The mode the device is set to (or being set to).
+    mode: Mode,
     /// A mode change waiting for the device to be idle.
-    pending_mode: Option<DetectionMode>,
+    pending_mode: Option<Mode>,
     shot: Option<Shot>,
     /// The Fusion camera config, applied once the camera has warmed up.
     pending_fusion_cam: Option<CamConfig>,
@@ -472,9 +475,9 @@ pub struct MevoSession<S: Read + Write> {
     /// ([`camera::WARMUP`]; tests shorten it).
     warmup: Duration,
     last_event: Instant,
-    /// Telemetry as last sent.
-    telemetry: HashMap<String, String>,
-    /// Events of a command, sent with the next poll.
+    /// The status as last sent: blockers, battery, attitude and telemetry.
+    status: DeviceStatus,
+    /// Events of a hints change, sent with the next poll.
     backlog: Vec<DeviceEvent>,
 }
 
@@ -495,9 +498,9 @@ impl<S: Read + Write> MevoSession<S> {
         self.model
     }
 
-    /// The detection mode the device is set to, or being set to.
+    /// The mode the device is set to, or being set to.
     #[must_use]
-    pub fn mode(&self) -> DetectionMode {
+    pub fn mode(&self) -> Mode {
         self.mode
     }
 
@@ -550,40 +553,41 @@ impl<S: Read + Write> MevoSession<S> {
         Ok(())
     }
 
-    /// Take the mode of a host command. A mode that changes what is sent to
-    /// the device reconfigures and re-arms it (at once when it is armed,
-    /// else once it is idle); one that does not (Xi chipping and putting)
-    /// is only latched. The device has no hand or club setting. See
-    /// [`DeviceSession::command`].
+    /// Take the mode of a new `golfer.turn`'s hints. A mode that changes
+    /// what is sent to the device reconfigures and re-arms it (at once when
+    /// it is armed, else once it is idle); one that does not (Xi chipping
+    /// and putting) is only recorded. No mode hint keeps the mode the device
+    /// has. The device has no handedness or club setting. See
+    /// [`DeviceSession::hints`].
     ///
-    /// What the change emits (log lines, `ready=false`) goes out with the
-    /// next [`poll`](Self::poll).
+    /// What the change emits (log lines, the `not_armed` blocker) goes out
+    /// with the next [`poll`](Self::poll).
     ///
     /// # Errors
     ///
     /// Never; the signature is the trait's.
-    pub fn command(&mut self, cmd: &DeviceCommand) -> Result<(), Error> {
+    pub fn hints(&mut self, hints: &TurnHints) -> Result<(), Error> {
         let flags = HostFlags::new();
         let mut events = Vec::new();
         {
             let mut sink = |e| events.push(e);
-            self.take_command(*cmd, &mut Events::new(&mut sink, &flags));
+            self.take_hints(*hints, &mut Events::new(&mut sink, &flags));
         }
         self.backlog.extend(events);
         Ok(())
     }
 
-    fn take_command(&mut self, cmd: DeviceCommand, out: &mut Events<'_>) {
-        if cmd.handed.is_some() || cmd.club.is_some() {
+    fn take_hints(&mut self, hints: TurnHints, out: &mut Events<'_>) {
+        if hints.handedness.is_some() || hints.club.is_some() {
             out.log(
                 Level::Debug,
                 format!(
-                    "hand {:?} and club {:?} don't apply to the device",
-                    cmd.handed, cmd.club
+                    "handedness {:?} and club {:?} don't apply to the device",
+                    hints.handedness, hints.club
                 ),
             );
         }
-        let Some(new) = cmd.mode else {
+        let Some(new) = hints.mode else {
             return;
         };
         if new == self.mode && self.pending_mode.is_none() {
@@ -617,7 +621,8 @@ impl<S: Read + Write> MevoSession<S> {
         }
     }
 
-    /// Release the device: `ready=false`, then the connection is dropped.
+    /// Release the device: the status goes back to `not_armed` with no
+    /// battery, attitude or telemetry, then the connection is dropped.
     /// See [`DeviceSession::close`].
     ///
     /// # Errors
@@ -626,11 +631,11 @@ impl<S: Read + Write> MevoSession<S> {
     pub fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
         self.wire.emit(out, &mut self.results, true);
         self.flush_backlog(out);
-        out.ready(false);
+        out.status(DeviceStatus::not_armed());
         Ok(())
     }
 
-    /// Send what a command emitted.
+    /// Send what a hints change emitted.
     fn flush_backlog(&mut self, out: &mut Events<'_>) {
         for event in std::mem::take(&mut self.backlog) {
             match event {
@@ -668,10 +673,11 @@ impl<S: Read + Write> MevoSession<S> {
             Level::Trace,
             format!("AVR device info: {}", h.avr.dev_info.text),
         );
-        let mut pairs = avr_telemetry(&h.avr.status);
-        pairs.extend(dsp_telemetry(dsp));
-        pairs.push(("ready", "false".to_owned()));
-        self.send_telemetry(out, pairs);
+        self.update_status(out, |s| {
+            set_avr(s, &h.avr.status);
+            set_dsp(s, dsp);
+            set_ready(s, false);
+        });
 
         if self.model == DeviceModel::Xi {
             out.log(
@@ -714,7 +720,7 @@ impl<S: Read + Write> MevoSession<S> {
                 .configure_avr(self.config.mevo_settings(self.mode)),
         }
         self.client.arm();
-        self.send_telemetry(out, [("ready", "false".to_owned())]);
+        self.update_status(out, |s| set_ready(s, false));
     }
 
     /// Apply a mode change that waited for the device to be idle.
@@ -757,7 +763,7 @@ impl<S: Read + Write> MevoSession<S> {
             out.phase("configuring");
             self.client.configure_cam(cam);
             self.client.arm();
-            self.send_telemetry(out, [("ready", "false".to_owned())]);
+            self.update_status(out, |s| set_ready(s, false));
         }
     }
 
@@ -778,7 +784,7 @@ impl<S: Read + Write> MevoSession<S> {
                     format!("armed -- mode={wire} -- waiting for shots"),
                 );
                 out.phase("measuring");
-                self.send_telemetry(out, [("ready", "true".to_owned())]);
+                self.update_status(out, |s| set_ready(s, true));
                 self.apply_pending_mode(out);
             }
             BinaryEvent::Trigger => self.on_trigger(out),
@@ -787,18 +793,18 @@ impl<S: Read + Write> MevoSession<S> {
                 self.finish_shot(out);
                 // The client re-arms after a shot and reports the completed
                 // shot rather than an `Armed` event.
-                self.send_telemetry(out, [("ready", "true".to_owned())]);
+                self.update_status(out, |s| set_ready(s, true));
                 self.apply_pending_mode(out);
             }
             BinaryEvent::Keepalive(status) => {
-                let mut pairs = Vec::new();
-                if let Some(avr) = &status.avr {
-                    pairs.extend(avr_telemetry(avr));
-                }
-                if let Some(dsp) = &status.dsp {
-                    pairs.extend(dsp_telemetry(dsp));
-                }
-                self.send_telemetry(out, pairs);
+                self.update_status(out, |s| {
+                    if let Some(avr) = &status.avr {
+                        set_avr(s, avr);
+                    }
+                    if let Some(dsp) = &status.dsp {
+                        set_dsp(s, dsp);
+                    }
+                });
             }
             BinaryEvent::StepRefused(env) => {
                 out.log(
@@ -817,8 +823,8 @@ impl<S: Read + Write> MevoSession<S> {
                 refused,
             } => self.camera_setup_unfinished(step, fusion, refused.as_ref(), out),
             BinaryEvent::Message(env) => match &env.message {
-                Message::DspStatus(dsp) => self.send_telemetry(out, dsp_telemetry(dsp)),
-                Message::AvrStatus(avr) => self.send_telemetry(out, avr_telemetry(avr)),
+                Message::DspStatus(dsp) => self.update_status(out, |s| set_dsp(s, dsp)),
+                Message::AvrStatus(avr) => self.update_status(out, |s| set_avr(s, avr)),
                 _ => {}
             },
         }
@@ -893,7 +899,7 @@ impl<S: Read + Write> MevoSession<S> {
             club: None,
             club_sent: false,
         });
-        self.send_telemetry(out, [("ready", "false".to_owned())]);
+        self.update_status(out, |s| set_ready(s, false));
     }
 
     fn on_datum(&mut self, datum: ShotDatum, out: &mut Events<'_>) {
@@ -944,11 +950,11 @@ impl<S: Read + Write> MevoSession<S> {
                 out.log(Level::Info, shot_line(&shot.key, "D4", &launch, &d4, label));
                 out.launch(shot.key.clone(), launch);
                 if !only {
-                    out.flight_result(shot.key.clone(), convert::flight_result(&d4));
+                    out.flight(shot.key.clone(), convert::flight_result(&d4));
                 }
                 if let Some(club) = shot.club.take() {
                     shot.club_sent = true;
-                    out.club_path(shot.key.clone(), club);
+                    out.club(shot.key.clone(), club);
                 }
             }
             ShotDatum::FlightV1(e8) => shot.e8 = Some(e8),
@@ -957,7 +963,7 @@ impl<S: Read + Write> MevoSession<S> {
                 let club = convert::club_data(&ed);
                 if shot.had_d4 {
                     shot.club_sent = true;
-                    out.club_path(shot.key.clone(), club);
+                    out.club(shot.key.clone(), club);
                 } else {
                     shot.club = Some(club);
                 }
@@ -967,7 +973,7 @@ impl<S: Read + Write> MevoSession<S> {
     }
 
     /// Send what the finished shot still sends (the early result's ball, the
-    /// club data held back, or an alert), then `shot_finished`.
+    /// club data held back, or an alert), then `shot.finished`.
     fn finish_shot(&mut self, out: &mut Events<'_>) {
         let Some(shot) = self.shot.take() else {
             return;
@@ -1021,7 +1027,7 @@ impl<S: Read + Write> MevoSession<S> {
                         ),
                     );
                     out.launch(shot.key.clone(), launch);
-                    out.flight_result(shot.key.clone(), flight);
+                    out.flight(shot.key.clone(), flight);
                 }
                 None => {
                     out.log(
@@ -1036,28 +1042,19 @@ impl<S: Read + Write> MevoSession<S> {
             }
         }
         if let Some(club) = club {
-            out.club_path(shot.key.clone(), club);
+            out.club(shot.key.clone(), club);
         }
         out.shot_finished(shot.key);
     }
 
-    /// Send the telemetry values that changed since they were last sent.
-    fn send_telemetry(
-        &mut self,
-        out: &mut Events<'_>,
-        pairs: impl IntoIterator<Item = (&'static str, String)>,
-    ) {
-        let changed: Vec<(&str, String)> = pairs
-            .into_iter()
-            .filter(|(k, v)| self.telemetry.get(*k) != Some(v))
-            .collect();
-        if changed.is_empty() {
-            return;
+    /// Change the status and send the whole of it if something changed.
+    fn update_status(&mut self, out: &mut Events<'_>, change: impl FnOnce(&mut DeviceStatus)) {
+        let mut next = self.status.clone();
+        change(&mut next);
+        if next != self.status {
+            self.status = next;
+            out.status(self.status.clone());
         }
-        for (k, v) in &changed {
-            self.telemetry.insert((*k).to_owned(), v.clone());
-        }
-        out.telemetry(changed);
     }
 }
 
@@ -1068,8 +1065,8 @@ impl DeviceSession for MevoSession<TcpStream> {
         MevoSession::<TcpStream>::poll(self, timeout, out)
     }
 
-    fn command(&mut self, cmd: &DeviceCommand) -> Result<(), Error> {
-        MevoSession::<TcpStream>::command(self, cmd)
+    fn hints(&mut self, hints: &TurnHints) -> Result<(), Error> {
+        MevoSession::<TcpStream>::hints(self, hints)
     }
 
     fn identity(&self) -> &DeviceIdentity {
@@ -1081,26 +1078,48 @@ impl DeviceSession for MevoSession<TcpStream> {
     }
 }
 
-/// `tilt` and `roll` (degrees; the device reports roll with the opposite
-/// sign) from an AVR status.
-fn avr_telemetry(avr: &AvrStatus) -> Vec<(&'static str, String)> {
-    vec![
-        ("tilt", format!("{:.1}", avr.tilt)),
-        ("roll", format!("{:.1}", -avr.roll)),
-    ]
+/// `v` as printed with one decimal, the device's resolution, so a change
+/// below it sends nothing; `+ 0.0` turns a negative zero into zero.
+fn round_tenth(v: f64) -> f64 {
+    format!("{v:.1}").parse().unwrap_or(v) + 0.0
 }
 
-/// `battery_pct`, `temp_c` and `external_power` from a DSP status whose
-/// layout is decoded; nothing otherwise.
-fn dsp_telemetry(dsp: &DspStatus) -> Vec<(&'static str, String)> {
-    if !dsp.is_decoded() {
-        return Vec::new();
+/// The blockers: none when ready, `not_armed` otherwise.
+fn set_ready(status: &mut DeviceStatus, ready: bool) {
+    status.blockers = if ready {
+        Vec::new()
+    } else {
+        vec![blockers::NOT_ARMED.to_owned()]
+    };
+}
+
+/// The attitude from an AVR status: `tilt` and `roll` in degrees (the device
+/// reports roll with the opposite sign).
+fn set_avr(status: &mut DeviceStatus, avr: &AvrStatus) {
+    status.tilt = Some(round_tenth(avr.tilt));
+    status.roll = Some(round_tenth(-avr.roll));
+}
+
+/// The battery charge, `temp_c` and `external_power` from a DSP status
+/// whose layout is decoded; a status that is not decoded reports none of
+/// them, so they leave the actor.
+fn set_dsp(status: &mut DeviceStatus, dsp: &DspStatus) {
+    const KEYS: [&str; 2] = ["temp_c", "external_power"];
+    if dsp.is_decoded() {
+        status.battery_pct = Some(dsp.battery_percent());
+        status
+            .telemetry
+            .insert("temp_c".to_owned(), format!("{:.1}", dsp.temperature_c()));
+        status.telemetry.insert(
+            "external_power".to_owned(),
+            dsp.external_power().to_string(),
+        );
+    } else {
+        status.battery_pct = None;
+        for key in KEYS {
+            status.telemetry.remove(key);
+        }
     }
-    vec![
-        ("battery_pct", dsp.battery_percent().to_string()),
-        ("temp_c", format!("{:.1}", dsp.temperature_c())),
-        ("external_power", dsp.external_power().to_string()),
-    ]
 }
 
 /// Log a message the session could not process and raise an alert; the
@@ -1197,14 +1216,14 @@ impl XiSpin {
 /// (the mode at the trigger) is full swing, else `D4`.
 fn xi_spin(
     source: SpinSource,
-    mode: DetectionMode,
+    mode: Mode,
     d4: &FlightResult,
     e8: Option<&FlightResultV1>,
 ) -> (Option<XiSpin>, &'static str) {
     match source {
         SpinSource::D4 => (None, "D4"),
         SpinSource::E8 => xi_spin_e8(d4, e8),
-        SpinSource::Auto if mode == DetectionMode::Full => {
+        SpinSource::Auto if mode == Mode::Full => {
             let (spin, label) = xi_spin_e8(d4, e8);
             let label = match label {
                 "D4 (no E8 spin)" => "D4 (no E8 spin) (auto)",

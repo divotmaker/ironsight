@@ -1,5 +1,6 @@
 //! `ironsight-frp` end to end: the driver connects over TCP to a scripted
-//! Xi, flightrelay's `FrpServer` serves it, and a controller reads the shot.
+//! Xi, flightrelay's `FrpServer` runs it as a launch monitor actor, and a
+//! peer on the bus reads the shot.
 
 #![cfg(all(feature = "frp", feature = "testing"))]
 
@@ -10,12 +11,25 @@ use std::time::{Duration, Instant};
 
 use flightrelay::driver::{DeviceDriver, Stop};
 use flightrelay::{
-    EndpointConfig, FrpEndpoint, FrpEvent, FrpMessage, FrpProtocolMessage, FrpServer, Role,
-    ServerConfig, ServerEvent, Source, Transport,
+    BusActor, EndpointConfig, FrpBody, FrpEndpoint, FrpServer, ServerConfig, ServerEvent, Source,
+    Transport,
 };
 use ironsight::config::Config;
 use ironsight::driver::Mevo;
 use ironsight::testing::{FakeDevice, Shot};
+
+/// The launch monitor actor's id.
+const ACTOR: &str = "3c9e1f27b04d68a5";
+
+/// The actor's blockers as `"true"` (none: armed) or `"false"`
+/// (`not_armed`).
+fn ready(actor: &BusActor) -> String {
+    match actor.blockers.as_slice() {
+        [] => "true".to_owned(),
+        [b] if b == "not_armed" => "false".to_owned(),
+        other => panic!("unexpected blockers {other:?}"),
+    }
+}
 
 /// What the scripted device does next.
 enum Do {
@@ -88,80 +102,78 @@ fn a_controller_reads_an_xi_shot_and_the_driver_reconnects() {
     let (addr_tx, addr_rx) = mpsc::channel();
     let server_stop = stop.clone();
     let server = std::thread::spawn(move || {
-        FrpServer::new(driver, ServerConfig::new(Transport::listen("127.0.0.1:0")))
-            .on_event(move |event| {
-                if let ServerEvent::Listening(addr) = event {
-                    let _ = addr_tx.send(*addr);
-                }
-            })
-            .run(&server_stop)
+        FrpServer::new(
+            driver,
+            ServerConfig::new(Transport::listen("127.0.0.1:0"), ACTOR),
+        )
+        .on_event(move |event| {
+            if let ServerEvent::Listening(addr) = event {
+                let _ = addr_tx.send(*addr);
+            }
+        })
+        .run(&server_stop)
     });
     let addr: SocketAddr = addr_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("listening");
 
-    let mut controller = FrpEndpoint::open(EndpointConfig::new(
-        Role::Controller,
-        Transport::connect(format!("ws://{addr}/frp")),
-    ))
+    let mut peer = FrpEndpoint::open(EndpointConfig::new(Transport::connect(format!(
+        "ws://{addr}/frp"
+    ))))
     .expect("open");
-    let mut conn = controller.establish().expect("handshake");
+    let mut conn = peer.establish().expect("connect");
 
     let give_up = Instant::now() + Duration::from_secs(30);
     let mut seen = Vec::new();
     let mut identity = None;
-    let mut ready = false;
+    let mut ready_seen = false;
     let mut pushed = false;
     loop {
         assert!(Instant::now() < give_up, "saw {seen:?}");
-        let env = match conn.recv().expect("recv") {
-            FrpMessage::Envelope(env) => env,
-            FrpMessage::Protocol(_) => continue,
-        };
-        assert_eq!(env.device, format!("FlightScope Xi ({device_addr})"));
-        match env.event {
-            FrpEvent::DeviceTelemetry {
-                model,
-                firmware,
-                source,
-                telemetry,
-                ..
-            } => {
-                assert_eq!(source, Some(Source::Measured));
-                if model.is_some() {
-                    identity = Some((model, firmware));
+        let msg = conn.recv().expect("recv");
+        assert_eq!(msg.from, ACTOR);
+        // The device's own id (its address here) never goes on the bus.
+        let json = msg.to_json().expect("json");
+        assert!(!json.contains(&device_addr.to_string()), "{json}");
+        match msg.body {
+            FrpBody::BusActor(actor) => {
+                assert!(actor.roles.iter().any(|r| r == "launch_monitor"));
+                let device = actor.device.as_ref().expect("device block");
+                assert_eq!(device.source, Some(Source::Measured));
+                if device.model.is_some() {
+                    identity = Some((device.model.clone(), device.firmware.clone()));
                 }
-                if telemetry.and_then(|t| t.get("ready").cloned()).as_deref() == Some("true") {
-                    ready = true;
+                if ready(&actor) == "true" {
+                    ready_seen = true;
                 }
             }
-            FrpEvent::ShotTrigger { .. } => seen.push("trigger"),
-            FrpEvent::Launch { .. } => seen.push("launch"),
-            FrpEvent::FlightResult { .. } => seen.push("flight"),
-            FrpEvent::ClubPath { .. } => seen.push("club"),
-            FrpEvent::ShotFinished { .. } => {
+            FrpBody::ShotTrigger(_) => seen.push("trigger"),
+            FrpBody::ShotLaunch(_) => seen.push("launch"),
+            FrpBody::ShotFlight(_) => seen.push("flight"),
+            FrpBody::ShotClub(_) => seen.push("club"),
+            FrpBody::ShotFinished(_) => {
                 seen.push("finished");
                 break;
             }
             _ => {}
         }
-        if ready && !pushed {
+        if ready_seen && !pushed {
             assert!(identity.is_some(), "identity before the first shot");
             todo.send(Do::Shot(Shot::xi_full_swing())).expect("push");
             pushed = true;
         }
     }
     assert_eq!(seen, ["trigger", "launch", "flight", "club", "finished"]);
-    let (model, firmware) = identity.expect("identity telemetry");
+    let (model, firmware) = identity.expect("identity in the device block");
     assert_eq!(model.as_deref(), Some("Xi"));
     assert_eq!(firmware.as_deref(), Some("3.18 (Jan 1 2020)"));
 
-    // The device drops the connection: not ready, a lost-connection alert,
+    // The device drops the connection: `not_armed`, a lost-connection alert,
     // then the driver reconnects and arms again.
     todo.send(Do::Hang).expect("hang");
     let mut states = Vec::new();
     let mut lost = false;
-    // (The shot's own `ready=true` may still be on its way.)
+    // (The shot's own re-arm may still be on its way.)
     let reconnected = |states: &[String]| {
         states
             .iter()
@@ -170,23 +182,16 @@ fn a_controller_reads_an_xi_shot_and_the_driver_reconnects() {
     };
     while !(lost && reconnected(&states)) {
         assert!(Instant::now() < give_up, "saw {states:?}");
-        match conn.recv().expect("recv") {
-            FrpMessage::Envelope(env) => {
-                if let FrpEvent::DeviceTelemetry {
-                    telemetry: Some(t), ..
-                } = env.event
-                    && let Some(r) = t.get("ready")
-                {
-                    states.push(r.clone());
-                }
-            }
-            // The driver's alert about the loss; the server relays it as a
-            // protocol alert.
-            FrpMessage::Protocol(FrpProtocolMessage::Alert { message, .. }) => {
-                assert!(message.contains("closed"), "{message}");
+        let msg = conn.recv().expect("recv");
+        assert_eq!(msg.from, ACTOR);
+        match msg.body {
+            FrpBody::BusActor(actor) => states.push(ready(&actor)),
+            // The driver's alert about the loss, under the actor's id.
+            FrpBody::BusAlert(alert) => {
+                assert!(alert.message.contains("closed"), "{}", alert.message);
                 lost = true;
             }
-            FrpMessage::Protocol(_) => {}
+            _ => {}
         }
     }
 

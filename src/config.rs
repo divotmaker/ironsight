@@ -29,7 +29,7 @@
 use std::net::SocketAddr;
 
 use flightrelay::config::{ConfigError, DriverConfig, is_default};
-use flightrelay::{DetectionMode, Distance};
+use flightrelay::{Distance, Mode};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::config::{
@@ -144,7 +144,7 @@ pub enum SpinSource {
     /// axis; otherwise it goes out alone, with no axis. A shot without an
     /// early-result spin keeps the full result's.
     E8,
-    /// The `E8` rule when the detection mode at the trigger is full swing,
+    /// The `E8` rule when the mode at the trigger is full swing,
     /// otherwise `D4`.
     Auto,
 }
@@ -260,11 +260,11 @@ impl Config {
 
     /// The Mevo+ or Gen2 detection mode for `mode`.
     #[must_use]
-    pub fn mevo_mode(&self, mode: DetectionMode) -> u8 {
+    pub fn mevo_mode(&self, mode: Mode) -> u8 {
         match mode {
-            DetectionMode::Full => self.full_swing_mode(),
-            DetectionMode::Putting => MODE_PUTTING,
-            DetectionMode::Chipping => MODE_CHIPPING,
+            Mode::Full => self.full_swing_mode(),
+            Mode::Putting => MODE_PUTTING,
+            Mode::Chipping => MODE_CHIPPING,
         }
     }
 
@@ -272,7 +272,7 @@ impl Config {
     /// configuration: the detection mode, ball type, track percentage, tee
     /// height and radar calibration.
     #[must_use]
-    pub fn mevo_settings(&self, mode: DetectionMode) -> AvrSettings {
+    pub fn mevo_settings(&self, mode: Mode) -> AvrSettings {
         let track = self.track_pct.unwrap_or(DEFAULT_TRACK_PCT);
         MevoSettings::new(
             self.mevo_mode(mode),
@@ -287,7 +287,7 @@ impl Config {
     /// The Mevo+ or Gen2 settings for a mode change: the detection mode
     /// alone.
     #[must_use]
-    pub fn mevo_mode_settings(&self, mode: DetectionMode) -> AvrSettings {
+    pub fn mevo_mode_settings(&self, mode: Mode) -> AvrSettings {
         AvrSettings::mode_only(self.mevo_mode(mode))
     }
 
@@ -295,12 +295,10 @@ impl Config {
     /// or the pitching shot type for chipping and putting, with the radar
     /// calibration.
     #[must_use]
-    pub fn xi_settings(&self, mode: DetectionMode) -> XiSettings {
+    pub fn xi_settings(&self, mode: Mode) -> XiSettings {
         match mode {
-            DetectionMode::Full => XiSettings::full_swing(self.full_swing_mode(), self.radar_cal()),
-            DetectionMode::Chipping | DetectionMode::Putting => {
-                XiSettings::pitching(self.radar_cal())
-            }
+            Mode::Full => XiSettings::full_swing(self.full_swing_mode(), self.radar_cal()),
+            Mode::Chipping | Mode::Putting => XiSettings::pitching(self.radar_cal()),
         }
     }
 
@@ -308,23 +306,23 @@ impl Config {
     /// to the device, for log lines: e.g. `"limited-flight(9)"` or
     /// `"pitching limited-flight(9)"`.
     #[must_use]
-    pub fn wire_label(&self, model: DeviceModel, mode: DetectionMode) -> &'static str {
+    pub fn wire_label(&self, model: DeviceModel, mode: Mode) -> &'static str {
         let outdoor = self.environment() == FlightScopeEnvironment::Outdoor;
         match (model, mode, outdoor) {
-            (DeviceModel::Xi, DetectionMode::Full, false) => "full-swing limited-flight(9)",
-            (DeviceModel::Xi, DetectionMode::Full, true) => "full-swing outdoor(8)",
+            (DeviceModel::Xi, Mode::Full, false) => "full-swing limited-flight(9)",
+            (DeviceModel::Xi, Mode::Full, true) => "full-swing outdoor(8)",
             (DeviceModel::Xi, _, _) => "pitching limited-flight(9)",
-            (DeviceModel::Mevo, DetectionMode::Full, false) => "limited-flight(9)",
-            (DeviceModel::Mevo, DetectionMode::Full, true) => "outdoor(8)",
-            (DeviceModel::Mevo, DetectionMode::Putting, _) => "putting(3)",
-            (DeviceModel::Mevo, DetectionMode::Chipping, _) => "chipping(5)",
+            (DeviceModel::Mevo, Mode::Full, false) => "limited-flight(9)",
+            (DeviceModel::Mevo, Mode::Full, true) => "outdoor(8)",
+            (DeviceModel::Mevo, Mode::Putting, _) => "putting(3)",
+            (DeviceModel::Mevo, Mode::Chipping, _) => "chipping(5)",
         }
     }
 
     /// Whether moving from `from` to `to` changes what is sent to a `model`.
     /// On the Xi, chipping and putting select the same session.
     #[must_use]
-    pub fn changes_wire(&self, model: DeviceModel, from: DetectionMode, to: DetectionMode) -> bool {
+    pub fn changes_wire(&self, model: DeviceModel, from: Mode, to: Mode) -> bool {
         match model {
             DeviceModel::Xi => self.xi_settings(from) != self.xi_settings(to),
             DeviceModel::Mevo => from != to,
@@ -464,19 +462,19 @@ mod tests {
             environment: Some(FlightScopeEnvironment::Outdoor),
             ..Config::default()
         };
-        assert_eq!(limited.mevo_settings(DetectionMode::Full).mode, 9);
-        assert_eq!(outdoor.mevo_settings(DetectionMode::Full).mode, 8);
+        assert_eq!(limited.mevo_settings(Mode::Full).mode, 9);
+        assert_eq!(outdoor.mevo_settings(Mode::Full).mode, 8);
         for c in [&limited, &outdoor] {
-            assert_eq!(c.mevo_mode_settings(DetectionMode::Chipping).mode, 5);
-            assert_eq!(c.mevo_mode_settings(DetectionMode::Putting).mode, 3);
-            assert_eq!(c.mevo_settings(DetectionMode::Putting).mode, 3);
+            assert_eq!(c.mevo_mode_settings(Mode::Chipping).mode, 5);
+            assert_eq!(c.mevo_mode_settings(Mode::Putting).mode, 3);
+            assert_eq!(c.mevo_settings(Mode::Putting).mode, 3);
         }
         assert_eq!(
-            limited.wire_label(DeviceModel::Mevo, DetectionMode::Full),
+            limited.wire_label(DeviceModel::Mevo, Mode::Full),
             "limited-flight(9)"
         );
         assert_eq!(
-            outdoor.wire_label(DeviceModel::Mevo, DetectionMode::Chipping),
+            outdoor.wire_label(DeviceModel::Mevo, Mode::Chipping),
             "chipping(5)"
         );
     }
@@ -491,26 +489,15 @@ mod tests {
                 environment: Some(env),
                 ..Config::default()
             };
-            for mode in [DetectionMode::Chipping, DetectionMode::Putting] {
+            for mode in [Mode::Chipping, Mode::Putting] {
                 let xi = c.xi_settings(mode);
                 assert_eq!(xi.mode, MODE_LIMITED_FLIGHT);
                 assert_eq!(xi.shot_type, XiShotType::Pitching);
             }
-            assert!(!c.changes_wire(
-                DeviceModel::Xi,
-                DetectionMode::Chipping,
-                DetectionMode::Putting
-            ));
-            assert!(c.changes_wire(DeviceModel::Xi, DetectionMode::Full, DetectionMode::Putting));
-            assert!(c.changes_wire(
-                DeviceModel::Mevo,
-                DetectionMode::Chipping,
-                DetectionMode::Putting
-            ));
-            assert_eq!(
-                c.xi_settings(DetectionMode::Full).shot_type,
-                XiShotType::FullSwing
-            );
+            assert!(!c.changes_wire(DeviceModel::Xi, Mode::Chipping, Mode::Putting));
+            assert!(c.changes_wire(DeviceModel::Xi, Mode::Full, Mode::Putting));
+            assert!(c.changes_wire(DeviceModel::Mevo, Mode::Chipping, Mode::Putting));
+            assert_eq!(c.xi_settings(Mode::Full).shot_type, XiShotType::FullSwing);
         }
     }
 
@@ -523,11 +510,8 @@ mod tests {
         };
         let cal = c.radar_cal();
         assert_eq!((cal.range_mm, cal.height_mm), (3048, 25));
-        assert_eq!(
-            Some(cal.clone()),
-            c.mevo_settings(DetectionMode::Full).radar_cal
-        );
-        assert_eq!(cal, c.xi_settings(DetectionMode::Chipping).radar_cal);
+        assert_eq!(Some(cal.clone()), c.mevo_settings(Mode::Full).radar_cal);
+        assert_eq!(cal, c.xi_settings(Mode::Chipping).radar_cal);
         let cal = Config::default().radar_cal();
         assert_eq!((cal.range_mm, cal.height_mm), (2438, 0));
     }

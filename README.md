@@ -21,8 +21,8 @@ non-blocking clients share the same `poll()` pattern:
 - **`driver::Mevo`** — a device driver for the
   [Flight Relay Protocol](https://github.com/flightrelay/spec) SDK's driver
   contract (`driver` feature): connect, configure, arm, reconnect and report
-  shots as FRP events. The `ironsight-frp` binary (`frp` feature) serves it to
-  FRP controllers over WebSocket.
+  shots as FRP messages. The `ironsight-frp` binary (`frp` feature) runs it as
+  a launch monitor actor on an FRP bus over WebSocket.
 
 Both clients are generic over any `Read + Write` stream. Blocking convenience
 wrappers and low-level sequencer state machines are also available. No async
@@ -256,7 +256,7 @@ function runs any sequencer to completion on a blocking stream. See
 ### Device driver and FRP binary
 
 Three features build on the [flightrelay](https://crates.io/crates/flightrelay)
-SDK (0.5, FRP 0.2.0):
+SDK (0.6, FRP 0.3.0):
 
 - **`config`**: `ironsight::config::Config`, the driver's settings as a serde
   struct (flightrelay's `DriverConfig`), with `validate()` and the mapping to
@@ -266,48 +266,53 @@ SDK (0.5, FRP 0.2.0):
   Mevo+, Gen2 and Xi, and `driver::convert` (shot results to FRP types).
 - **`frp`**: the `ironsight-frp` binary.
 
-The driver configures the device for the detected model in the detection mode
-the host has latched, and re-arms it when a controller's
-`set_detection_mode` changes what is sent to the device (on the Xi, chipping
-and putting are one session). Full swing runs in mode 9 (limited flight) or 8
-(`environment = "outdoor"`); on the Xi, chipping and putting use the pitching
-shot type. The radar has no club or handedness setting.
+The driver configures the device for the detected model in the mode of the
+current `golfer.turn` (full swing before any turn or when the turn gives no
+mode), and re-arms it when a new turn's mode changes what is sent to the
+device (on the Xi, chipping and putting are one session). A turn without a
+mode keeps the mode the device has. Full swing runs in mode 9 (limited
+flight) or 8 (`environment = "outdoor"`); on the Xi, chipping and putting use
+the pitching shot type. The radar has no club or handedness setting.
 
 What it sends:
 
-- **Identity:** manufacturer `FlightScope`, model `Mevo+`, `Mevo Gen2` or
-  `Xi`, firmware from the AVR device info (version and build date). The FRP
-  `device` id is the Mevo's WiFi SSID, or `FlightScope Xi (<address>)`
-  (`FlightScope Mevo (<address>)` for a Mevo that reports no SSID). No
-  `label` is set, so the card text is manufacturer and model
-  (`FlightScope Xi`).
-- **Telemetry:** `ready`, `tilt`, `roll`, and on the Mevo+ `battery_pct`,
-  `temp_c` and `external_power` (the Gen2's and Xi's status layout has no
+- **Identity** (the `device` block of the actor's `bus.actor`):
+  manufacturer `FlightScope`, model `Mevo+`, `Mevo Gen2` or `Xi`, firmware
+  from the AVR device info (version and build date). The device's own id,
+  for the host's logs only, is the Mevo's WiFi SSID, or
+  `FlightScope Xi (<address>)` (`FlightScope Mevo (<address>)` for a Mevo
+  that reports no SSID); it never goes on the bus. No `label` is set, so the
+  card text is manufacturer and model (`FlightScope Xi`).
+- **Status** (`bus.actor`): the `not_armed` blocker until the device is
+  armed and from each trigger until it re-arms (no blockers while armed),
+  tilt and roll, and on the Mevo+ the battery charge and the `temp_c` and
+  `external_power` telemetry keys (the Gen2's and Xi's status layout has no
   decoded values for them, so they are left out).
-- **Shots:** `shot_trigger` with a timestamp, then `launch` and
-  `flight_result` (`basis: modeled`: carry, offline, apex, flight time,
+- **Shots:** `shot.trigger` with a timestamp, then `shot.launch` and
+  `shot.flight` (`basis: modeled`: carry, offline, apex, flight time,
   descent, and total and roll when the device reports them) as soon as the
-  full result (`D4`) arrives, `club_path` once the shot has a ball, and
-  `shot_finished` when the device is done. Each goes out once.
+  full result (`D4`) arrives, `shot.club` once the shot has a ball, and
+  `shot.finished` when the device is done. Each goes out once.
   - A launch-only full result (no spin and no flight, launched at 5° or more,
-    as the Xi sends for very short chips) sends a `launch` without spin and no
-    `flight_result`. Below 5° the same result is a ball that stayed on the
-    ground, and goes out as measured (apex 0).
+    as the Xi sends for very short chips) sends a `shot.launch` without spin
+    and no `shot.flight`. Below 5° the same result is a ball that stayed on
+    the ground, and goes out as measured (apex 0).
   - Without a full result, the early result (`E8`) makes the shot when
-    `use_estimated = true`; a shot the device did not read raises an alert
-    and sends no ball.
+    `use_estimated = true`; a shot the device did not read raises a
+    `bus.alert` and sends no ball.
   - Xi only, `spin_source`: `d4` (the default, the spin FS Golf displays),
     `e8` (the early result's total spin, split by the full result's axis when
     the shot has club data, otherwise sent alone with no axis) or `auto`
     (`e8` in full swing). It applies without a new session.
-- **Raw frames** when a controller asks for them, once the handshake is
+- **Raw frames** (`shot.raw`) when the host's configuration turns them on
+  (`frp.raw_frames = true` for `ironsight-frp`), once the handshake is
   done: one message each, the payload as `data` and `"<type> <src>><dst>"`
   as `label` (e.g. `"D4 AVR>APP"`). The handshake's messages, those that can
   identify the unit, its network or the host (`protocol::carries_identity`),
   and the device's free text (`0xE3`) and DSP debug output (`0xF0`) are never
   sent; they go to the host's log as hex trace lines.
 
-A message the driver cannot decode raises an alert naming the error (never
+A message the driver cannot decode raises a `bus.alert` naming the error (never
 the message's bytes, which go to the trace log) and the session goes on.
 A closed connection, an operation timeout or 10 s without a message ends the
 session, and the host reconnects (1 s, growing by 1 s per failed attempt to
@@ -320,11 +325,14 @@ ironsight-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
               [--set <key>=<value>]... [--log <info|debug|trace>] [--help]
 ```
 
-- `--config`: a TOML file with the settings below at the top level.
-- `--set key=value`: one setting, over the file; repeatable.
-- `--target`: an address to listen on for controllers (default
-  `0.0.0.0:5880`; several controllers at once), or a `ws://` URL of a
-  controller to dial, such as flighthook.
+- `--config`: a TOML file with the settings below at the top level, and the
+  runner's own settings in an `[frp]` table: `actor_id` (the actor's id on
+  the bus; generated and written into the file on the first run, so it stays
+  the same across restarts) and `raw_frames` (default `false`).
+- `--set key=value`: one setting, over the file; repeatable
+  (`--set frp.raw_frames=true` for a runner setting).
+- `--target`: an address to listen on for peers (default `0.0.0.0:5880`;
+  several at once), or a `ws://` URL of a hub to dial, such as flighthook.
 - `--log`: the lowest level of the driver's log lines on stderr (default
   `info`).
 - `--help`: usage and every setting with its default.
@@ -343,7 +351,7 @@ ironsight-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
 | `spin_source` | `d4` | Xi: `e8` or `auto` |
 
 ```sh
-# Mevo+ at the default address, serve controllers on port 5880
+# Mevo+ at the default address, listen for peers on port 5880
 cargo run --features frp --bin ironsight-frp
 
 # Another address, bridged to flighthook
@@ -389,6 +397,6 @@ Minimal by design:
 - **`serde`** (optional, `serde` feature) — serialization support
 - **`serde_json`** (optional, `gvp` feature) — camera protocol support
 - **`flightrelay`** (optional, `config`, `driver` and `frp` features) — FRP
-  driver contract, settings and server
+  driver contract, settings and launch monitor actor host
 
 No async runtime. No logging framework. Standard library TCP only.
