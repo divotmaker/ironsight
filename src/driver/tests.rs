@@ -68,13 +68,36 @@ impl Run {
         driver.connect_with(&mut ctx, stream)
     }
 
-    fn poll<S: Read + Write>(&mut self, session: &mut MevoSession<S>) -> Result<(), Error> {
+    /// Handshake as [`Mevo::connect`] does, with the handshake begun at
+    /// `started` and sleeping `idle_sleep` between passes that bring nothing.
+    fn open<S: Read + Write>(
+        &mut self,
+        driver: &mut Mevo,
+        stream: S,
+        started: Instant,
+        idle_sleep: Duration,
+    ) -> Result<MevoSession<S>, Error> {
+        let stop = Stop::new();
+        let mut host = Host(full());
         let events = &mut self.events;
         let mut sink = |e| events.push(e);
-        session.poll(
-            Duration::from_millis(10),
-            &mut Events::new(&mut sink, &self.flags),
-        )
+        let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &self.flags), &mut host);
+        let addr = driver.config.socket_addr().expect("address");
+        driver.open(&mut ctx, stream, addr, started, idle_sleep)
+    }
+
+    fn poll<S: Read + Write>(&mut self, session: &mut MevoSession<S>) -> Result<(), Error> {
+        self.poll_for(session, Duration::from_millis(10))
+    }
+
+    fn poll_for<S: Read + Write>(
+        &mut self,
+        session: &mut MevoSession<S>,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        let events = &mut self.events;
+        let mut sink = |e| events.push(e);
+        session.poll(timeout, &mut Events::new(&mut sink, &self.flags))
     }
 
     /// Poll until an event matching `pred` arrives (10 s at most).
@@ -225,6 +248,11 @@ fn raw_frames(events: &[DeviceEvent]) -> Vec<&flightrelay::RawFrame> {
 
 fn driver(config: Config) -> Mevo {
     Mevo::new(config).expect("valid config")
+}
+
+/// The instant `d` before now.
+fn ago(d: Duration) -> Instant {
+    Instant::now().checked_sub(d).expect("clock past the epoch")
 }
 
 fn full() -> TurnHints {
@@ -879,6 +907,8 @@ fn a_closed_connection_ends_the_session() {
     );
 }
 
+/// Silence alone keeps the session until ten seconds have passed since the
+/// last message; then a poll ends it, also one with a zero timeout.
 #[test]
 fn a_silent_device_ends_the_session_after_ten_seconds() {
     let mut run = Run::new();
@@ -888,16 +918,13 @@ fn a_silent_device_ends_the_session_after_ten_seconds() {
     let mut session = run.connect(&mut mevo, line, full()).expect("connect");
     run.armed(&mut session);
     silent.set(true);
-    let start = Instant::now();
-    let err = loop {
-        if let Err(e) = run.poll(&mut session) {
-            break e;
-        }
-        assert!(start.elapsed() < Duration::from_secs(15), "never ended");
-    };
+    session.last_event = ago(STALE_TIMEOUT / 2);
+    run.poll(&mut session).expect("not stale yet");
+    session.last_event = ago(STALE_TIMEOUT);
+    let err = run
+        .poll_for(&mut session, Duration::ZERO)
+        .expect_err("stale");
     assert!(matches!(err, Error::Stale), "{err:?}");
-    let took = start.elapsed();
-    assert!(took >= Duration::from_secs(9), "{took:?}");
 }
 
 #[test]
@@ -1157,30 +1184,6 @@ fn a_short_identity_frame_raises_an_alert_without_its_bytes() {
 
 // -- Staleness ---------------------------------------------------------------
 
-#[test]
-fn a_zero_timeout_poll_on_a_silent_device_ends_the_session_after_ten_seconds() {
-    let mut run = Run::new();
-    let mut mevo = driver(Config::default());
-    let device = FakeDevice::xi();
-    let (line, silent, _) = Line::new(&device);
-    let mut session = run.connect(&mut mevo, line, full()).expect("connect");
-    run.armed(&mut session);
-    silent.set(true);
-    let start = Instant::now();
-    let err = loop {
-        let events = &mut run.events;
-        let mut sink = |e| events.push(e);
-        if let Err(e) = session.poll(Duration::ZERO, &mut Events::new(&mut sink, &run.flags)) {
-            break e;
-        }
-        assert!(start.elapsed() < Duration::from_secs(15), "never ended");
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    assert!(matches!(err, Error::Stale), "{err:?}");
-    let took = start.elapsed();
-    assert!(took >= Duration::from_secs(9), "{took:?}");
-}
-
 /// A stream that answers every read with one frame that does not decode (a
 /// 3-byte AVR status) and swallows writes; counts the reads.
 struct Garbage {
@@ -1222,15 +1225,15 @@ fn a_handshake_that_gets_only_undecodable_frames_goes_stale_without_spinning() {
         frame,
         reads: Rc::clone(&reads),
     };
-    let start = Instant::now();
-    let err = run.connect(&mut mevo, garbage, full()).expect_err("stale");
-    let took = start.elapsed();
+    // Begun all but 200 ms of the stale timeout ago.
+    let started = ago(STALE_TIMEOUT - Duration::from_millis(200));
+    let err = run
+        .open(&mut mevo, garbage, started, IDLE_SLEEP)
+        .expect_err("stale");
     assert!(matches!(err, Error::Stale), "{err:?}");
-    assert!(took >= Duration::from_secs(9), "{took:?}");
-    assert!(took < Duration::from_secs(15), "{took:?}");
-    // One bad frame per idle sleep: about 500 in 10 s, not a busy loop.
-    assert!(reads.get() <= 700, "{} reads", reads.get());
-    assert!(alerts(&run.events).len() <= 700);
+    // One bad frame per idle sleep: about 10 in 200 ms, not a busy loop.
+    assert!(reads.get() <= 50, "{} reads", reads.get());
+    assert!(alerts(&run.events).len() <= 50);
 }
 
 // -- A trigger while a shot is open ------------------------------------------
@@ -1799,100 +1802,90 @@ fn phases(events: &[DeviceEvent]) -> Vec<&'static str> {
 /// A Fusion setup the device never finishes, or refuses, raises one alert
 /// and one warning with the step; the session carries on armed and ready,
 /// the Fusion config is not sent again, and the next shot is reported.
+/// Each step's name is covered by the client tests; here one unanswered and
+/// one refused step, one in each Fusion mode.
 #[test]
 fn a_fusion_camera_setup_the_device_does_not_finish_alerts_and_the_session_carries_on() {
-    let faults = [
-        (CameraFault::Ignore(0x82), "camera config ack", "no answer"),
+    let cases = [
         (
+            CameraMode::Fusion,
             CameraFault::Ignore(0x83),
             "camera config readback",
             "no answer",
         ),
-        (CameraFault::Ignore(0x81), "camera start ack", "no answer"),
         (
-            CameraFault::Ignore(0xBF),
-            "camera parameter ack",
-            "no answer",
-        ),
-        (
-            CameraFault::Refuse(0x82),
-            "camera config ack",
-            "refused: PI 0x94 021202",
-        ),
-        (
+            CameraMode::RawFusion,
             CameraFault::Refuse(0x81),
             "camera start ack",
             "refused: PI 0x94 021201",
         ),
     ];
-    for mode in [CameraMode::Fusion, CameraMode::RawFusion] {
-        for (fault, step, how) in faults {
-            let mut run = Run::new();
-            let mut mevo = driver(Config {
-                camera_mode: Some(mode),
-                ..Config::default()
-            });
-            let device = FakeDevice::mevo_plus();
-            let mut session = run
-                .connect(&mut mevo, device.clone(), full())
-                .expect("connect");
-            run.armed(&mut session);
-            let cam = match mode {
-                CameraMode::Fusion => CamConfig::fusion_preset(),
-                _ => CamConfig::raw_fusion_preset(),
-            }
-            .encode();
-            let fusion_configs = |device: &FakeDevice| {
-                device
-                    .sent()
-                    .iter()
-                    .filter(|f| f.dest == BusAddr::Pi && f.type_id == 0x82 && f.payload == cam)
-                    .count()
-            };
-
-            device.set_camera_fault(Some(fault));
-            session.client.set_camera_setup_timeout(CAMERA_GIVE_UP);
-            session.warmup = Duration::ZERO;
-            let start = run.events.len();
-            run.poll_until(&mut session, |e| {
-                matches!(e, DeviceEvent::Frp(FrpBody::BusAlert(_)))
-            });
-            run.armed(&mut session);
-
-            let events = &run.events[start..];
-            assert_eq!(
-                alerts(events),
-                [
-                    "The Mevo+ didn't finish the Fusion camera setup, so it stays in standard camera mode. Check that the Pro Package is on, or try the other Fusion camera mode."
-                ],
-                "{mode:?} {fault:?}"
-            );
-            let warned = warns(events, "did not finish");
-            assert_eq!(warned.len(), 1, "{mode:?} {fault:?}");
-            assert!(warned[0].contains(step), "{}", warned[0]);
-            assert!(warned[0].contains(how), "{}", warned[0]);
-            assert_eq!(
-                phases(events),
-                ["configuring", "measuring"],
-                "{mode:?} {fault:?}"
-            );
-            assert_eq!(fusion_configs(&device), 1);
-            assert!(!device.sent().is_empty() && arms(&device) == 2);
-
-            // No retry, no error, and a shot still goes through.
-            for _ in 0..10 {
-                run.poll(&mut session).expect("poll");
-            }
-            assert_eq!(fusion_configs(&device), 1);
-            device.set_camera_fault(None);
-            let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
-            assert_eq!(
-                kinds(&shot),
-                ["trigger", "launch", "flight", "club", "finished"],
-                "{mode:?} {fault:?}"
-            );
-            assert_eq!(alerts(&run.events[start..]).len(), 1);
+    for (mode, fault, step, how) in cases {
+        let mut run = Run::new();
+        let mut mevo = driver(Config {
+            camera_mode: Some(mode),
+            ..Config::default()
+        });
+        let device = FakeDevice::mevo_plus();
+        let mut session = run
+            .connect(&mut mevo, device.clone(), full())
+            .expect("connect");
+        run.armed(&mut session);
+        let cam = match mode {
+            CameraMode::Fusion => CamConfig::fusion_preset(),
+            _ => CamConfig::raw_fusion_preset(),
         }
+        .encode();
+        let fusion_configs = |device: &FakeDevice| {
+            device
+                .sent()
+                .iter()
+                .filter(|f| f.dest == BusAddr::Pi && f.type_id == 0x82 && f.payload == cam)
+                .count()
+        };
+
+        device.set_camera_fault(Some(fault));
+        session.client.set_camera_setup_timeout(CAMERA_GIVE_UP);
+        session.warmup = Duration::ZERO;
+        let start = run.events.len();
+        run.poll_until(&mut session, |e| {
+            matches!(e, DeviceEvent::Frp(FrpBody::BusAlert(_)))
+        });
+        run.armed(&mut session);
+
+        let events = &run.events[start..];
+        assert_eq!(
+            alerts(events),
+            [
+                "The Mevo+ didn't finish the Fusion camera setup, so it stays in standard camera mode. Check that the Pro Package is on, or try the other Fusion camera mode."
+            ],
+            "{mode:?} {fault:?}"
+        );
+        let warned = warns(events, "did not finish");
+        assert_eq!(warned.len(), 1, "{mode:?} {fault:?}");
+        assert!(warned[0].contains(step), "{}", warned[0]);
+        assert!(warned[0].contains(how), "{}", warned[0]);
+        assert_eq!(
+            phases(events),
+            ["configuring", "measuring"],
+            "{mode:?} {fault:?}"
+        );
+        assert_eq!(fusion_configs(&device), 1);
+        assert!(!device.sent().is_empty() && arms(&device) == 2);
+
+        // No retry, no error, and a shot still goes through.
+        for _ in 0..10 {
+            run.poll(&mut session).expect("poll");
+        }
+        assert_eq!(fusion_configs(&device), 1);
+        device.set_camera_fault(None);
+        let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
+        assert_eq!(
+            kinds(&shot),
+            ["trigger", "launch", "flight", "club", "finished"],
+            "{mode:?} {fault:?}"
+        );
+        assert_eq!(alerts(&run.events[start..]).len(), 1);
     }
 }
 

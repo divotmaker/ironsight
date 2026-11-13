@@ -1124,8 +1124,8 @@ mod tests {
         /// AVR status polls refused (0x94 `[02 30 2A]`) before the first
         /// answer, as after power-on.
         avr_boot_nacks: usize,
-        /// Refuse the DSP query instead of leaving it unanswered.
-        nack_dsp_query: bool,
+        /// Leave the DSP query unanswered instead of refusing it.
+        ignore_dsp_query: bool,
     }
 
     impl XiState {
@@ -1140,8 +1140,8 @@ mod tests {
         }
 
         /// Answer one request as the scripted Xi. Nothing addressed to the
-        /// PI is answered, and neither is the DSP query (0x48), so the DSP
-        /// query timeout path is exercised.
+        /// PI is answered; the DSP query (0x48) is refused, as the Xi does,
+        /// unless `ignore_dsp_query` leaves it to its timeout.
         fn respond(&mut self, f: &RawFrame) {
             let p = &f.payload;
             if let Some(i) = self
@@ -1168,7 +1168,7 @@ mod tests {
                     self.push(BusAddr::Avr, 0x94, vec![0x02, 0x30, 0x2A]);
                 }
                 (BusAddr::Avr, 0xAA) => self.push(BusAddr::Avr, 0xAA, xi_avr_status()),
-                (BusAddr::Dsp, 0x48) if self.nack_dsp_query => {
+                (BusAddr::Dsp, 0x48) if !self.ignore_dsp_query => {
                     self.push(BusAddr::Dsp, 0x94, vec![0x02, 0x40, 0x48]);
                 }
                 (BusAddr::Dsp, 0xBF) => {
@@ -1288,7 +1288,10 @@ mod tests {
 
     #[test]
     fn xi_handshake_configure_arm_and_shot() {
-        let state = Rc::new(RefCell::new(XiState::default()));
+        let state = Rc::new(RefCell::new(XiState {
+            ignore_dsp_query: true,
+            ..XiState::default()
+        }));
         let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
         let mut events = Vec::new();
 
@@ -1431,10 +1434,7 @@ mod tests {
     /// arm.
     #[test]
     fn xi_connect_sequence_wakes_the_dsp_after_its_config_query() {
-        let state = Rc::new(RefCell::new(XiState {
-            nack_dsp_query: true,
-            ..XiState::default()
-        }));
+        let state = Rc::new(RefCell::new(XiState::default()));
         let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
         let mut events = Vec::new();
         client.handshake();
@@ -1506,10 +1506,7 @@ mod tests {
     #[test]
     fn xi_config_nack_of_each_step_type_continues_to_the_arm() {
         let baseline = {
-            let state = Rc::new(RefCell::new(XiState {
-                nack_dsp_query: true,
-                ..XiState::default()
-            }));
+            let state = Rc::new(RefCell::new(XiState::default()));
             connect_and_arm(&state);
             tx_lines(&state.borrow().received)
         };
@@ -1521,7 +1518,6 @@ mod tests {
             (0xB0, "0100"),
         ] {
             let state = Rc::new(RefCell::new(XiState {
-                nack_dsp_query: true,
                 refuse: vec![(BusAddr::Avr, type_id, hex(payload))],
                 ..XiState::default()
             }));
@@ -1552,10 +1548,7 @@ mod tests {
     /// `StepRefused` first, `Configured` on the next poll.
     #[test]
     fn xi_config_nack_of_the_last_step_completes() {
-        let state = Rc::new(RefCell::new(XiState {
-            nack_dsp_query: true,
-            ..XiState::default()
-        }));
+        let state = Rc::new(RefCell::new(XiState::default()));
         let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
         let mut events = Vec::new();
         client.handshake();
@@ -1588,7 +1581,6 @@ mod tests {
     #[test]
     fn xi_dsp_power_mode_nack_continues_to_the_arm() {
         let state = Rc::new(RefCell::new(XiState {
-            nack_dsp_query: true,
             refuse: vec![(BusAddr::Dsp, 0xBF, hex("06000001000001"))],
             ..XiState::default()
         }));
@@ -1616,7 +1608,6 @@ mod tests {
     #[test]
     fn xi_dsp_power_mode_unanswered_continues_to_the_arm() {
         let state = Rc::new(RefCell::new(XiState {
-            nack_dsp_query: true,
             ignore: vec![(BusAddr::Dsp, 0xBF, hex("06000001000001"))],
             ..XiState::default()
         }));
@@ -1656,7 +1647,6 @@ mod tests {
     #[test]
     fn xi_avr_refusing_status_polls_is_re_polled() {
         let state = Rc::new(RefCell::new(XiState {
-            nack_dsp_query: true,
             avr_boot_nacks: 2,
             ..XiState::default()
         }));

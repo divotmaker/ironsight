@@ -169,7 +169,7 @@ impl DeviceDriver for Mevo {
             .map_err(|source| Error::Connect { addr, source })?;
         let _ = stream.set_nodelay(true);
         stream.set_nonblocking(true).map_err(ConnError::Io)?;
-        self.open(ctx, stream, addr)
+        self.open(ctx, stream, addr, Instant::now(), IDLE_SLEEP)
     }
 
     fn apply_config(&mut self, new: &Config) {
@@ -182,7 +182,9 @@ impl Mevo {
     /// Run a whole session on `stream` instead of a TCP connection: the
     /// handshake, then [`MevoSession`] as [`connect`](DeviceDriver::connect)
     /// returns it. `stream` must not block on reads (return `WouldBlock` when
-    /// it has nothing). The Xi's identity uses the configured address.
+    /// it has nothing), and must answer each request at once: the handshake
+    /// polls it without sleeping between passes. The Xi's identity uses the
+    /// configured address.
     ///
     /// # Errors
     ///
@@ -194,15 +196,19 @@ impl Mevo {
         stream: S,
     ) -> Result<MevoSession<S>, Error> {
         let addr = self.config.socket_addr()?;
-        self.open(ctx, stream, addr)
+        self.open(ctx, stream, addr, Instant::now(), Duration::ZERO)
     }
 
-    /// Handshake on `stream` and build the session.
+    /// Handshake on `stream` and build the session. The handshake is stale
+    /// [`STALE_TIMEOUT`] after `started` or its last message, and sleeps
+    /// `idle_sleep` after each pass that brought no event.
     fn open<S: Read + Write>(
         &mut self,
         ctx: &mut ConnectCtx<'_>,
         stream: S,
         addr: SocketAddr,
+        started: Instant,
+        idle_sleep: Duration,
     ) -> Result<MevoSession<S>, Error> {
         let mut conn = BinaryConnection::new(stream);
         let wire = Wire::attach(&mut conn);
@@ -211,7 +217,7 @@ impl Mevo {
         client.handshake();
         ctx.out.phase("handshaking");
 
-        let mut last_event = Instant::now();
+        let mut last_event = started;
         let mut results = LastResults::default();
         let handshake = loop {
             ctx.tick()?;
@@ -249,8 +255,8 @@ impl Mevo {
             if last_event.elapsed() >= STALE_TIMEOUT {
                 return Err(Error::Stale);
             }
-            if idle {
-                std::thread::sleep(IDLE_SLEEP);
+            if idle && !idle_sleep.is_zero() {
+                std::thread::sleep(idle_sleep);
             }
         };
 

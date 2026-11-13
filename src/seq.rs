@@ -2767,12 +2767,12 @@ mod tests {
         let status = env(BusAddr::Avr, 0xAA, status);
 
         for _ in 0..2 {
+            let before = Instant::now();
             assert!(seq.feed(&nack).is_empty());
             // Not before the interval.
             assert!(seq.check_cal_timeout().is_empty());
             let at = seq.repoll_at.expect("re-poll scheduled");
-            let wait = at.saturating_duration_since(Instant::now());
-            assert!(wait + Duration::from_millis(100) > STATUS_REPOLL_INTERVAL);
+            assert!(at >= before + STATUS_REPOLL_INTERVAL);
             seq.repoll_at = Some(Instant::now());
             assert_eq!(sent(&seq.check_cal_timeout()), [(BusAddr::Avr, 0xAA)]);
             // Once per refusal.
