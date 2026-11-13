@@ -155,7 +155,7 @@ fn run() -> Result<(), ConnError> {
         if let Some(env) = conn.recv()? {
             // If a shot sequence is active, feed it first.
             if let Some(ref mut s) = shot {
-                let actions = s.feed(&env);
+                let actions = s.feed(&env, Instant::now());
                 for a in actions {
                     send_action(&mut conn, a)?;
                 }

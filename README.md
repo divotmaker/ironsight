@@ -245,24 +245,31 @@ loop {
 }
 ```
 
+`poll()` reads the clock. `poll_at(now)` takes the time instead: every timer
+of the client (operation deadlines, keepalives, the trigger watchdog, the
+handshake's timed steps) compares against the `now` it is given, so a test
+on an in-memory device steps time instead of waiting for it.
+
 ### Low-level sequencer API
 
 For callers that need full control over the event loop, the `Sequence` trait
 exposes the underlying pollable state machines. Each sequencer has `feed()`
-(accept a message, return commands to send) and `is_complete()`. The `drive()`
+(accept a message and the time it is handled, return commands to send) and
+`is_complete()`; the timed steps (`check_timeout()`, `check_cal_timeout()`,
+`check_drain_timeout()`) take a `now` too, so no sequencer reads a clock. The `drive()`
 function runs any sequencer to completion on a blocking stream. See
 [`examples/event_loop.rs`](examples/event_loop.rs).
 
 ### Device driver and FRP binary
 
 Three features build on the [flightrelay](https://crates.io/crates/flightrelay)
-SDK (0.6, FRP 0.3.0):
+SDK (0.7, FRP 0.3.0):
 
 - **`config`**: `ironsight::config::Config`, the driver's settings as a serde
   struct (flightrelay's `DriverConfig`), with `validate()` and the mapping to
   `MevoSettings` / `XiSettings`. It needs no device stack and builds for
   `wasm32-unknown-unknown`, so a settings form can use it.
-- **`driver`**: `ironsight::driver::Mevo`, flightrelay's `DeviceDriver` for the
+- **`driver`**: `ironsight::driver::Mevo`, flightrelay's `FrpDriver` for the
   Mevo+, Gen2 and Xi, and `driver::convert` (shot results to FRP types).
 - **`frp`**: the `ironsight-frp` binary.
 
@@ -317,6 +324,14 @@ the message's bytes, which go to the trace log) and the session goes on.
 A closed connection, an operation timeout or 10 s without a message ends the
 session, and the host reconnects (1 s, growing by 1 s per failed attempt to
 15 s, back to 1 s after a session that lasted 10 s).
+
+The session follows the SDK's driver contract: the host calls
+`step(now, out)`, which handles what the device sent and what is due at
+`now` and returns at once, and every timer of the session (the 10 s stale
+timeout, keepalives, the camera warmup, the operation deadlines) compares
+against that `now`. The handshake waits through the host
+(`ConnectCtx::now` / `ConnectCtx::wait`). So a test host, such as the SDK's
+`flightrelay::testing::TestHost`, runs a whole session in virtual time.
 
 #### `ironsight-frp`
 
@@ -382,7 +397,11 @@ tests of applications built on ironsight:
 - Payload encoders for test frames: `avr_status`, `dev_info`, `shot_text`,
   `mevo_plus_dsp_status`.
 - With the `driver` feature, `driver::Mevo::connect_with` runs a whole
-  driver session (handshake, configuration, shots) on any of these fakes.
+  driver session (handshake, configuration, shots) on any of these fakes,
+  and `MevoSession::step` drives it. With flightrelay's `testing` feature,
+  its `TestHost` connects and steps the session in virtual time:
+  `host.connect_with(|ctx| mevo.connect_with(ctx, device.clone()))`, then
+  `host.run_for(d, |now, out| session.step(now, out))`.
 
 ```toml
 [dev-dependencies]

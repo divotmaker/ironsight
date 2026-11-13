@@ -3,8 +3,10 @@
 //! Two layers:
 //!
 //! 1. **Sequencers** — pollable state machines ([`Sequence`] trait). Each
-//!    sequencer's `feed()` accepts a received [`Envelope`] and returns
-//!    [`Action`]s to send. Callers own the event loop.
+//!    sequencer's `feed()` accepts a received [`Envelope`] and the time it
+//!    is handled, and returns [`Action`]s to send. The timed steps
+//!    (`check_timeout()` and friends) compare against a `now` the caller
+//!    passes too, so a sequencer reads no clock. Callers own the event loop.
 //!
 //! 2. **Blocking functions** — convenience wrappers that call [`drive()`] to
 //!    run a sequencer to completion on a blocking [`Connection`] (TcpStream).
@@ -65,8 +67,9 @@ pub enum Action {
 /// `is_complete()` indicates the sequence is done. Type-specific `finish()`
 /// methods (not in the trait) extract the result.
 pub trait Sequence {
-    /// Process a received message. Returns actions to send (may be empty).
-    fn feed(&mut self, env: &Envelope) -> Vec<Action>;
+    /// Process a message received at `now`. Returns actions to send (may be
+    /// empty). A sequencer that times a step starts the timer from `now`.
+    fn feed(&mut self, env: &Envelope, now: Instant) -> Vec<Action>;
 
     /// Is the sequence complete?
     fn is_complete(&self) -> bool;
@@ -122,7 +125,7 @@ pub fn drive<S: Read + Write>(
             return Err(ConnError::Timeout);
         }
         if let Some(env) = conn.recv()? {
-            let actions = seq.feed(&env);
+            let actions = seq.feed(&env, Instant::now());
             for a in actions {
                 send_action(conn, a)?;
             }
@@ -322,11 +325,11 @@ impl DspSequencer {
     /// DevInfoReq; a timed-out power-mode write completes the sequence
     /// (check [`is_complete()`](Sequence::is_complete) afterward).
     /// Call this periodically in the event loop.
-    pub fn check_timeout(&mut self) -> Vec<Action> {
+    pub fn check_timeout(&mut self, now: Instant) -> Vec<Action> {
         let Some(deadline) = self.deadline else {
             return vec![];
         };
-        if Instant::now() < deadline {
+        if now < deadline {
             return vec![];
         }
         match self.step {
@@ -353,7 +356,7 @@ impl DspSequencer {
 }
 
 impl Sequence for DspSequencer {
-    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+    fn feed(&mut self, env: &Envelope, now: Instant) -> Vec<Action> {
         if matches!(self.step, DspStep::WaitDspQuery)
             && env.src == BusAddr::Dsp
             && let Message::ConfigNack(ref nack) = env.message
@@ -384,7 +387,7 @@ impl Sequence for DspSequencer {
                 if let Message::DspStatus(ref s) = env.message {
                     self.status = Some(s.clone());
                     self.step = DspStep::WaitDspQuery;
-                    self.deadline = Some(Instant::now() + DSP_QUERY_TIMEOUT);
+                    self.deadline = Some(now + DSP_QUERY_TIMEOUT);
                     return vec![Action::Send(Command::DspQuery, BusAddr::Dsp)];
                 }
                 vec![]
@@ -448,7 +451,7 @@ impl Sequence for DspSequencer {
                         .is_some_and(|d| d.model() == DeviceModel::Xi)
                     {
                         self.step = DspStep::WaitPowerMode;
-                        self.deadline = Some(Instant::now() + DSP_QUERY_TIMEOUT);
+                        self.deadline = Some(now + DSP_QUERY_TIMEOUT);
                         return vec![Action::Send(
                             Command::ParamValue(ParamValue {
                                 param_id: XI_DSP_POWER_MODE_ID,
@@ -580,9 +583,9 @@ impl AvrSequencer {
     /// [`STATUS_REPOLL_INTERVAL`] has passed, and move past an optional cal
     /// step that has gone unanswered. Call this periodically in the event
     /// loop.
-    pub fn check_cal_timeout(&mut self) -> Vec<Action> {
+    pub fn check_cal_timeout(&mut self, now: Instant) -> Vec<Action> {
         if let Some(at) = self.repoll_at
-            && Instant::now() >= at
+            && now >= at
         {
             self.repoll_at = None;
             return vec![Action::Send(
@@ -591,20 +594,20 @@ impl AvrSequencer {
             )];
         }
         if let Some(deadline) = self.cal_deadline
-            && Instant::now() >= deadline
+            && now >= deadline
         {
             self.cal_deadline = None;
-            return self.advance_past_cal();
+            return self.advance_past_cal(now);
         }
         vec![]
     }
 
     /// Skip past the current optional cal step.
-    fn advance_past_cal(&mut self) -> Vec<Action> {
+    fn advance_past_cal(&mut self, now: Instant) -> Vec<Action> {
         match self.step {
             AvrStep::WaitFactoryCal => {
                 self.step = AvrStep::WaitIfCal;
-                self.cal_deadline = Some(Instant::now() + TIMEOUT);
+                self.cal_deadline = Some(now + TIMEOUT);
                 vec![Action::Send(
                     Command::CalParamReq(CalParamReq),
                     BusAddr::Avr,
@@ -630,14 +633,14 @@ impl AvrSequencer {
 }
 
 impl Sequence for AvrSequencer {
-    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+    fn feed(&mut self, env: &Envelope, now: Instant) -> Vec<Action> {
         if matches!(self.step, AvrStep::WaitStatus1 | AvrStep::WaitStatus2)
             && env.src == BusAddr::Avr
             && let Message::ConfigNack(ref nack) = env.message
             && nack.acked_cmd == TYPE_STATUS & 0x7F
         {
             self.repoll_at
-                .get_or_insert_with(|| Instant::now() + STATUS_REPOLL_INTERVAL);
+                .get_or_insert_with(|| now + STATUS_REPOLL_INTERVAL);
             return vec![];
         }
         // Cal steps use a different skip filter (allow ConfigAck through
@@ -716,7 +719,7 @@ impl Sequence for AvrSequencer {
             AvrStep::WaitConfig => {
                 if let Message::ConfigResp(ref r) = env.message {
                     self.config = Some(r.clone());
-                    self.cal_deadline = Some(Instant::now() + TIMEOUT);
+                    self.cal_deadline = Some(now + TIMEOUT);
                     if self.model == DeviceModel::Xi {
                         self.step = AvrStep::WaitIfCal;
                         return vec![Action::Send(
@@ -739,7 +742,7 @@ impl Sequence for AvrSequencer {
                 if let Message::CalDataResp(ref r) = env.message {
                     self.factory_cal = Some(r.clone());
                     self.step = AvrStep::WaitIfCal;
-                    self.cal_deadline = Some(Instant::now() + TIMEOUT);
+                    self.cal_deadline = Some(now + TIMEOUT);
                     return vec![Action::Send(
                         Command::CalParamReq(CalParamReq),
                         BusAddr::Avr,
@@ -869,7 +872,7 @@ impl PiSequencer {
 }
 
 impl Sequence for PiSequencer {
-    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+    fn feed(&mut self, env: &Envelope, _now: Instant) -> Vec<Action> {
         if should_skip_with_mode_ack(env, BusAddr::Pi) {
             return vec![];
         }
@@ -1203,7 +1206,7 @@ impl AvrConfigSequencer {
 }
 
 impl Sequence for AvrConfigSequencer {
-    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+    fn feed(&mut self, env: &Envelope, _now: Instant) -> Vec<Action> {
         if should_skip_with_mode_ack(env, BusAddr::Avr) {
             return vec![];
         }
@@ -1634,7 +1637,7 @@ impl XiConfigSequencer {
 }
 
 impl Sequence for XiConfigSequencer {
-    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+    fn feed(&mut self, env: &Envelope, _now: Instant) -> Vec<Action> {
         let Some((cmd, reply)) = self.steps.get(self.current) else {
             return vec![];
         };
@@ -1759,7 +1762,7 @@ impl CameraConfigSequencer {
 }
 
 impl Sequence for CameraConfigSequencer {
-    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+    fn feed(&mut self, env: &Envelope, _now: Instant) -> Vec<Action> {
         if let Message::ConfigNack(nack) = &env.message
             && env.src == BusAddr::Pi
             && nack.acked_cmd == self.sent_type
@@ -1862,7 +1865,7 @@ impl DisarmSequencer {
 }
 
 impl Sequence for DisarmSequencer {
-    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+    fn feed(&mut self, env: &Envelope, _now: Instant) -> Vec<Action> {
         match self.step {
             DisarmStep::WaitAck => {
                 if env.src != BusAddr::Avr {
@@ -2000,7 +2003,7 @@ impl ArmSequencer {
 }
 
 impl Sequence for ArmSequencer {
-    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+    fn feed(&mut self, env: &Envelope, _now: Instant) -> Vec<Action> {
         match self.step {
             ArmStep::WaitDspStatus => {
                 // Accept DspStatus from DSP (skip noise from other buses)
@@ -2258,12 +2261,12 @@ impl ShotSequencer {
     /// When the drain deadline expires, skip the redundant ShotResultReq
     /// (ClubResult already accumulated during drain) and proceed directly
     /// to ARM.
-    pub fn check_drain_timeout(&mut self) -> Vec<Action> {
+    pub fn check_drain_timeout(&mut self, now: Instant) -> Vec<Action> {
         if !matches!(self.step, ShotStep::Draining) {
             return vec![];
         }
         if let Some(deadline) = self.drain_deadline
-            && Instant::now() >= deadline
+            && now >= deadline
         {
             self.step = ShotStep::WaitingForArmAck;
             return vec![Action::Send(
@@ -2276,7 +2279,7 @@ impl ShotSequencer {
 }
 
 impl Sequence for ShotSequencer {
-    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+    fn feed(&mut self, env: &Envelope, now: Instant) -> Vec<Action> {
         match self.step {
             ShotStep::Draining => {
                 match &env.message {
@@ -2295,7 +2298,7 @@ impl Sequence for ShotSequencer {
                         self.data.flight = Some(r.clone());
                         self.pending = Some(ShotDatum::Flight(r.clone()));
                         if self.drain_deadline.is_none() {
-                            self.drain_deadline = Some(Instant::now() + DRAIN_TIMEOUT);
+                            self.drain_deadline = Some(now + DRAIN_TIMEOUT);
                         }
                     }
                     Message::ClubResult(r) => {
@@ -2441,11 +2444,11 @@ pub fn sync_dsp(conn: &mut Connection) -> Result<DspSync, ConnError> {
         if Instant::now() >= deadline {
             return Err(ConnError::Timeout);
         }
-        for a in seq.check_timeout() {
+        for a in seq.check_timeout(Instant::now()) {
             send_action(conn, a)?;
         }
         if let Some(env) = conn.recv()? {
-            for a in seq.feed(&env) {
+            for a in seq.feed(&env, Instant::now()) {
                 send_action(conn, a)?;
             }
             if seq.is_complete() {
@@ -2476,7 +2479,7 @@ pub fn sync_avr_for(conn: &mut Connection, model: DeviceModel) -> Result<AvrSync
             return Err(ConnError::Timeout);
         }
         // Check cal timeouts
-        let timeout_actions = seq.check_cal_timeout();
+        let timeout_actions = seq.check_cal_timeout(Instant::now());
         for a in timeout_actions {
             send_action(conn, a)?;
         }
@@ -2484,7 +2487,7 @@ pub fn sync_avr_for(conn: &mut Connection, model: DeviceModel) -> Result<AvrSync
             return Ok(seq.into_result());
         }
         if let Some(env) = conn.recv()? {
-            let actions = seq.feed(&env);
+            let actions = seq.feed(&env, Instant::now());
             for a in actions {
                 send_action(conn, a)?;
             }
@@ -2600,6 +2603,16 @@ pub fn complete_shot(conn: &mut Connection, log: impl Fn(&str)) -> Result<ShotDa
 mod tests {
     use super::*;
     use crate::frame::RawFrame;
+    use std::sync::LazyLock;
+
+    /// The tests' time origin: the clock is read once, and a test steps time
+    /// by adding to it.
+    fn t0() -> Instant {
+        static T0: LazyLock<Instant> = LazyLock::new(Instant::now);
+        *T0
+    }
+
+    const MS: Duration = Duration::from_millis(1);
 
     /// Build a device → APP envelope.
     fn env(src: BusAddr, type_id: u8, payload: Vec<u8>) -> Envelope {
@@ -2633,20 +2646,20 @@ mod tests {
     #[test]
     fn dsp_query_nack_moves_on() {
         let (mut seq, _) = DspSequencer::new();
-        assert_eq!(sent(&seq.feed(&dsp_status())), [(BusAddr::Dsp, 0x48)]);
+        assert_eq!(sent(&seq.feed(&dsp_status(), t0())), [(BusAddr::Dsp, 0x48)]);
         let nack = env(BusAddr::Dsp, 0x94, vec![0x02, 0x40, 0x48]);
-        assert_eq!(sent(&seq.feed(&nack)), [(BusAddr::Dsp, 0x67)]);
+        assert_eq!(sent(&seq.feed(&nack, t0())), [(BusAddr::Dsp, 0x67)]);
     }
 
     #[test]
     fn dsp_query_timeout_moves_on() {
         let (mut seq, _) = DspSequencer::new();
-        seq.feed(&dsp_status());
-        assert!(seq.check_timeout().is_empty());
-        seq.deadline = Some(Instant::now());
-        assert_eq!(sent(&seq.check_timeout()), [(BusAddr::Dsp, 0x67)]);
+        seq.feed(&dsp_status(), t0());
+        let due = t0() + DSP_QUERY_TIMEOUT;
+        assert!(seq.check_timeout(due - MS).is_empty());
+        assert_eq!(sent(&seq.check_timeout(due)), [(BusAddr::Dsp, 0x67)]);
         // Only once.
-        assert!(seq.check_timeout().is_empty());
+        assert!(seq.check_timeout(due + MS).is_empty());
     }
 
     /// DSP device info naming the model `text`.
@@ -2660,11 +2673,11 @@ mod tests {
     /// Run a DSP sync up to and including the config query's reply (0xA0);
     /// returns what that reply produced.
     fn dsp_sync_to_config(seq: &mut DspSequencer, model: &[u8; 14]) -> Vec<Action> {
-        assert_eq!(sent(&seq.feed(&dsp_status())), [(BusAddr::Dsp, 0x48)]);
+        assert_eq!(sent(&seq.feed(&dsp_status(), t0())), [(BusAddr::Dsp, 0x48)]);
         let nack = env(BusAddr::Dsp, 0x94, vec![0x02, 0x40, 0x48]);
-        assert_eq!(sent(&seq.feed(&nack)), [(BusAddr::Dsp, 0x67)]);
+        assert_eq!(sent(&seq.feed(&nack, t0())), [(BusAddr::Dsp, 0x67)]);
         assert_eq!(
-            sent(&seq.feed(&dsp_dev_info(model))),
+            sent(&seq.feed(&dsp_dev_info(model), t0())),
             [(BusAddr::Dsp, 0xFD)]
         );
         let prod = |sub| {
@@ -2673,12 +2686,12 @@ mod tests {
             p[1] = sub;
             env(BusAddr::Dsp, 0xFD, p)
         };
-        assert_eq!(sent(&seq.feed(&prod(0))), [(BusAddr::Dsp, 0xFD)]);
-        assert_eq!(sent(&seq.feed(&prod(8))), [(BusAddr::Dsp, 0xFD)]);
-        assert_eq!(sent(&seq.feed(&prod(9))), [(BusAddr::Dsp, 0x21)]);
+        assert_eq!(sent(&seq.feed(&prod(0), t0())), [(BusAddr::Dsp, 0xFD)]);
+        assert_eq!(sent(&seq.feed(&prod(8), t0())), [(BusAddr::Dsp, 0xFD)]);
+        assert_eq!(sent(&seq.feed(&prod(9), t0())), [(BusAddr::Dsp, 0x21)]);
         let mut config = vec![0u8; 69];
         config[0] = 0x44;
-        seq.feed(&env(BusAddr::Dsp, 0xA0, config))
+        seq.feed(&env(BusAddr::Dsp, 0xA0, config), t0())
     }
 
     /// On the Xi the DSP sync ends with the power-mode write (param 0x01 =
@@ -2701,10 +2714,13 @@ mod tests {
             env(BusAddr::Avr, 0x95, hex("02303f")),
             env(BusAddr::Dsp, 0x95, hex("024030")),
         ] {
-            assert!(seq.feed(&other).is_empty());
+            assert!(seq.feed(&other, t0()).is_empty());
             assert!(!seq.is_complete());
         }
-        assert!(seq.feed(&env(BusAddr::Dsp, 0x95, hex("02403f"))).is_empty());
+        assert!(
+            seq.feed(&env(BusAddr::Dsp, 0x95, hex("02403f")), t0())
+                .is_empty()
+        );
         assert!(seq.is_complete());
         assert!(seq.take_refused().is_none());
         let sync = seq.into_result();
@@ -2718,7 +2734,10 @@ mod tests {
     fn xi_dsp_power_mode_nack_completes() {
         let (mut seq, _) = DspSequencer::new();
         dsp_sync_to_config(&mut seq, b"0.38 FS Xi    ");
-        assert!(seq.feed(&env(BusAddr::Dsp, 0x94, hex("02403f"))).is_empty());
+        assert!(
+            seq.feed(&env(BusAddr::Dsp, 0x94, hex("02403f")), t0())
+                .is_empty()
+        );
         assert!(seq.is_complete());
         let refused = seq.take_refused().expect("refusal kept");
         assert_eq!((refused.src, refused.type_id), (BusAddr::Dsp, 0x94));
@@ -2732,10 +2751,10 @@ mod tests {
     fn xi_dsp_power_mode_timeout_completes() {
         let (mut seq, _) = DspSequencer::new();
         dsp_sync_to_config(&mut seq, b"0.38 FS Xi    ");
-        assert!(seq.check_timeout().is_empty());
+        let due = t0() + DSP_QUERY_TIMEOUT;
+        assert!(seq.check_timeout(due - MS).is_empty());
         assert!(!seq.is_complete());
-        seq.deadline = Some(Instant::now());
-        assert!(seq.check_timeout().is_empty());
+        assert!(seq.check_timeout(due).is_empty());
         assert!(seq.is_complete());
         assert!(seq.take_refused().is_none());
         let sync = seq.into_result();
@@ -2766,29 +2785,31 @@ mod tests {
         status[0] = 0x18;
         let status = env(BusAddr::Avr, 0xAA, status);
 
+        let mut t = t0();
         for _ in 0..2 {
-            let before = Instant::now();
-            assert!(seq.feed(&nack).is_empty());
+            assert!(seq.feed(&nack, t).is_empty());
             // Not before the interval.
-            assert!(seq.check_cal_timeout().is_empty());
-            let at = seq.repoll_at.expect("re-poll scheduled");
-            assert!(at >= before + STATUS_REPOLL_INTERVAL);
-            seq.repoll_at = Some(Instant::now());
-            assert_eq!(sent(&seq.check_cal_timeout()), [(BusAddr::Avr, 0xAA)]);
+            t += STATUS_REPOLL_INTERVAL;
+            assert!(seq.check_cal_timeout(t - MS).is_empty());
+            assert_eq!(sent(&seq.check_cal_timeout(t)), [(BusAddr::Avr, 0xAA)]);
             // Once per refusal.
-            assert!(seq.check_cal_timeout().is_empty());
+            t += STATUS_REPOLL_INTERVAL;
+            assert!(seq.check_cal_timeout(t).is_empty());
         }
         // A NACK of another command is not a refused poll.
-        assert!(seq.feed(&env(BusAddr::Avr, 0x94, hex("023023"))).is_empty());
+        assert!(
+            seq.feed(&env(BusAddr::Avr, 0x94, hex("023023")), t)
+                .is_empty()
+        );
         assert!(seq.repoll_at.is_none());
         // The AVR answers: the handshake goes on as normal.
-        assert_eq!(sent(&seq.feed(&status)), [(BusAddr::Avr, 0xAA)]);
-        assert!(seq.feed(&nack).is_empty());
-        seq.repoll_at = Some(Instant::now());
-        assert_eq!(sent(&seq.check_cal_timeout()), [(BusAddr::Avr, 0xAA)]);
-        assert_eq!(sent(&seq.feed(&status)), [(BusAddr::Avr, 0x67)]);
+        assert_eq!(sent(&seq.feed(&status, t)), [(BusAddr::Avr, 0xAA)]);
+        assert!(seq.feed(&nack, t).is_empty());
+        t += STATUS_REPOLL_INTERVAL;
+        assert_eq!(sent(&seq.check_cal_timeout(t)), [(BusAddr::Avr, 0xAA)]);
+        assert_eq!(sent(&seq.feed(&status, t)), [(BusAddr::Avr, 0x67)]);
         // Past the status polls a refused poll schedules nothing.
-        assert!(seq.feed(&nack).is_empty());
+        assert!(seq.feed(&nack, t0()).is_empty());
         assert!(seq.repoll_at.is_none());
     }
 
@@ -2800,10 +2821,10 @@ mod tests {
         let mut status = vec![0u8; 25];
         status[0] = 0x18;
         let status = env(BusAddr::Avr, 0xAA, status);
-        assert_eq!(sent(&seq.feed(&status)), [(BusAddr::Avr, 0xAA)]);
-        assert!(seq.check_cal_timeout().is_empty());
-        assert_eq!(sent(&seq.feed(&status)), [(BusAddr::Avr, 0x67)]);
-        assert!(seq.check_cal_timeout().is_empty());
+        assert_eq!(sent(&seq.feed(&status, t0())), [(BusAddr::Avr, 0xAA)]);
+        assert!(seq.check_cal_timeout(t0()).is_empty());
+        assert_eq!(sent(&seq.feed(&status, t0())), [(BusAddr::Avr, 0x67)]);
+        assert!(seq.check_cal_timeout(t0()).is_empty());
         assert!(seq.repoll_at.is_none());
     }
 
@@ -2819,17 +2840,17 @@ mod tests {
         let mut config = vec![0u8; 69];
         config[0] = 0x44;
 
-        assert_eq!(sent(&seq.feed(&status)), [(BusAddr::Avr, 0xAA)]);
-        assert_eq!(sent(&seq.feed(&status)), [(BusAddr::Avr, 0x67)]);
-        assert_eq!(sent(&seq.feed(&dev_info)), [(BusAddr::Avr, 0x67)]);
-        assert_eq!(sent(&seq.feed(&dev_info)), [(BusAddr::Avr, 0xBE)]);
-        assert_eq!(sent(&seq.feed(&param(0x0C))), [(BusAddr::Avr, 0xBE)]);
-        assert_eq!(sent(&seq.feed(&param(0x0D))), [(BusAddr::Avr, 0x21)]);
+        assert_eq!(sent(&seq.feed(&status, t0())), [(BusAddr::Avr, 0xAA)]);
+        assert_eq!(sent(&seq.feed(&status, t0())), [(BusAddr::Avr, 0x67)]);
+        assert_eq!(sent(&seq.feed(&dev_info, t0())), [(BusAddr::Avr, 0x67)]);
+        assert_eq!(sent(&seq.feed(&dev_info, t0())), [(BusAddr::Avr, 0xBE)]);
+        assert_eq!(sent(&seq.feed(&param(0x0C), t0())), [(BusAddr::Avr, 0xBE)]);
+        assert_eq!(sent(&seq.feed(&param(0x0D), t0())), [(BusAddr::Avr, 0x21)]);
         // ConfigResp → IF cal request, no factory cal.
         let config = env(BusAddr::Avr, 0xA0, config);
-        assert_eq!(sent(&seq.feed(&config)), [(BusAddr::Avr, 0xD0)]);
+        assert_eq!(sent(&seq.feed(&config, t0())), [(BusAddr::Avr, 0xD0)]);
         let if_cal = env(BusAddr::Avr, 0xD1, vec![0u8; 171]);
-        assert!(seq.feed(&if_cal).is_empty());
+        assert!(seq.feed(&if_cal, t0()).is_empty());
         assert!(seq.is_complete());
         let sync = seq.into_result();
         assert!(sync.factory_cal.is_none());
@@ -2842,8 +2863,8 @@ mod tests {
         let (mut seq, _) = AvrSequencer::new_for(DeviceModel::Xi);
         seq.step = AvrStep::WaitIfCal;
         seq.status = Some(AvrStatus::decode(&[0u8; 25]).unwrap());
-        seq.cal_deadline = Some(Instant::now());
-        assert!(seq.check_cal_timeout().is_empty());
+        seq.cal_deadline = Some(t0());
+        assert!(seq.check_cal_timeout(t0()).is_empty());
         assert!(seq.is_complete());
     }
 
@@ -2851,27 +2872,27 @@ mod tests {
     fn xi_arm_waits_for_armed_text_only() {
         let (mut seq, actions) = ArmSequencer::new_for(DeviceModel::Xi);
         assert_eq!(sent(&actions), [(BusAddr::Dsp, 0xAA)]);
-        assert_eq!(sent(&seq.feed(&dsp_status())), [(BusAddr::Avr, 0xAA)]);
+        assert_eq!(sent(&seq.feed(&dsp_status(), t0())), [(BusAddr::Avr, 0xAA)]);
         let avr_status = env(BusAddr::Avr, 0xAA, vec![0u8; 25]);
-        assert_eq!(sent(&seq.feed(&avr_status)), [(BusAddr::Avr, 0xB0)]);
+        assert_eq!(sent(&seq.feed(&avr_status, t0())), [(BusAddr::Avr, 0xB0)]);
         let ack = env(BusAddr::Avr, 0x95, vec![0x02, 0x30, 0x30]);
-        assert!(seq.feed(&ack).is_empty());
+        assert!(seq.feed(&ack, t0()).is_empty());
         assert!(!seq.is_complete());
         let armed = env(BusAddr::Avr, 0xE3, b"\n\rARMED Xi\0".to_vec());
-        seq.feed(&armed);
+        seq.feed(&armed, t0());
         assert!(seq.is_complete());
     }
 
     #[test]
     fn mevo_arm_polls_pi() {
         let (mut seq, _) = ArmSequencer::new();
-        seq.feed(&dsp_status());
-        seq.feed(&env(BusAddr::Avr, 0xAA, vec![0u8; 25]));
+        seq.feed(&dsp_status(), t0());
+        seq.feed(&env(BusAddr::Avr, 0xAA, vec![0u8; 25]), t0());
         let ack = env(BusAddr::Avr, 0x95, vec![0x02, 0x30, 0x30]);
-        assert_eq!(sent(&seq.feed(&ack)), [(BusAddr::Pi, 0xAA)]);
-        seq.feed(&env(BusAddr::Avr, 0xE3, b"\n\rARMED\0".to_vec()));
+        assert_eq!(sent(&seq.feed(&ack, t0())), [(BusAddr::Pi, 0xAA)]);
+        seq.feed(&env(BusAddr::Avr, 0xE3, b"\n\rARMED\0".to_vec()), t0());
         assert!(!seq.is_complete());
-        seq.feed(&env(BusAddr::Pi, 0xAA, vec![0u8; 17]));
+        seq.feed(&env(BusAddr::Pi, 0xAA, vec![0u8; 17]), t0());
         assert!(seq.is_complete());
     }
 
@@ -2909,7 +2930,7 @@ mod tests {
                 }
                 _ => ack.clone(),
             };
-            all.extend(seq.feed(&reply));
+            all.extend(seq.feed(&reply, t0()));
         }
         let wire: Vec<(u8, Vec<u8>)> = all
             .iter()
@@ -2972,10 +2993,10 @@ mod tests {
             ));
             assert!(wire.len() < 64, "config sequence did not finish");
             for n in &noise {
-                assert!(seq.feed(n).is_empty());
+                assert!(seq.feed(n, t0()).is_empty());
             }
             assert!(!seq.is_complete());
-            pending = seq.feed(&xi_reply(f.type_id, &f.payload));
+            pending = seq.feed(&xi_reply(f.type_id, &f.payload), t0());
         }
         assert!(seq.is_complete());
         wire
@@ -3096,7 +3117,7 @@ mod tests {
             let f = cmd.encode(dest);
             wire.push((f.type_id, hex_of(&f.payload)));
             assert!(wire.len() < 32, "did not finish");
-            pending = seq.feed(&xi_reply(f.type_id, &f.payload));
+            pending = seq.feed(&xi_reply(f.type_id, &f.payload), t0());
         }
         assert!(seq.is_complete());
         wire
@@ -3234,12 +3255,18 @@ mod tests {
     fn xi_config_waits_for_the_matching_reply() {
         let (mut seq, _) = XiConfigSequencer::mode_change(&XiSettings::default());
         // Step 1 is a BF write: a B0 ack does not complete it.
-        assert!(seq.feed(&env(BusAddr::Avr, 0x95, hex("023030"))).is_empty());
-        let next = seq.feed(&env(BusAddr::Avr, 0x95, hex("02303f")));
+        assert!(
+            seq.feed(&env(BusAddr::Avr, 0x95, hex("023030")), t0())
+                .is_empty()
+        );
+        let next = seq.feed(&env(BusAddr::Avr, 0x95, hex("02303f")), t0());
         assert_eq!(sent(&next), [(BusAddr::Avr, 0xB0)]);
         // Step 2 is B0: a BF ack does not complete it, a rejection does.
-        assert!(seq.feed(&env(BusAddr::Avr, 0x95, hex("02303f"))).is_empty());
-        let next = seq.feed(&env(BusAddr::Avr, 0x94, hex("023030")));
+        assert!(
+            seq.feed(&env(BusAddr::Avr, 0x95, hex("02303f")), t0())
+                .is_empty()
+        );
+        let next = seq.feed(&env(BusAddr::Avr, 0x94, hex("023030")), t0());
         assert_eq!(sent(&next), [(BusAddr::Avr, 0xBF)]);
         assert!(!seq.is_complete());
     }
@@ -3267,7 +3294,7 @@ mod tests {
                 } else {
                     xi_reply(f.type_id, &f.payload)
                 };
-                pending = seq.feed(&reply);
+                pending = seq.feed(&reply, t0());
                 refusals.extend(seq.take_refused());
             }
             assert!(seq.is_complete(), "0x{refused_type:02X}");
@@ -3284,12 +3311,18 @@ mod tests {
         let (mut seq, _) = XiConfigSequencer::connect(&XiSettings::default());
         // Step 1 is the BF Altitude write.
         for other in ["023030", "023025", "023023", "02302a"] {
-            assert!(seq.feed(&env(BusAddr::Avr, 0x94, hex(other))).is_empty());
+            assert!(
+                seq.feed(&env(BusAddr::Avr, 0x94, hex(other)), t0())
+                    .is_empty()
+            );
         }
         // A DSP refusal of a BF does not end an AVR step.
-        assert!(seq.feed(&env(BusAddr::Dsp, 0x94, hex("02403f"))).is_empty());
+        assert!(
+            seq.feed(&env(BusAddr::Dsp, 0x94, hex("02403f")), t0())
+                .is_empty()
+        );
         assert!(seq.take_refused().is_none());
-        let next = seq.feed(&env(BusAddr::Avr, 0x95, hex("02303f")));
+        let next = seq.feed(&env(BusAddr::Avr, 0x95, hex("02303f")), t0());
         assert_eq!(sent(&next), [(BusAddr::Avr, 0xA5)]);
     }
 

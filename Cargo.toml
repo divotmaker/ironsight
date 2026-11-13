@@ -17,7 +17,7 @@ gvp = ["dep:serde", "dep:serde_json"]
 # The driver's settings (`ironsight::config`): serde types only, no device
 # stack, for settings forms and WebAssembly UIs.
 config = ["dep:flightrelay", "flightrelay/config", "dep:serde"]
-# The `DeviceDriver` for FlightScope devices (`ironsight::driver`).
+# The `FrpDriver` for FlightScope devices (`ironsight::driver`).
 driver = ["config", "flightrelay/driver"]
 # The `ironsight-frp` binary: the driver served over FRP.
 frp = ["driver", "flightrelay/server", "flightrelay/main"]

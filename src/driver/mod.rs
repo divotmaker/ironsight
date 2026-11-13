@@ -1,4 +1,4 @@
-//! The FlightScope [`DeviceDriver`]: Mevo, Mevo+, Mevo Gen2 and Xi.
+//! The FlightScope [`FrpDriver`]: Mevo, Mevo+, Mevo Gen2 and Xi.
 //!
 //! Requires the `driver` feature. [`Mevo`] plugs a FlightScope device into
 //! any host of flightrelay's driver contract: flightrelay's `FrpServer` and
@@ -54,8 +54,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flightrelay::config::{ConfigError, DriverConfig};
 use flightrelay::driver::{
-    ConnectCtx, DeviceDriver, DeviceEvent, DeviceIdentity, DeviceSession, DeviceStatus, DriverInfo,
-    Events, HostFlags, Level, Live, NoAction, RawProfile, ShotIds, Stopped, TurnHints,
+    Activity, ConnectCtx, DeviceEvent, DeviceIdentity, DeviceStatus, DriverInfo, Events, FrpDriver,
+    FrpSession, HostFlags, IDLE, Level, Live, NoAction, RawProfile, ShotIds, Stopped, TurnHints,
 };
 use flightrelay::types::{ClubData, Launch, blockers};
 use flightrelay::{FrpBody, Mode, RawDir, RawFrame, Severity, ShotKey, Source};
@@ -80,8 +80,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STALE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Keepalive cadence once armed.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
-/// Sleep between polls of an idle connection.
-const IDLE_SLEEP: Duration = Duration::from_millis(20);
 /// Frame types besides [`carries_identity`]'s that go only to the audit log:
 /// the device's free text (0xE3) and DSP debug output (0xF0).
 const AUDIT_ONLY: [u8; 2] = [TYPE_TEXT, TYPE_DSP_DEBUG];
@@ -110,7 +108,7 @@ pub enum Error {
     /// Nothing arrived from the device for 10 seconds.
     #[error("no message from the device for {} s", STALE_TIMEOUT.as_secs())]
     Stale,
-    /// The config can't be used: [`connect`](DeviceDriver::connect) found
+    /// The config can't be used: [`connect`](FrpDriver::connect) found
     /// an address that doesn't parse (a host applied a config without
     /// validating it).
     #[error("{0}")]
@@ -131,14 +129,14 @@ pub struct Mevo {
     spin_source: Live<SpinSource>,
 }
 
-impl DeviceDriver for Mevo {
+impl FrpDriver for Mevo {
     type Config = Config;
     type Error = Error;
     type Action = NoAction;
     type Session = MevoSession<TcpStream>;
 
     /// The TCP connect gives up at once on a stop and the handshake checks
-    /// for one between polls; closing sends nothing.
+    /// for one on every pass; closing sends nothing.
     const STOP_WAIT: Duration = Duration::from_secs(3);
 
     fn info(_: &Config) -> DriverInfo {
@@ -169,7 +167,7 @@ impl DeviceDriver for Mevo {
             .map_err(|source| Error::Connect { addr, source })?;
         let _ = stream.set_nodelay(true);
         stream.set_nonblocking(true).map_err(ConnError::Io)?;
-        self.open(ctx, stream, addr, Instant::now(), IDLE_SLEEP)
+        self.open(ctx, stream, addr)
     }
 
     fn apply_config(&mut self, new: &Config) {
@@ -180,15 +178,15 @@ impl DeviceDriver for Mevo {
 
 impl Mevo {
     /// Run a whole session on `stream` instead of a TCP connection: the
-    /// handshake, then [`MevoSession`] as [`connect`](DeviceDriver::connect)
+    /// handshake, then [`MevoSession`] as [`connect`](FrpDriver::connect)
     /// returns it. `stream` must not block on reads (return `WouldBlock` when
-    /// it has nothing), and must answer each request at once: the handshake
-    /// polls it without sleeping between passes. The Xi's identity uses the
-    /// configured address.
+    /// it has nothing). The handshake's timers run on the host's time
+    /// ([`ConnectCtx::now`]), so a test host steps them. The Xi's identity
+    /// uses the configured address.
     ///
     /// # Errors
     ///
-    /// As [`connect`](DeviceDriver::connect), without the TCP connect.
+    /// As [`connect`](FrpDriver::connect), without the TCP connect.
     #[cfg(any(test, feature = "testing"))]
     pub fn connect_with<S: Read + Write>(
         &mut self,
@@ -196,19 +194,18 @@ impl Mevo {
         stream: S,
     ) -> Result<MevoSession<S>, Error> {
         let addr = self.config.socket_addr()?;
-        self.open(ctx, stream, addr, Instant::now(), Duration::ZERO)
+        self.open(ctx, stream, addr)
     }
 
-    /// Handshake on `stream` and build the session. The handshake is stale
-    /// [`STALE_TIMEOUT`] after `started` or its last message, and sleeps
-    /// `idle_sleep` after each pass that brought no event.
+    /// Handshake on `stream` and build the session. Each pass ticks the
+    /// host; one that brought no event waits [`IDLE`]. The handshake is
+    /// stale [`STALE_TIMEOUT`] after it began or after its last message, on
+    /// the host's time.
     fn open<S: Read + Write>(
         &mut self,
         ctx: &mut ConnectCtx<'_>,
         stream: S,
         addr: SocketAddr,
-        started: Instant,
-        idle_sleep: Duration,
     ) -> Result<MevoSession<S>, Error> {
         let mut conn = BinaryConnection::new(stream);
         let wire = Wire::attach(&mut conn);
@@ -217,19 +214,20 @@ impl Mevo {
         client.handshake();
         ctx.out.phase("handshaking");
 
-        let mut last_event = started;
+        let mut last_event = ctx.now();
         let mut results = LastResults::default();
         let handshake = loop {
             ctx.tick()?;
-            let polled = client.poll();
+            let now = ctx.now();
+            let polled = client.poll_at(now);
             // Nothing of the handshake leaves the driver as a raw frame.
             if wire.emit(&mut ctx.out, &mut results, false) {
-                last_event = Instant::now();
+                last_event = now;
             }
             let idle = match polled {
                 Ok(Some(BinaryEvent::Handshake(h))) => break h,
                 Ok(Some(BinaryEvent::StepRefused(env))) => {
-                    last_event = Instant::now();
+                    last_event = now;
                     ctx.out.log(
                         Level::Warn,
                         format!(
@@ -242,7 +240,7 @@ impl Mevo {
                     false
                 }
                 Ok(Some(_)) => {
-                    last_event = Instant::now();
+                    last_event = now;
                     false
                 }
                 Ok(None) => true,
@@ -252,13 +250,14 @@ impl Mevo {
                 }
                 Err(e) => return Err(e.into()),
             };
-            if last_event.elapsed() >= STALE_TIMEOUT {
+            if now.saturating_duration_since(last_event) >= STALE_TIMEOUT {
                 return Err(Error::Stale);
             }
-            if idle && !idle_sleep.is_zero() {
-                std::thread::sleep(idle_sleep);
+            if idle {
+                ctx.wait(IDLE)?;
             }
         };
+        let now = ctx.now();
 
         let identity = identity(&handshake, addr);
         let model = handshake.model;
@@ -276,9 +275,8 @@ impl Mevo {
             pending_mode: None,
             shot: None,
             pending_fusion_cam: None,
-            session_start: Instant::now(),
-            warmup: camera::WARMUP,
-            last_event: Instant::now(),
+            session_start: now,
+            last_event: now,
             status: DeviceStatus::not_armed(),
             backlog: Vec::new(),
         };
@@ -458,7 +456,7 @@ struct Shot {
 /// One connection to a FlightScope device. See the [module docs](self).
 ///
 /// Generic over the stream so a test can run it on an in-memory device; the
-/// methods are those of [`DeviceSession`], which `MevoSession<TcpStream>`
+/// methods are those of [`FrpSession`], which `MevoSession<TcpStream>`
 /// implements.
 pub struct MevoSession<S: Read + Write> {
     client: BinaryClient<S>,
@@ -477,13 +475,10 @@ pub struct MevoSession<S: Read + Write> {
     /// The Fusion camera config, applied once the camera has warmed up.
     pending_fusion_cam: Option<CamConfig>,
     session_start: Instant,
-    /// How long the camera warms up before the Fusion config
-    /// ([`camera::WARMUP`]; tests shorten it).
-    warmup: Duration,
     last_event: Instant,
     /// The status as last sent: blockers, battery, attitude and telemetry.
     status: DeviceStatus,
-    /// Events of a hints change, sent with the next poll.
+    /// Events of a hints change, sent with the next step.
     backlog: Vec<DeviceEvent>,
 }
 
@@ -510,53 +505,45 @@ impl<S: Read + Write> MevoSession<S> {
         self.mode
     }
 
-    /// Who the device is. See [`DeviceSession::identity`].
+    /// Who the device is. See [`FrpSession::identity`].
     #[must_use]
     pub fn identity(&self) -> &DeviceIdentity {
         &self.identity
     }
 
-    /// Drive the device for about `timeout`. See [`DeviceSession::poll`].
+    /// Handle what the device sent and what is due at `now`: one poll of the
+    /// client, whose event (if any) goes out as FRP events. Returns
+    /// [`Activity::Active`] after an event, [`Activity::Idle`] when there was none.
+    /// See [`FrpSession::step`].
     ///
     /// # Errors
     ///
-    /// Returns what ended the session.
-    pub fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), Error> {
-        let deadline = Instant::now() + timeout;
+    /// Returns what ended the session, [`Error::Stale`] once nothing has
+    /// arrived for [`STALE_TIMEOUT`] before `now`.
+    pub fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
         self.flush_backlog(out);
-        loop {
-            self.apply_fusion_cam(out);
-            let polled = self.client.poll();
-            if self.wire.emit(out, &mut self.results, true) {
-                self.last_event = Instant::now();
-            }
-            let idle = match polled {
-                Ok(Some(event)) => {
-                    self.last_event = Instant::now();
-                    self.on_event(event, out);
-                    false
-                }
-                Ok(None) => true,
-                Err(e @ (ConnError::Wire(_) | ConnError::Protocol(_))) => {
-                    could_not_process(out, &e);
-                    true
-                }
-                Err(e) => return Err(e.into()),
-            };
-            // Checked on every pass, so a host polling with a zero timeout
-            // sees a dead device too.
-            if self.last_event.elapsed() >= STALE_TIMEOUT {
-                return Err(Error::Stale);
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            if idle {
-                std::thread::sleep(left.min(IDLE_SLEEP));
-            }
+        self.apply_fusion_cam(now, out);
+        let polled = self.client.poll_at(now);
+        if self.wire.emit(out, &mut self.results, true) {
+            self.last_event = now;
         }
-        Ok(())
+        let next = match polled {
+            Ok(Some(event)) => {
+                self.last_event = now;
+                self.on_event(event, out);
+                Activity::Active
+            }
+            Ok(None) => Activity::Idle,
+            Err(e @ (ConnError::Wire(_) | ConnError::Protocol(_))) => {
+                could_not_process(out, &e);
+                Activity::Idle
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if now.saturating_duration_since(self.last_event) >= STALE_TIMEOUT {
+            return Err(Error::Stale);
+        }
+        Ok(next)
     }
 
     /// Take the mode of a new `golfer.turn`'s hints. A mode that changes
@@ -564,10 +551,10 @@ impl<S: Read + Write> MevoSession<S> {
     /// it is armed, else once it is idle); one that does not (Xi chipping
     /// and putting) is only recorded. No mode hint keeps the mode the device
     /// has. The device has no handedness or club setting. See
-    /// [`DeviceSession::hints`].
+    /// [`FrpSession::hints`].
     ///
     /// What the change emits (log lines, the `not_armed` blocker) goes out
-    /// with the next [`poll`](Self::poll).
+    /// with the next [`step`](Self::step).
     ///
     /// # Errors
     ///
@@ -629,7 +616,7 @@ impl<S: Read + Write> MevoSession<S> {
 
     /// Release the device: the status goes back to `not_armed` with no
     /// battery, attitude or telemetry, then the connection is dropped.
-    /// See [`DeviceSession::close`].
+    /// See [`FrpSession::close`].
     ///
     /// # Errors
     ///
@@ -754,10 +741,10 @@ impl<S: Read + Write> MevoSession<S> {
 
     /// Apply the Fusion camera config once the camera has warmed up, between
     /// shots.
-    fn apply_fusion_cam(&mut self, out: &mut Events<'_>) {
+    fn apply_fusion_cam(&mut self, now: Instant, out: &mut Events<'_>) {
         if self.pending_fusion_cam.is_none()
             || self.shot.is_some()
-            || self.session_start.elapsed() < self.warmup
+            || now.saturating_duration_since(self.session_start) < camera::WARMUP
         {
             return;
         }
@@ -1064,11 +1051,11 @@ impl<S: Read + Write> MevoSession<S> {
     }
 }
 
-impl DeviceSession for MevoSession<TcpStream> {
+impl FrpSession for MevoSession<TcpStream> {
     type Driver = Mevo;
 
-    fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), Error> {
-        MevoSession::<TcpStream>::poll(self, timeout, out)
+    fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
+        MevoSession::<TcpStream>::step(self, now, out)
     }
 
     fn hints(&mut self, hints: &TurnHints) -> Result<(), Error> {

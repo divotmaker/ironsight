@@ -1,11 +1,12 @@
 //! `FakeDevice` and `Shot` driven through `BinaryConnection` and
 //! `BinaryClient`, pinning the frames ironsight sends.
 
-use std::sync::{Arc, Mutex};
+use std::cell::Cell;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::client::{BinaryClient, BinaryEvent};
+use crate::client::{BinaryClient, BinaryEvent, CAMERA_SETUP_TIMEOUT};
 use crate::protocol::camera::CamConfig;
 use crate::protocol::handshake::DeviceModel;
 use crate::protocol::status::AvrStatus;
@@ -39,15 +40,31 @@ fn record(conn: &mut BinaryConnection<FakeDevice>) -> Arc<Mutex<Vec<Seen>>> {
     seen
 }
 
-/// Poll `client` until `pred` matches an event; return every event seen.
+thread_local! {
+    /// The test's time since [`t0`]; it only moves forward.
+    static ELAPSED: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+}
+
+/// The test's clock: read once, then stepped by [`advance`].
+fn now() -> Instant {
+    static T0: LazyLock<Instant> = LazyLock::new(Instant::now);
+    *T0 + ELAPSED.get()
+}
+
+fn advance(d: Duration) {
+    ELAPSED.set(ELAPSED.get() + d);
+}
+
+/// Poll `client` until `pred` matches an event; return every event seen. A
+/// poll that brings nothing moves the clock 1 ms (10 s at most).
 fn poll_until(
     client: &mut BinaryClient<FakeDevice>,
     pred: impl Fn(&BinaryEvent) -> bool,
 ) -> Vec<BinaryEvent> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let give_up = now() + Duration::from_secs(10);
     let mut events = Vec::new();
-    while Instant::now() < deadline {
-        match client.poll().expect("poll") {
+    while now() < give_up {
+        match client.poll_at(now()).expect("poll") {
             Some(e) => {
                 let done = pred(&e);
                 events.push(e);
@@ -55,7 +72,7 @@ fn poll_until(
                     return events;
                 }
             }
-            None => std::thread::sleep(Duration::from_millis(1)),
+            None => advance(Duration::from_millis(1)),
         }
     }
     panic!("event not seen; got {events:?}");
@@ -215,16 +232,18 @@ fn xi_result_acks() {
     device.push(BusAddr::Avr, TYPE_FLIGHT_RESULT_V1, fixtures::XI_CHIP_E8);
     device.push(BusAddr::Avr, TYPE_FLIGHT_RESULT, fixtures::XI_SHOT_D4);
     let mut conn = device.connection();
-    let deadline = Instant::now() + Duration::from_secs(5);
     let mut acked = 0;
-    while acked < 2 {
-        assert!(Instant::now() < deadline, "results never arrived");
+    for _ in 0..100 {
+        if acked == 2 {
+            break;
+        }
         if let Some(env) = conn.recv().expect("recv") {
             let ack = seq::result_ack(DeviceModel::Xi, &env).expect("result ack");
             seq::send_action(&mut conn, ack).expect("send");
             acked += 1;
         }
     }
+    assert_eq!(acked, 2, "results never arrived");
     let sent: Vec<(BusAddr, BusAddr, u8, String)> = device
         .sent()
         .iter()
@@ -421,8 +440,6 @@ const CAMERA_STEPS: [(u8, &str); 4] = [
     (0xBF, "camera parameter ack"),
 ];
 
-const SHORT_CAMERA_TIMEOUT: Duration = Duration::from_millis(60);
-
 fn unfinished(events: &[BinaryEvent]) -> Vec<(&'static str, bool, Option<String>)> {
     events
         .iter()
@@ -450,13 +467,12 @@ fn a_camera_setup_the_device_never_finishes_gives_up_and_the_arm_runs() {
             let device = FakeDevice::mevo_plus();
             device.set_camera_fault(Some(CameraFault::Ignore(frame_type)));
             let mut client = BinaryClient::new(device.connection());
-            client.set_camera_setup_timeout(SHORT_CAMERA_TIMEOUT);
-            let started = Instant::now();
+            let started = now();
             client.configure_cam(config);
             client.arm();
             let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::Armed));
             assert!(
-                started.elapsed() >= SHORT_CAMERA_TIMEOUT,
+                now() - started >= CAMERA_SETUP_TIMEOUT,
                 "0x{frame_type:02X}"
             );
             assert_eq!(
@@ -488,9 +504,9 @@ fn a_refused_camera_step_gives_up_at_once_and_the_arm_runs() {
         client.set_camera_setup_timeout(Duration::from_secs(60));
         client.configure_cam(CamConfig::fusion_preset());
         client.arm();
-        let started = Instant::now();
+        let started = now();
         let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::Armed));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(now() - started < Duration::from_secs(5));
         let raw = hex(&[0x02, 0x12, frame_type & 0x7F]);
         assert_eq!(
             unfinished(&events),
@@ -552,14 +568,17 @@ fn the_camera_deadline_does_not_apply_to_other_operations() {
     // `new()` answers nothing of the Xi configuration.
     let mut client = BinaryClient::new(device.connection());
     client.set_camera_setup_timeout(Duration::ZERO);
-    client.set_operation_timeout(SHORT_CAMERA_TIMEOUT);
     client.configure_xi(XiSettings::default());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match client.poll() {
-            Err(crate::ConnError::Timeout) => return,
+    let started = now();
+    while now() - started < Duration::from_secs(60) {
+        match client.poll_at(now()) {
+            Err(crate::ConnError::Timeout) => {
+                // The default operation timeout, 30 s.
+                assert_eq!(now() - started, Duration::from_secs(30));
+                return;
+            }
             Err(e) => panic!("{e}"),
-            Ok(_) => std::thread::sleep(Duration::from_millis(1)),
+            Ok(_) => advance(Duration::from_millis(1)),
         }
     }
     panic!("no timeout");

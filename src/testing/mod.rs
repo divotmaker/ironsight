@@ -34,11 +34,13 @@
 //! let device = FakeDevice::new();
 //! device.push_shot(&Shot::xi_full_swing());
 //! let mut client = BinaryClient::new(device.connection());
+//! // The device answers at once; time moves only when the test moves it.
+//! let mut now = std::time::Instant::now();
 //! let completed = loop {
-//!     match client.poll().unwrap() {
+//!     match client.poll_at(now).unwrap() {
 //!         Some(BinaryEvent::ShotComplete(shot)) => break shot,
 //!         Some(_) => {}
-//!         None => std::thread::sleep(std::time::Duration::from_millis(1)),
+//!         None => now += std::time::Duration::from_millis(1),
 //!     }
 //! };
 //! assert!(completed.flight.is_some());

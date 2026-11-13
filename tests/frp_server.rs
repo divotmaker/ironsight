@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use flightrelay::driver::{DeviceDriver, Stop};
+use flightrelay::driver::{FrpDriver, Stop};
 use flightrelay::{
     BusActor, EndpointConfig, FrpBody, FrpEndpoint, FrpServer, ServerConfig, ServerEvent, Source,
     Transport,

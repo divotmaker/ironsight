@@ -178,7 +178,7 @@ impl KeepaliveSequencer {
 }
 
 impl Sequence for KeepaliveSequencer {
-    fn feed(&mut self, env: &Envelope) -> Vec<Action> {
+    fn feed(&mut self, env: &Envelope, _now: Instant) -> Vec<Action> {
         match (&env.message, env.src) {
             (Message::DspStatus(_), BusAddr::Dsp) => self.got_dsp = true,
             (Message::AvrStatus(_), BusAddr::Avr) => self.got_avr = true,
@@ -258,7 +258,9 @@ pub struct BinaryClient<S: Read + Write> {
     // Keepalive state
     keepalive_enabled: bool,
     keepalive_queued: bool,
-    last_keepalive: Instant,
+    /// When the last keepalive ended; `None` until the first poll, which
+    /// starts the interval.
+    last_keepalive: Option<Instant>,
     keepalive_interval: Duration,
 
     // Configuration
@@ -307,7 +309,7 @@ impl<S: Read + Write> BinaryClient<S> {
             op_deadline: None,
             keepalive_enabled: false,
             keepalive_queued: false,
-            last_keepalive: Instant::now(),
+            last_keepalive: None,
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             op_timeout: DEFAULT_OP_TIMEOUT,
             camera_timeout: CAMERA_SETUP_TIMEOUT,
@@ -336,6 +338,20 @@ impl<S: Read + Write> BinaryClient<S> {
     /// Returns `Err` on I/O errors, wire decode errors, disconnection,
     /// or operation timeout (except keepalive timeouts, which are non-fatal).
     pub fn poll(&mut self) -> Result<Option<BinaryEvent>, ConnError> {
+        self.poll_at(Instant::now())
+    }
+
+    /// [`poll()`](Self::poll) at `now`: every timer of the client (the
+    /// operation deadlines, the keepalive interval, the trigger watchdog and
+    /// the sequencers' timed steps) compares against `now`, and the client
+    /// reads no clock of its own. Pass a time that never goes backward.
+    ///
+    /// # Errors
+    ///
+    /// As [`poll()`](Self::poll).
+    pub fn poll_at(&mut self, now: Instant) -> Result<Option<BinaryEvent>, ConnError> {
+        self.last_keepalive.get_or_insert(now);
+
         // 0. Event produced by an operation that sent nothing.
         if let Some(event) = self.ready_event.take() {
             return Ok(Some(event));
@@ -343,7 +359,7 @@ impl<S: Read + Write> BinaryClient<S> {
 
         // 1. Check operation deadline.
         if let Some(deadline) = self.op_deadline
-            && Instant::now() >= deadline
+            && now >= deadline
         {
             if matches!(
                 self.active,
@@ -358,7 +374,7 @@ impl<S: Read + Write> BinaryClient<S> {
                 self.active = None;
                 self.op_deadline = None;
                 self.keepalive_queued = false;
-                self.last_keepalive = Instant::now();
+                self.last_keepalive = Some(now);
             } else {
                 return Err(ConnError::Timeout);
             }
@@ -368,7 +384,7 @@ impl<S: Read + Write> BinaryClient<S> {
         if self.active.is_none()
             && let Some(queued) = self.queue.pop_front()
         {
-            self.start_op(queued)?;
+            self.start_op(queued, now)?;
             if let Some(event) = self.ready_event.take() {
                 return Ok(Some(event));
             }
@@ -378,22 +394,22 @@ impl<S: Read + Write> BinaryClient<S> {
         if let Some(ActiveOp::Handshake { ref mut phase, .. }) = self.active {
             match **phase {
                 HandshakePhase::Dsp(ref mut dsp) => {
-                    for a in dsp.check_timeout() {
+                    for a in dsp.check_timeout(now) {
                         seq::send_action(&mut self.conn, a)?;
                     }
                     // On the Xi a timed-out power-mode write is the last
                     // DSP step.
                     if dsp.is_complete() {
-                        return self.advance_phase();
+                        return self.advance_phase(now);
                     }
                 }
                 HandshakePhase::Avr(ref mut avr) => {
-                    for a in avr.check_cal_timeout() {
+                    for a in avr.check_cal_timeout(now) {
                         seq::send_action(&mut self.conn, a)?;
                     }
                     // On the Xi a timed-out IF cal is the last AVR step.
                     if avr.is_complete() {
-                        return self.advance_phase();
+                        return self.advance_phase(now);
                     }
                 }
                 HandshakePhase::Pi(_) => {}
@@ -403,7 +419,7 @@ impl<S: Read + Write> BinaryClient<S> {
         // 3b. Shot drain timeout — if IDLE never arrives after shot data,
         //     skip ShotResultReq and proceed directly to ARM.
         if let Some(ActiveOp::Shot(ref mut seq)) = self.active {
-            let timeout_actions = seq.check_drain_timeout();
+            let timeout_actions = seq.check_drain_timeout(now);
             for a in timeout_actions {
                 seq::send_action(&mut self.conn, a)?;
             }
@@ -416,7 +432,7 @@ impl<S: Read + Write> BinaryClient<S> {
             && !matches!(self.active, Some(ActiveOp::Shot(_)))
             && self
                 .trigger_time
-                .is_some_and(|t| t.elapsed() >= TRIGGER_TIMEOUT)
+                .is_some_and(|t| now.saturating_duration_since(t) >= TRIGGER_TIMEOUT)
         {
             return Err(ConnError::Timeout);
         }
@@ -426,7 +442,9 @@ impl<S: Read + Write> BinaryClient<S> {
         if self.keepalive_enabled
             && !self.keepalive_queued
             && !self.shot_in_progress
-            && self.last_keepalive.elapsed() >= self.keepalive_interval
+            && self
+                .last_keepalive
+                .is_some_and(|t| now.saturating_duration_since(t) >= self.keepalive_interval)
         {
             self.queue.push_back(QueuedOp::Keepalive);
             self.keepalive_queued = true;
@@ -472,13 +490,13 @@ impl<S: Read + Write> BinaryClient<S> {
                         | (Message::PiStatus(_), BusAddr::Pi)
                 );
             if !dominated {
-                let result = Self::feed_active(active, &env, &mut self.conn)?;
+                let result = Self::feed_active(active, &env, now, &mut self.conn)?;
                 let refused = Self::take_refused(active).map(BinaryEvent::StepRefused);
                 let event = match result {
                     FeedResult::Consumed => None,
                     FeedResult::Intermediate(event) => Some(*event),
-                    FeedResult::PhaseComplete => self.advance_phase()?,
-                    FeedResult::Done => self.finish_op()?,
+                    FeedResult::PhaseComplete => self.advance_phase(now)?,
+                    FeedResult::Done => self.finish_op(now)?,
                     FeedResult::CameraRefused => self.give_up_camera(),
                 };
                 let Some(refused) = refused else {
@@ -497,7 +515,7 @@ impl<S: Read + Write> BinaryClient<S> {
         if let Message::ShotText(ref st) = env.message {
             if st.is_trigger() {
                 self.shot_in_progress = true;
-                self.trigger_time = Some(Instant::now());
+                self.trigger_time = Some(now);
                 self.armed = false;
                 self.early_shot = ShotData::default();
                 return Ok(Some(BinaryEvent::Trigger));
@@ -513,7 +531,7 @@ impl<S: Read + Write> BinaryClient<S> {
                 // keepalives aren't permanently suppressed.
                 self.keepalive_queued = false;
                 self.active = Some(ActiveOp::Shot(Box::new(seq)));
-                self.op_deadline = Some(Instant::now() + self.op_timeout);
+                self.op_deadline = Some(now + self.op_timeout);
                 return Ok(None);
             }
         }
@@ -652,13 +670,13 @@ impl<S: Read + Write> BinaryClient<S> {
 
     // -- Internal: start an operation ---------------------------------------
 
-    fn start_op(&mut self, op: QueuedOp) -> Result<(), ConnError> {
+    fn start_op(&mut self, op: QueuedOp, now: Instant) -> Result<(), ConnError> {
         let timeout = match &op {
             QueuedOp::Keepalive => KEEPALIVE_TIMEOUT,
             QueuedOp::ConfigureCam(_) => self.camera_timeout,
             _ => self.op_timeout,
         };
-        self.op_deadline = Some(Instant::now() + timeout);
+        self.op_deadline = Some(now + timeout);
 
         match op {
             QueuedOp::Handshake => {
@@ -778,14 +796,15 @@ impl<S: Read + Write> BinaryClient<S> {
     fn feed_active(
         active: &mut ActiveOp,
         env: &Envelope,
+        now: Instant,
         conn: &mut BinaryConnection<S>,
     ) -> Result<FeedResult, ConnError> {
         match active {
             ActiveOp::Handshake { phase, .. } => {
                 let actions = match &mut **phase {
-                    HandshakePhase::Dsp(seq) => seq.feed(env),
-                    HandshakePhase::Avr(seq) => seq.feed(env),
-                    HandshakePhase::Pi(seq) => seq.feed(env),
+                    HandshakePhase::Dsp(seq) => seq.feed(env, now),
+                    HandshakePhase::Avr(seq) => seq.feed(env, now),
+                    HandshakePhase::Pi(seq) => seq.feed(env, now),
                 };
                 for a in actions {
                     seq::send_action(conn, a)?;
@@ -802,7 +821,7 @@ impl<S: Read + Write> BinaryClient<S> {
                 }
             }
             ActiveOp::Disarm(seq) => {
-                let actions = seq.feed(env);
+                let actions = seq.feed(env, now);
                 for a in actions {
                     seq::send_action(conn, a)?;
                 }
@@ -814,9 +833,9 @@ impl<S: Read + Write> BinaryClient<S> {
             }
             ActiveOp::Configure(config_phase) => {
                 let actions = match config_phase {
-                    ConfigurePhase::Avr(seq) => seq.feed(env),
-                    ConfigurePhase::Xi(seq) => seq.feed(env),
-                    ConfigurePhase::Camera(seq) => seq.feed(env),
+                    ConfigurePhase::Avr(seq) => seq.feed(env, now),
+                    ConfigurePhase::Xi(seq) => seq.feed(env, now),
+                    ConfigurePhase::Camera(seq) => seq.feed(env, now),
                 };
                 for a in actions {
                     seq::send_action(conn, a)?;
@@ -835,7 +854,7 @@ impl<S: Read + Write> BinaryClient<S> {
                 }
             }
             ActiveOp::Arm(seq) => {
-                let actions = seq.feed(env);
+                let actions = seq.feed(env, now);
                 for a in actions {
                     seq::send_action(conn, a)?;
                 }
@@ -846,7 +865,7 @@ impl<S: Read + Write> BinaryClient<S> {
                 }
             }
             ActiveOp::Shot(seq) => {
-                let actions = seq.feed(env);
+                let actions = seq.feed(env, now);
                 for a in actions {
                     seq::send_action(conn, a)?;
                 }
@@ -861,7 +880,7 @@ impl<S: Read + Write> BinaryClient<S> {
                 }
             }
             ActiveOp::Keepalive(seq) => {
-                let actions = seq.feed(env);
+                let actions = seq.feed(env, now);
                 for a in actions {
                     seq::send_action(conn, a)?;
                 }
@@ -876,7 +895,7 @@ impl<S: Read + Write> BinaryClient<S> {
 
     /// Advance a multi-phase operation (handshake or configure) to its next
     /// phase, or emit the completion event if all phases are done.
-    fn advance_phase(&mut self) -> Result<Option<BinaryEvent>, ConnError> {
+    fn advance_phase(&mut self, now: Instant) -> Result<Option<BinaryEvent>, ConnError> {
         let active = self.active.take().expect("advance_phase with no active op");
 
         match active {
@@ -887,7 +906,7 @@ impl<S: Read + Write> BinaryClient<S> {
                     for a in actions {
                         seq::send_action(&mut self.conn, a)?;
                     }
-                    self.op_deadline = Some(Instant::now() + self.op_timeout);
+                    self.op_deadline = Some(now + self.op_timeout);
                     self.active = Some(ActiveOp::Handshake {
                         phase: Box::new(HandshakePhase::Avr(avr_seq)),
                         dsp: Some(dsp_result),
@@ -913,7 +932,7 @@ impl<S: Read + Write> BinaryClient<S> {
                     for a in actions {
                         seq::send_action(&mut self.conn, a)?;
                     }
-                    self.op_deadline = Some(Instant::now() + self.op_timeout);
+                    self.op_deadline = Some(now + self.op_timeout);
                     self.active = Some(ActiveOp::Handshake {
                         phase: Box::new(HandshakePhase::Pi(pi_seq)),
                         dsp,
@@ -955,7 +974,7 @@ impl<S: Read + Write> BinaryClient<S> {
     }
 
     /// Finish a single-phase operation and emit its completion event.
-    fn finish_op(&mut self) -> Result<Option<BinaryEvent>, ConnError> {
+    fn finish_op(&mut self, now: Instant) -> Result<Option<BinaryEvent>, ConnError> {
         let active = self.active.take().expect("finish_op with no active op");
         self.op_deadline = None;
 
@@ -969,23 +988,23 @@ impl<S: Read + Write> BinaryClient<S> {
             ActiveOp::Arm(_) => {
                 self.armed = true;
                 self.keepalive_enabled = true;
-                self.last_keepalive = Instant::now();
+                self.last_keepalive = Some(now);
                 Ok(Some(BinaryEvent::Armed))
             }
             ActiveOp::Shot(seq) => {
                 self.armed = true;
                 self.shot_in_progress = false;
                 self.trigger_time = None;
-                self.last_keepalive = Instant::now();
+                self.last_keepalive = Some(now);
                 Ok(Some(BinaryEvent::ShotComplete(Box::new(seq.into_result()))))
             }
             ActiveOp::Keepalive(_) => {
                 self.keepalive_queued = false;
-                self.last_keepalive = Instant::now();
+                self.last_keepalive = Some(now);
                 let snapshot = self.status.clone();
                 // Start next queued op immediately if available.
                 if let Some(queued) = self.queue.pop_front() {
-                    self.start_op(queued)?;
+                    self.start_op(queued, now)?;
                 }
                 Ok(Some(BinaryEvent::Keepalive(snapshot)))
             }
@@ -1036,6 +1055,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io;
     use std::rc::Rc;
+    use std::sync::LazyLock;
 
     use super::*;
     use crate::frame::{FrameSplitter, RawFrame};
@@ -1126,6 +1146,8 @@ mod tests {
         avr_boot_nacks: usize,
         /// Leave the DSP query unanswered instead of refusing it.
         ignore_dsp_query: bool,
+        /// The test's time since [`t0`]: the clock the client is polled at.
+        elapsed: Duration,
     }
 
     impl XiState {
@@ -1264,15 +1286,38 @@ mod tests {
         }
     }
 
-    /// Poll until `pred` matches an event, collecting every event seen.
+    /// The tests' time origin: the clock is read once, and a test steps time
+    /// by adding to it.
+    fn t0() -> Instant {
+        static T0: LazyLock<Instant> = LazyLock::new(Instant::now);
+        *T0
+    }
+
+    /// The scripted Xi's time: [`t0`] plus what the test has stepped.
+    fn now(client: &BinaryClient<XiStream>) -> Instant {
+        t0() + client.conn.stream().0.borrow().elapsed
+    }
+
+    fn advance(client: &BinaryClient<XiStream>, d: Duration) {
+        client.conn.stream().0.borrow_mut().elapsed += d;
+    }
+
+    /// One poll at the scripted Xi's time.
+    fn poll(client: &mut BinaryClient<XiStream>) -> Option<BinaryEvent> {
+        let at = now(client);
+        client.poll_at(at).expect("poll failed")
+    }
+
+    /// Poll until `pred` matches an event, collecting every event seen; a
+    /// poll that brings nothing moves the clock 1 ms (10 s at most).
     fn poll_until(
         client: &mut BinaryClient<XiStream>,
         events: &mut Vec<BinaryEvent>,
         pred: impl Fn(&BinaryEvent) -> bool,
     ) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            match client.poll().expect("poll failed") {
+        let give_up = now(client) + Duration::from_secs(10);
+        while now(client) < give_up {
+            match poll(client) {
                 Some(event) => {
                     let done = pred(&event);
                     events.push(event);
@@ -1280,7 +1325,7 @@ mod tests {
                         return;
                     }
                 }
-                None => std::thread::sleep(Duration::from_millis(1)),
+                None => advance(client, Duration::from_millis(1)),
             }
         }
         panic!("event not seen; got {events:?}");
@@ -1616,11 +1661,11 @@ mod tests {
         client.handshake();
         client.configure_xi(XiSettings::default());
         client.arm();
-        let t0 = Instant::now();
+        let start = now(&client);
         poll_until(&mut client, &mut events, |e| {
             matches!(e, BinaryEvent::Armed)
         });
-        assert!(t0.elapsed() >= seq::DSP_QUERY_TIMEOUT);
+        assert!(now(&client) - start >= seq::DSP_QUERY_TIMEOUT);
         let handshake = events
             .iter()
             .find_map(|e| match e {
@@ -1653,11 +1698,11 @@ mod tests {
         let mut client = BinaryClient::new(BinaryConnection::new(XiStream(state.clone())));
         let mut events = Vec::new();
         client.handshake();
-        let t0 = Instant::now();
+        let start = now(&client);
         poll_until(&mut client, &mut events, |e| {
             matches!(e, BinaryEvent::Handshake(_))
         });
-        let elapsed = t0.elapsed();
+        let elapsed = now(&client) - start;
         assert!(elapsed >= 2 * seq::STATUS_REPOLL_INTERVAL, "{elapsed:?}");
         assert!(elapsed < 4 * seq::STATUS_REPOLL_INTERVAL, "{elapsed:?}");
         assert!(
@@ -1725,7 +1770,7 @@ mod tests {
             // Each poll handles at most one frame; 50 cover this frame and
             // every reply the scripted device pushes for it.
             for _ in 0..50 {
-                match client.poll().unwrap() {
+                match poll(client) {
                     Some(BinaryEvent::ShotDatum(ShotDatum::FlightV1(_) | ShotDatum::Flight(_))) => {
                         let st = state.borrow();
                         let last = st.received.last().unwrap();
@@ -1831,15 +1876,16 @@ mod tests {
                 let wire: Vec<u8> = state.borrow_mut().outbox.drain(..).collect();
                 let mut splitter = FrameSplitter::new();
                 let mut pending: VecDeque<Vec<u8>> = splitter.feed(&wire).into();
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut polls = 0;
                 while !matches!(events.last(), Some(BinaryEvent::ShotComplete(_))) {
-                    assert!(Instant::now() < deadline, "no ShotComplete: {events:?}");
+                    polls += 1;
+                    assert!(polls < 10_000, "no ShotComplete: {events:?}");
                     if state.borrow().outbox.is_empty()
                         && let Some(f) = pending.pop_front()
                     {
                         state.borrow_mut().outbox.extend(f);
                     }
-                    if let Some(e) = client.poll().unwrap() {
+                    if let Some(e) = poll(&mut client) {
                         events.push(e);
                     }
                 }
@@ -1877,12 +1923,13 @@ mod tests {
             }
         }
         let mut events = Vec::new();
-        let idle_at = Instant::now() + Duration::from_millis(3500);
-        while Instant::now() < idle_at {
-            if let Some(e) = client.poll().unwrap() {
+        // Past the 3 s drain timeout before IDLE arrives.
+        let idle_at = now(&client) + Duration::from_millis(3500);
+        while now(&client) < idle_at {
+            if let Some(e) = poll(&mut client) {
                 events.push(e);
             } else {
-                std::thread::sleep(Duration::from_millis(5));
+                advance(&client, Duration::from_millis(5));
             }
         }
         {

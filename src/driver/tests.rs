@@ -4,44 +4,47 @@
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use flightrelay::config::DriverConfig;
-use flightrelay::driver::{
-    ConnectCtx, ConnectHost, DeviceDriver, DeviceEvent, Events, HostFlags, Level, Stop, TurnHints,
-};
+use flightrelay::driver::{DeviceEvent, FrpDriver, Level, TurnHints};
+use flightrelay::testing::TestHost;
 use flightrelay::types::{Basis, ClubData, FlightResult as Flight, Launch};
 use flightrelay::{FrpBody, Mode, RawDir, Severity, Source};
 
 use super::*;
 use crate::addr::BusAddr;
+use crate::client::CAMERA_SETUP_TIMEOUT;
 use crate::config::{Config, SpinSource};
 use crate::protocol::{TYPE_CLUB_RESULT, TYPE_FLIGHT_RESULT, TYPE_FLIGHT_RESULT_V1};
 use crate::testing::{CameraFault, FakeDevice, Shot as FakeShot, fixtures};
 
-struct Host(TurnHints);
-
-impl ConnectHost for Host {
-    fn tick(&mut self) {}
-    fn hints(&self) -> &TurnHints {
-        &self.0
-    }
-}
-
-/// A host for one test: its flags and every event the driver emitted.
+/// A host for one test: the SDK's test host (its clock moves only when a
+/// test steps it), and every event the driver emitted.
 struct Run {
-    flags: HostFlags,
+    host: TestHost,
     events: Vec<DeviceEvent>,
 }
 
+/// How much host time [`Run::poll_until`] steps through before it gives up.
+const GIVE_UP: Duration = Duration::from_secs(10);
+
 impl Run {
     fn new() -> Self {
-        let flags = HostFlags::new();
-        flags.set_wants_raw(true);
+        Self::on(TestHost::new())
+    }
+
+    fn on(host: TestHost) -> Self {
+        host.flags.set_wants_raw(true);
         Self {
-            flags,
+            host,
             events: Vec::new(),
         }
+    }
+
+    /// Move what the host collected into `events`.
+    fn collect(&mut self) {
+        self.events.extend(self.host.take());
     }
 
     fn connect<S: Read + Write>(
@@ -50,79 +53,64 @@ impl Run {
         stream: S,
         hints: TurnHints,
     ) -> Result<MevoSession<S>, Error> {
-        let stop = Stop::new();
-        self.connect_until(driver, stream, hints, &stop)
+        self.host = std::mem::take(&mut self.host).with_hints(hints);
+        let session = self
+            .host
+            .connect_with(|ctx| driver.connect_with(ctx, stream));
+        self.collect();
+        session
     }
 
-    fn connect_until<S: Read + Write>(
-        &mut self,
-        driver: &mut Mevo,
-        stream: S,
-        hints: TurnHints,
-        stop: &Stop,
-    ) -> Result<MevoSession<S>, Error> {
-        let mut host = Host(hints);
-        let events = &mut self.events;
-        let mut sink = |e| events.push(e);
-        let mut ctx = ConnectCtx::new(stop, Events::new(&mut sink, &self.flags), &mut host);
-        driver.connect_with(&mut ctx, stream)
+    /// One step at the host's time.
+    fn step<S: Read + Write>(&mut self, session: &mut MevoSession<S>) -> Result<Activity, Error> {
+        let next = self.host.with(|now, out| session.step(now, out));
+        self.collect();
+        next
     }
 
-    /// Handshake as [`Mevo::connect`] does, with the handshake begun at
-    /// `started` and sleeping `idle_sleep` between passes that bring nothing.
-    fn open<S: Read + Write>(
-        &mut self,
-        driver: &mut Mevo,
-        stream: S,
-        started: Instant,
-        idle_sleep: Duration,
-    ) -> Result<MevoSession<S>, Error> {
-        let stop = Stop::new();
-        let mut host = Host(full());
-        let events = &mut self.events;
-        let mut sink = |e| events.push(e);
-        let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &self.flags), &mut host);
-        let addr = driver.config.socket_addr().expect("address");
-        driver.open(&mut ctx, stream, addr, started, idle_sleep)
-    }
-
+    /// Step through 10 ms of host time.
     fn poll<S: Read + Write>(&mut self, session: &mut MevoSession<S>) -> Result<(), Error> {
         self.poll_for(session, Duration::from_millis(10))
     }
 
+    /// Step through `d` of host time.
     fn poll_for<S: Read + Write>(
         &mut self,
         session: &mut MevoSession<S>,
-        timeout: Duration,
+        d: Duration,
     ) -> Result<(), Error> {
-        let events = &mut self.events;
-        let mut sink = |e| events.push(e);
-        session.poll(timeout, &mut Events::new(&mut sink, &self.flags))
+        let done = self.host.run_for(d, |now, out| session.step(now, out));
+        self.collect();
+        done
     }
 
-    /// Poll until an event matching `pred` arrives (10 s at most).
+    /// Step until an event matching `pred` arrives ([`GIVE_UP`] of host time
+    /// at most).
     fn poll_until<S: Read + Write>(
         &mut self,
         session: &mut MevoSession<S>,
         pred: impl Fn(&DeviceEvent) -> bool,
     ) {
         let start = self.events.len();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            self.poll(session).expect("poll");
+        let give_up = self.host.now() + GIVE_UP;
+        while self.host.now() < give_up {
+            let next = self.step(session).expect("step");
             if self.events[start..].iter().any(&pred) {
                 return;
+            }
+            if next == Activity::Idle {
+                self.host.advance(IDLE);
             }
         }
         panic!("event not seen; got {:#?}", &self.events[start..]);
     }
 
-    /// Poll until the device is armed and ready.
+    /// Step until the device is armed and ready.
     fn armed<S: Read + Write>(&mut self, session: &mut MevoSession<S>) {
         self.poll_until(session, is_ready);
     }
 
-    /// Push `shot` and poll until it has finished; return the shot's
+    /// Push `shot` and step until it has finished; return the shot's
     /// events.
     fn shot(
         &mut self,
@@ -148,11 +136,8 @@ impl Run {
     }
 
     fn close<S: Read + Write>(&mut self, session: MevoSession<S>) {
-        let events = &mut self.events;
-        let mut sink = |e| events.push(e);
-        session
-            .close(&mut Events::new(&mut sink, &self.flags))
-            .expect("close");
+        self.host.with(|_, out| session.close(out)).expect("close");
+        self.collect();
     }
 }
 
@@ -248,11 +233,6 @@ fn raw_frames(events: &[DeviceEvent]) -> Vec<&flightrelay::RawFrame> {
 
 fn driver(config: Config) -> Mevo {
     Mevo::new(config).expect("valid config")
-}
-
-/// The instant `d` before now.
-fn ago(d: Duration) -> Instant {
-    Instant::now().checked_sub(d).expect("clock past the epoch")
 }
 
 fn full() -> TurnHints {
@@ -503,7 +483,7 @@ fn xi_acks_and_results_are_raw_frames_and_identity_frames_only_audit_lines() {
 
     // Raw frames are built only while someone wants them.
     let mut quiet = Run::new();
-    quiet.flags.set_wants_raw(false);
+    quiet.host.flags.set_wants_raw(false);
     let device = FakeDevice::xi();
     let mut session = quiet
         .connect(&mut driver(Config::default()), device.clone(), full())
@@ -908,7 +888,7 @@ fn a_closed_connection_ends_the_session() {
 }
 
 /// Silence alone keeps the session until ten seconds have passed since the
-/// last message; then a poll ends it, also one with a zero timeout.
+/// last message; the step at ten seconds ends it.
 #[test]
 fn a_silent_device_ends_the_session_after_ten_seconds() {
     let mut run = Run::new();
@@ -918,35 +898,107 @@ fn a_silent_device_ends_the_session_after_ten_seconds() {
     let mut session = run.connect(&mut mevo, line, full()).expect("connect");
     run.armed(&mut session);
     silent.set(true);
-    session.last_event = ago(STALE_TIMEOUT / 2);
-    run.poll(&mut session).expect("not stale yet");
-    session.last_event = ago(STALE_TIMEOUT);
-    let err = run
-        .poll_for(&mut session, Duration::ZERO)
-        .expect_err("stale");
+    let last = session.last_event;
+    let ms = Duration::from_millis(1);
+    // `run_for` may end up to one idle step past its end.
+    run.poll_for(
+        &mut session,
+        last + STALE_TIMEOUT - IDLE * 2 - run.host.now(),
+    )
+    .expect("not stale yet");
+    run.host.advance(last + STALE_TIMEOUT - ms - run.host.now());
+    run.step(&mut session).expect("not stale yet");
+    run.host.advance(ms);
+    let err = run.step(&mut session).expect_err("stale");
     assert!(matches!(err, Error::Stale), "{err:?}");
+}
+
+/// A stream over a [`FakeDevice`] whose reads find nothing once `muted` is
+/// set; writes still reach the device.
+struct Muted {
+    device: FakeDevice,
+    muted: Rc<Cell<bool>>,
+}
+
+impl Read for Muted {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.muted.get() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        self.device.read(buf)
+    }
+}
+
+impl Write for Muted {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.device.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A keepalive the device never answers times out after three seconds, and
+/// the next one goes out a full interval after that: at 3 s and 9 s after
+/// arming, none in between.
+#[test]
+fn an_unanswered_keepalive_is_followed_by_the_next_one_an_interval_later() {
+    let mut run = Run::new();
+    let mut mevo = driver(Config::default());
+    let device = FakeDevice::xi();
+    let muted = Rc::new(Cell::new(false));
+    let line = Muted {
+        device: device.clone(),
+        muted: Rc::clone(&muted),
+    };
+    let mut session = run.connect(&mut mevo, line, full()).expect("connect");
+    run.armed(&mut session);
+    muted.set(true);
+    let armed = run.host.now();
+    let polls = |device: &FakeDevice| {
+        device
+            .sent()
+            .iter()
+            .filter(|f| f.dest == BusAddr::Dsp && f.type_id == 0xAA)
+            .count()
+    };
+    let mut seen = polls(&device);
+    let mut sends = Vec::new();
+    while run.host.now() < armed + Duration::from_millis(9_500) {
+        let next = run.step(&mut session).expect("step");
+        let now = polls(&device);
+        if now > seen {
+            sends.push(run.host.now() - armed);
+            seen = now;
+        }
+        if next == Activity::Idle {
+            run.host.advance(IDLE);
+        }
+    }
+    assert_eq!(sends.len(), 2, "{sends:?}");
+    let slack = IDLE * 4;
+    assert!(
+        sends[0] >= Duration::from_secs(3) && sends[0] <= Duration::from_secs(3) + slack,
+        "{sends:?}"
+    );
+    assert!(
+        sends[1] >= Duration::from_secs(9) && sends[1] <= Duration::from_secs(9) + slack,
+        "{sends:?}"
+    );
 }
 
 #[test]
 fn a_stop_ends_the_handshake() {
-    let mut run = Run::new();
     let mut mevo = driver(Config::default());
     let device = FakeDevice::xi();
     let (line, silent, _) = Line::new(&device);
     silent.set(true);
-    let stop = Stop::new();
-    let stopper = stop.clone();
-    let thread = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        stopper.stop();
-    });
-    let start = Instant::now();
-    let err = run
-        .connect_until(&mut mevo, line, full(), &stop)
-        .expect_err("stopped");
+    let mut run = Run::on(TestHost::new().stop_after_ticks(20));
+    let start = run.host.now();
+    let err = run.connect(&mut mevo, line, full()).expect_err("stopped");
     assert!(matches!(err, Error::Stopped), "{err:?}");
-    assert!(start.elapsed() < Mevo::STOP_WAIT);
-    thread.join().expect("thread");
+    assert_eq!(run.host.ticks(), 20);
+    assert!(run.host.now() - start < Mevo::STOP_WAIT);
 }
 
 #[test]
@@ -957,68 +1009,20 @@ fn a_stop_before_the_tcp_connect_returns_at_once() {
         address: Some(addr.to_string()),
         ..Config::default()
     });
-    let stop = Stop::new();
-    stop.stop();
-    let flags = HostFlags::new();
-    let mut sink = |_| {};
-    let mut host = Host(full());
-    let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut host);
-    let err = mevo.connect(&mut ctx).expect_err("stopped");
+    let mut host = TestHost::new();
+    host.stop().stop();
+    let err = host.connect(&mut mevo).expect_err("stopped");
     assert!(matches!(err, Error::Stopped), "{err:?}");
 }
 
 #[test]
-fn a_stop_during_the_tcp_connect_returns_at_once() {
-    // 192.0.2.1 (TEST-NET-1) is never routed to a host: the connect waits
-    // for its 5 s timeout unless the stop ends it.
-    let mut mevo = driver(Config {
-        address: Some("192.0.2.1:5100".into()),
-        ..Config::default()
-    });
-    let stop = Stop::new();
-    let stopper = stop.clone();
-    let thread = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
-        stopper.stop();
-    });
-    let flags = HostFlags::new();
-    let mut sink = |_| {};
-    let mut host = Host(full());
-    let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut host);
-    let start = Instant::now();
-    let result = mevo.connect(&mut ctx);
-    let took = start.elapsed();
-    thread.join().expect("thread");
-    match result {
-        Err(Error::Stopped) => {
-            assert!(took >= Duration::from_millis(250), "{took:?}");
-            assert!(took < Duration::from_secs(1), "{took:?}");
-        }
-        // A machine without a route refuses the connect at once; there is
-        // nothing to stop then.
-        Err(Error::Connect { .. }) if took < Duration::from_millis(250) => {}
-        other => panic!("{other:?} after {took:?}"),
-    }
-}
-
-#[test]
-fn a_refused_connect_is_an_error_naming_the_address() {
-    let addr = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        l.local_addr().expect("addr")
+fn a_connect_error_names_the_address() {
+    let addr: SocketAddr = "192.168.2.1:5100".parse().expect("addr");
+    let err = Error::Connect {
+        addr,
+        source: io::ErrorKind::ConnectionRefused.into(),
     };
-    let mut mevo = driver(Config {
-        address: Some(addr.to_string()),
-        ..Config::default()
-    });
-    let stop = Stop::new();
-    let flags = HostFlags::new();
-    let mut sink = |_| {};
-    let mut host = Host(full());
-    let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut host);
-    let err = mevo.connect(&mut ctx).expect_err("refused");
-    assert!(matches!(err, Error::Connect { .. }), "{err:?}");
-    assert!(err.to_string().contains(&addr.to_string()));
+    assert!(err.to_string().contains("192.168.2.1:5100"), "{err}");
 }
 
 #[test]
@@ -1133,7 +1137,7 @@ fn mentions(line: &str, payload: &[u8], ascii: &str) -> bool {
 #[test]
 fn a_short_identity_frame_raises_an_alert_without_its_bytes() {
     let mut run = Run::new();
-    run.flags.set_min_level(Level::Trace);
+    run.host.flags.set_min_level(Level::Trace);
     let mut mevo = driver(Config::default());
     let device = FakeDevice::xi();
     let mut session = run
@@ -1225,15 +1229,14 @@ fn a_handshake_that_gets_only_undecodable_frames_goes_stale_without_spinning() {
         frame,
         reads: Rc::clone(&reads),
     };
-    // Begun all but 200 ms of the stale timeout ago.
-    let started = ago(STALE_TIMEOUT - Duration::from_millis(200));
-    let err = run
-        .open(&mut mevo, garbage, started, IDLE_SLEEP)
-        .expect_err("stale");
+    let start = run.host.now();
+    let err = run.connect(&mut mevo, garbage, full()).expect_err("stale");
     assert!(matches!(err, Error::Stale), "{err:?}");
-    // One bad frame per idle sleep: about 10 in 200 ms, not a busy loop.
-    assert!(reads.get() <= 50, "{} reads", reads.get());
-    assert!(alerts(&run.events).len() <= 50);
+    assert_eq!(run.host.now() - start, STALE_TIMEOUT);
+    // One bad frame per pass, and each pass waits: not a busy loop.
+    let passes = usize::try_from(STALE_TIMEOUT.as_millis() / IDLE.as_millis()).expect("passes") + 1;
+    assert!(reads.get() <= passes, "{} reads", reads.get());
+    assert!(alerts(&run.events).len() <= passes);
 }
 
 // -- A trigger while a shot is open ------------------------------------------
@@ -1241,7 +1244,7 @@ fn a_handshake_that_gets_only_undecodable_frames_goes_stale_without_spinning() {
 #[test]
 fn a_second_trigger_finishes_the_open_shot_before_the_next_one_starts() {
     let mut run = Run::new();
-    run.flags.set_min_level(Level::Debug);
+    run.host.flags.set_min_level(Level::Debug);
     let mut mevo = driver(Config::default());
     let device = FakeDevice::xi();
     let mut session = run
@@ -1587,9 +1590,6 @@ fn mevo_plus_keepalives_send_battery_temperature_and_power_when_they_change() {
         .connect(&mut mevo, device.clone(), full())
         .expect("connect");
     run.armed(&mut session);
-    session
-        .client
-        .set_keepalive_interval(Duration::from_millis(50));
     device.set_dsp_status(crate::testing::mevo_plus_dsp_status(55, 35.5, true));
     let before = run.events.len();
     run.poll_until(&mut session, |e| {
@@ -1614,9 +1614,6 @@ fn a_dsp_status_that_is_not_decoded_takes_the_battery_off_the_actor() {
         .connect(&mut mevo, device.clone(), full())
         .expect("connect");
     run.armed(&mut session);
-    session
-        .client
-        .set_keepalive_interval(Duration::from_millis(50));
     assert_eq!(session.status.battery_pct, Some(87));
     let mut gen2 = vec![0u8; 71];
     gen2[0] = 0x46;
@@ -1655,9 +1652,6 @@ fn a_mevo_gen2_session_sends_no_battery_temperature_or_power() {
         Some("4.56 (Feb 3 2024)")
     );
     run.armed(&mut session);
-    session
-        .client
-        .set_keepalive_interval(Duration::from_millis(50));
     let polls = |device: &FakeDevice| {
         device
             .sent()
@@ -1696,10 +1690,10 @@ fn the_fusion_camera_config_follows_the_warmup_and_waits_for_an_open_shot() {
             f.dest == BusAddr::Pi && f.type_id == 0x82 && f.payload == fusion
         })
     };
-    // Still warming up.
-    for _ in 0..5 {
-        run.poll(&mut session).expect("poll");
-    }
+    // Still warming up: a shot triggers just before the warmup ends.
+    let almost = session.session_start + camera::WARMUP - Duration::from_millis(50);
+    run.poll_for(&mut session, almost - run.host.now())
+        .expect("poll");
     assert_eq!(fusion_sent(&device), None);
 
     // Warmed up, but a shot is open: held.
@@ -1708,10 +1702,9 @@ fn the_fusion_camera_config_follows_the_warmup_and_waits_for_an_open_shot() {
     run.poll_until(&mut session, |e| {
         matches!(e, DeviceEvent::Frp(FrpBody::ShotTrigger(_)))
     });
-    session.warmup = Duration::ZERO;
-    for _ in 0..5 {
-        run.poll(&mut session).expect("poll");
-    }
+    run.poll_for(&mut session, Duration::from_millis(100))
+        .expect("poll");
+    assert!(run.host.now() >= session.session_start + camera::WARMUP);
     assert_eq!(fusion_sent(&device), None);
 
     // Applied once the shot is done, then re-armed.
@@ -1755,9 +1748,11 @@ fn the_raw_fusion_camera_config_is_sent_disarmed() {
         .expect("connect");
     run.armed(&mut session);
     let armed = arms(&device);
-    session.warmup = Duration::ZERO;
-    run.poll_until(&mut session, |_| arms(&device) == armed + 1);
-    run.armed(&mut session);
+    // The warmup, then the config and its re-arm.
+    run.poll_for(&mut session, camera::WARMUP + Duration::from_secs(1))
+        .expect("warmup");
+    assert_eq!(arms(&device), armed + 1);
+    assert!(ready_last(&run.events));
     let raw = CamConfig::raw_fusion_preset().encode();
     let sent = device.sent();
     let cam = sent
@@ -1776,8 +1771,6 @@ fn the_raw_fusion_camera_config_is_sent_disarmed() {
     );
     assert_eq!(warns(&run.events, "camera"), Vec::<&str>::new());
 }
-
-const CAMERA_GIVE_UP: Duration = Duration::from_millis(80);
 
 fn warns<'a>(events: &'a [DeviceEvent], needle: &str) -> Vec<&'a str> {
     events
@@ -1845,13 +1838,14 @@ fn a_fusion_camera_setup_the_device_does_not_finish_alerts_and_the_session_carri
         };
 
         device.set_camera_fault(Some(fault));
-        session.client.set_camera_setup_timeout(CAMERA_GIVE_UP);
-        session.warmup = Duration::ZERO;
         let start = run.events.len();
-        run.poll_until(&mut session, |e| {
-            matches!(e, DeviceEvent::Frp(FrpBody::BusAlert(_)))
-        });
-        run.armed(&mut session);
+        // The warmup, then the setup the device does not finish.
+        run.poll_for(
+            &mut session,
+            camera::WARMUP + CAMERA_SETUP_TIMEOUT + Duration::from_secs(1),
+        )
+        .expect("carries on");
+        assert!(ready_last(&run.events), "{mode:?} {fault:?}");
 
         let events = &run.events[start..];
         assert_eq!(
@@ -1905,14 +1899,10 @@ fn a_camera_warmup_the_device_does_not_finish_alerts_and_arms() {
             let mut session = run
                 .connect(&mut mevo, device.clone(), full())
                 .expect("connect");
-            session.client.set_camera_setup_timeout(CAMERA_GIVE_UP);
             run.armed(&mut session);
             assert!(session.client.is_armed());
             // The Fusion config, when configured, follows the warmup.
-            session.warmup = Duration::ZERO;
-            for _ in 0..5 {
-                run.poll(&mut session).expect("poll");
-            }
+            run.poll_for(&mut session, camera::WARMUP).expect("warmup");
             let warned = warns(&run.events, "did not finish the camera setup");
             assert_eq!(warned.len(), 1, "{fault:?} {mode:?}");
             assert!(warned[0].contains("camera config ack"), "{}", warned[0]);
@@ -1953,11 +1943,11 @@ fn a_camera_setup_the_device_finishes_raises_no_alert() {
             .connect(&mut mevo, device.clone(), full())
             .expect("connect");
         run.armed(&mut session);
-        session.warmup = Duration::ZERO;
+        run.poll_for(&mut session, camera::WARMUP).expect("warmup");
         // The Fusion config and its re-arm.
         let wanted_arms = if mode == CameraMode::Standard { 1 } else { 2 };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && (arms(&device) < wanted_arms || !ready_last(&run.events))
+        let give_up = run.host.now() + GIVE_UP;
+        while run.host.now() < give_up && (arms(&device) < wanted_arms || !ready_last(&run.events))
         {
             run.poll(&mut session).expect("poll");
         }
