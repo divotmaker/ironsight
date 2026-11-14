@@ -76,8 +76,7 @@ pub enum BinaryEvent {
     /// camera is left as the device has it (a Fusion configuration that
     /// did not finish leaves it in standard mode).
     CameraSetupUnfinished {
-        /// The step the configuration stopped at, in words
-        /// ([`CameraConfigSequencer::step_name`]).
+        /// The step the configuration stopped at, in words.
         step: &'static str,
         /// The configuration was for a Fusion mode
         /// ([`CamConfig::is_fusion`]).
@@ -172,7 +171,7 @@ impl KeepaliveSequencer {
                 got_avr: false,
                 got_pi: !model.has_camera(),
             },
-            seq::keepalive_actions_for(model),
+            seq::keepalive_polls(model),
         )
     }
 }
@@ -331,7 +330,7 @@ impl<S: Read + Write> BinaryClient<S> {
     /// is available (non-blocking).
     ///
     /// On the Xi, every 0xE8 and 0xD4 flight result is acked with 0x95 as
-    /// soon as it is received (see [`seq::result_ack`]).
+    /// soon as it is received.
     ///
     /// # Errors
     ///
@@ -394,7 +393,7 @@ impl<S: Read + Write> BinaryClient<S> {
         if let Some(ActiveOp::Handshake { ref mut phase, .. }) = self.active {
             match **phase {
                 HandshakePhase::Dsp(ref mut dsp) => {
-                    for a in dsp.check_timeout(now) {
+                    for a in dsp.check_timers(now) {
                         seq::send_action(&mut self.conn, a)?;
                     }
                     // On the Xi a timed-out power-mode write is the last
@@ -404,7 +403,7 @@ impl<S: Read + Write> BinaryClient<S> {
                     }
                 }
                 HandshakePhase::Avr(ref mut avr) => {
-                    for a in avr.check_cal_timeout(now) {
+                    for a in avr.check_timers(now) {
                         seq::send_action(&mut self.conn, a)?;
                     }
                     // On the Xi a timed-out IF cal is the last AVR step.
@@ -419,7 +418,7 @@ impl<S: Read + Write> BinaryClient<S> {
         // 3b. Shot drain timeout — if IDLE never arrives after shot data,
         //     skip ShotResultReq and proceed directly to ARM.
         if let Some(ActiveOp::Shot(ref mut seq)) = self.active {
-            let timeout_actions = seq.check_drain_timeout(now);
+            let timeout_actions = seq.check_timers(now);
             for a in timeout_actions {
                 seq::send_action(&mut self.conn, a)?;
             }
@@ -587,8 +586,7 @@ impl<S: Read + Write> BinaryClient<S> {
         self.queue.push_back(QueuedOp::ConfigureAvr(avr));
     }
 
-    /// Enqueue the Xi's configuration (see [`XiSettings`] and
-    /// [`XiConfigSequencer`]).
+    /// Enqueue the Xi's configuration (see [`XiSettings`]).
     ///
     /// The first Xi configuration on a connection sends the connect-time
     /// block (parameter writes, radar calibration) followed by the mode

@@ -521,7 +521,7 @@ parameter (Altitude, &sect;8.3). The Mevo+ and Gen2 are not sent this write.
 
 ### 8.3 Configuration
 
-ironsight (`BinaryClient::configure_xi`, `XiConfigSequencer`) sends the Xi its
+ironsight (`BinaryClient::configure_xi`) sends the Xi its
 full parameter set, radar calibration and mode on connect, then the mode alone
 on a change. It sends the frames below in this order, one at a time. Each
 waits for its reply:

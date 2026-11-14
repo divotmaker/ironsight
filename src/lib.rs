@@ -21,8 +21,4 @@ pub use conn::{BinaryConnection, ConnError, Envelope};
 pub use error::WireError;
 pub use frame::{FrameSplitter, RawFrame};
 pub use protocol::{Command, Message};
-pub use seq::{
-    Action, ArmSequencer, AvrConfigSequencer, AvrSequencer, CameraConfigSequencer, DisarmSequencer,
-    DspSequencer, MevoSettings, PiSequencer, Sequence, ShotDatum, ShotSequencer, XiConfigSequencer,
-    XiSettings, XiShotType,
-};
+pub use seq::{MevoSettings, ShotDatum, XiSettings, XiShotType};

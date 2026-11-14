@@ -1,12 +1,13 @@
-//! Handshake sequences, operational routines, and pollable state machines.
+//! What the handshake, configuration and shot sequences take and produce:
+//! the device settings ([`MevoSettings`], [`AvrSettings`], [`XiSettings`]),
+//! the handshake's results ([`DspSync`], [`AvrSync`], [`PiSync`]) and the
+//! shot data ([`ShotDatum`], [`ShotData`]).
 //!
-//! Each sequencer is a pollable state machine ([`Sequence`] trait). Its
-//! `feed()` accepts a received [`Envelope`] and the time it is handled, and
-//! returns [`Action`]s to send. The timed steps (`check_timeout()` and
-//! friends) compare against a `now` the caller passes too, so a sequencer
-//! reads no clock. Callers own the event loop: receive an envelope, `feed()`
-//! it, and send the returned actions with [`send_action`].
-//! [`BinaryClient`](crate::BinaryClient) runs the sequencers this way.
+//! [`BinaryClient`](crate::BinaryClient) runs the sequences. Each one is a
+//! crate-private state machine: `feed()` takes a received [`Envelope`] and
+//! the time it is handled and returns the commands to send, and
+//! `check_timers(now)` runs the timed steps due at `now`, so a sequence
+//! reads no clock.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -31,17 +32,17 @@ use crate::protocol::{
 };
 
 /// Per-exchange timeout.
-pub const TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long the DSP sequencer waits for the DSP query response (0xC8) before
 /// carrying on without it. The Xi's DSP may not answer it, so the handshake
 /// does not depend on one.
-pub const DSP_QUERY_TIMEOUT: Duration = TIMEOUT;
+pub(crate) const DSP_QUERY_TIMEOUT: Duration = TIMEOUT;
 
 /// How long the AVR sequencer waits before re-sending a status poll the
 /// AVR refused (0x94). The Xi's AVR refuses status polls for several
 /// seconds after power-on.
-pub const STATUS_REPOLL_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const STATUS_REPOLL_INTERVAL: Duration = Duration::from_secs(1);
 
 // ===========================================================================
 // Action, Sequence trait, infrastructure
@@ -49,7 +50,7 @@ pub const STATUS_REPOLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// An action returned by a sequencer's `feed()` or `new()`.
 #[derive(Debug, Clone)]
-pub enum Action {
+pub(crate) enum Action {
     /// Send a command to a bus address.
     Send(Command, BusAddr),
 }
@@ -59,7 +60,7 @@ pub enum Action {
 /// `feed()` accepts a received message and returns actions to send.
 /// `is_complete()` indicates the sequence is done. Type-specific `finish()`
 /// methods (not in the trait) extract the result.
-pub trait Sequence {
+pub(crate) trait Sequence {
     /// Process a message received at `now`. Returns actions to send (may be
     /// empty). A sequencer that times a step starts the timer from `now`.
     fn feed(&mut self, env: &Envelope, now: Instant) -> Vec<Action>;
@@ -69,7 +70,7 @@ pub trait Sequence {
 }
 
 /// Send an action on a connection.
-pub fn send_action<S: Read + Write>(
+pub(crate) fn send_action<S: Read + Write>(
     conn: &mut BinaryConnection<S>,
     action: Action,
 ) -> Result<(), ConnError> {
@@ -89,7 +90,7 @@ pub fn send_action<S: Read + Write>(
 /// [`BinaryClient`](crate::BinaryClient) sends it for every frame it
 /// receives. Call this when driving the sequencers directly.
 #[must_use]
-pub fn result_ack(model: DeviceModel, env: &Envelope) -> Option<Action> {
+pub(crate) fn result_ack(model: DeviceModel, env: &Envelope) -> Option<Action> {
     let is_result = matches!(env.type_id, TYPE_FLIGHT_RESULT_V1 | TYPE_FLIGHT_RESULT);
     (model == DeviceModel::Xi && env.src == BusAddr::Avr && is_result).then(|| {
         Action::Send(
@@ -102,7 +103,7 @@ pub fn result_ack(model: DeviceModel, env: &Envelope) -> Option<Action> {
 /// Commands for a keepalive poll on the given model. The PI is polled only
 /// on models that have one.
 #[must_use]
-pub fn keepalive_actions_for(model: DeviceModel) -> Vec<Action> {
+pub(crate) fn keepalive_polls(model: DeviceModel) -> Vec<Action> {
     let mut actions = vec![
         Action::Send(
             Command::StatusPoll(StatusPoll { pi_mode: false }),
@@ -167,7 +168,7 @@ fn should_skip_for_cal(env: &Envelope, expected_src: BusAddr) -> bool {
 pub struct DspSync {
     pub status: DspStatus,
     /// DSP hardware info (0xC8). `None` when the DSP query is rejected or
-    /// goes unanswered within [`DSP_QUERY_TIMEOUT`].
+    /// goes unanswered within 2 seconds.
     pub hw_info: Option<DspQueryResp>,
     pub dev_info: DevInfoResp,
     pub prod_info: [ProdInfoResp; 3],
@@ -175,7 +176,7 @@ pub struct DspSync {
     /// Model family, detected from the DSP device info.
     pub model: DeviceModel,
     /// Xi only: `true` when the DSP did not answer the power-mode write
-    /// within [`DSP_QUERY_TIMEOUT`] and the sync carried on without a
+    /// within 2 seconds and the sync carried on without a
     /// reply. Always `false` on the Mevo+ and Gen2, which are not sent it.
     pub power_mode_unanswered: bool,
 }
@@ -206,7 +207,7 @@ const XI_DSP_POWER_MODE_NORMAL: i32 = 1;
 ///
 /// Sequence: StatusPoll → DspQuery (0x48) → DevInfoReq → ProdInfoReq ×3 →
 /// ConfigQuery. The DSP query is optional: a ConfigNack for it, or no answer
-/// within [`DSP_QUERY_TIMEOUT`] (see [`check_timeout()`](Self::check_timeout)),
+/// within [`DSP_QUERY_TIMEOUT`] (see [`check_timers()`](Self::check_timers)),
 /// moves on to DevInfoReq with no hardware info.
 ///
 /// On the Xi the sequence ends with a power-mode write to the DSP, BF
@@ -216,7 +217,7 @@ const XI_DSP_POWER_MODE_NORMAL: i32 = 1;
 /// reply within [`DSP_QUERY_TIMEOUT`] it completes too, and
 /// [`DspSync::power_mode_unanswered`] is set. The Mevo+ and Gen2 are not
 /// sent it.
-pub struct DspSequencer {
+pub(crate) struct DspSequencer {
     step: DspStep,
     status: Option<DspStatus>,
     hw_info: Option<DspQueryResp>,
@@ -281,7 +282,7 @@ impl DspSequencer {
     /// DevInfoReq; a timed-out power-mode write completes the sequence
     /// (check [`is_complete()`](Sequence::is_complete) afterward).
     /// Call this periodically in the event loop.
-    pub fn check_timeout(&mut self, now: Instant) -> Vec<Action> {
+    pub fn check_timers(&mut self, now: Instant) -> Vec<Action> {
         let Some(deadline) = self.deadline else {
             return vec![];
         };
@@ -476,9 +477,9 @@ enum AvrStep {
 /// An AVR that is still starting up refuses the status poll with a 0x94
 /// (`[02 30 2A]`); the Xi does so for several seconds after power-on. The
 /// poll is then sent again [`STATUS_REPOLL_INTERVAL`] later, from
-/// [`check_cal_timeout()`](Self::check_cal_timeout), once per refusal,
+/// [`check_timers()`](Self::check_timers), once per refusal,
 /// until the AVR answers. The caller's overall deadline bounds the wait.
-pub struct AvrSequencer {
+pub(crate) struct AvrSequencer {
     step: AvrStep,
     model: DeviceModel,
     status: Option<AvrStatus>,
@@ -533,7 +534,7 @@ impl AvrSequencer {
     /// [`STATUS_REPOLL_INTERVAL`] has passed, and move past an optional cal
     /// step that has gone unanswered. Call this periodically in the event
     /// loop.
-    pub fn check_cal_timeout(&mut self, now: Instant) -> Vec<Action> {
+    pub fn check_timers(&mut self, now: Instant) -> Vec<Action> {
         if let Some(at) = self.repoll_at
             && now >= at
         {
@@ -785,7 +786,7 @@ enum PiStep {
 }
 
 /// Pollable state machine for PI sync (Phase 3).
-pub struct PiSequencer {
+pub(crate) struct PiSequencer {
     step: PiStep,
     dev_info: Option<DevInfoResp>,
     cam_config: Option<CamConfig>,
@@ -953,13 +954,13 @@ pub struct AvrSettings {
 impl AvrSettings {
     /// The detection mode alone, for a mode change on a Mevo+ or Mevo Gen2
     /// that already has its parameters and radar calibration.
-    /// [`AvrConfigSequencer`] sends B0 `[01 00]`, A5 `[02 00 mode]` and B0
-    /// `[01 00]`.
+    /// [`BinaryClient::configure_avr`](crate::BinaryClient::configure_avr)
+    /// sends B0 `[01 00]`, A5 `[02 00 mode]` and B0 `[01 00]`.
     ///
     /// After a full parameter set (see [`MevoSettings`]) the Mevo+ can
     /// refuse the arm (0x94) for up to about 30 seconds before it accepts
     /// it. After the mode alone it re-arms much sooner, though a few
-    /// refusals can still occur; [`ArmSequencer`] retries them.
+    /// refusals can still occur; the arm retries them.
     #[must_use]
     pub fn mode_only(mode: u8) -> Self {
         Self {
@@ -984,8 +985,8 @@ const MEVO_TEE_HEIGHT_ID: u8 = 0x26;
 /// Build one with [`MevoSettings::new`]; the fields stay public for
 /// reading and adjusting.
 ///
-/// Converts into [`AvrSettings`]. [`AvrConfigSequencer`] (and
-/// [`BinaryClient::configure_avr`](crate::BinaryClient::configure_avr))
+/// Converts into [`AvrSettings`].
+/// [`BinaryClient::configure_avr`](crate::BinaryClient::configure_avr)
 /// then sends B0 `[01 00]`, then each parameter write in this order, the
 /// mode and the radar calibration, each followed by B0 `[01 00]`:
 ///
@@ -1105,7 +1106,7 @@ enum AvrConfigStep {
 }
 
 /// Pollable state machine for AVR configuration (Phase 4).
-pub struct AvrConfigSequencer {
+pub(crate) struct AvrConfigSequencer {
     step: AvrConfigStep,
     settings: AvrSettings,
 }
@@ -1260,12 +1261,10 @@ impl XiShotType {
 /// Configuration for the Xi: detection mode, shot type and radar
 /// calibration.
 ///
-/// [`XiConfigSequencer`] (and
-/// [`BinaryClient::configure_xi`](crate::BinaryClient::configure_xi)) send
+/// [`BinaryClient::configure_xi`](crate::BinaryClient::configure_xi) sends
 /// the Xi its full parameter set, radar calibration and mode on the
 /// connection's first configuration (the connect-time block), then the mode
-/// alone on a change (the mode block). See [`XiConfigSequencer`] for the
-/// exact bytes.
+/// alone on a change (the mode block).
 ///
 /// Build one with [`full_swing`](Self::full_swing) or
 /// [`pitching`](Self::pitching).
@@ -1467,7 +1466,7 @@ fn xi_gate() -> (Command, XiReply) {
 ///
 /// Arm afterward with [`ArmSequencer`]. The mode block expects a disarmed
 /// device; [`BinaryClient`](crate::BinaryClient) disarms first when needed.
-pub struct XiConfigSequencer {
+pub(crate) struct XiConfigSequencer {
     steps: Vec<(Command, XiReply)>,
     /// Index of the step waiting for its reply.
     current: usize,
@@ -1612,7 +1611,7 @@ enum CamConfigStep {
 /// ([`is_refused()`](Self::is_refused)); a step that gets no reply at all
 /// waits for the caller's timeout. Either way
 /// [`step_name()`](Self::step_name) names the step the sequence stopped at.
-pub struct CameraConfigSequencer {
+pub(crate) struct CameraConfigSequencer {
     step: CamConfigStep,
     /// The type of the command the current step waits on a reply to,
     /// without the reply bit (what a 0x94 carries as `acked_cmd`).
@@ -1769,7 +1768,7 @@ enum DisarmStep {
 /// CANCELLED + "System State 5". Must run before `AvrConfigSequencer` on
 /// re-configure while the device is armed, so the device is fully idle
 /// before new config commands arrive.
-pub struct DisarmSequencer {
+pub(crate) struct DisarmSequencer {
     step: DisarmStep,
 }
 
@@ -1889,7 +1888,7 @@ enum ArmStep {
 ///
 /// On a model without a camera Pi ([`new(DeviceModel::Xi)`](Self::new))
 /// step 4 skips the PI poll and waits for the "ARMED" text alone.
-pub struct ArmSequencer {
+pub(crate) struct ArmSequencer {
     step: ArmStep,
     retries: u16,
     /// Poll the PI after the arm ConfigAck and wait for its status.
@@ -1910,12 +1909,6 @@ impl ArmSequencer {
             BusAddr::Dsp,
         )];
         (seq, actions)
-    }
-
-    /// Number of ConfigNack retries so far.
-    #[must_use]
-    pub fn retries(&self) -> u16 {
-        self.retries
     }
 }
 
@@ -2069,7 +2062,7 @@ pub struct ShotData {
 /// Each variant wraps the corresponding protocol type. Only the four
 /// data types relevant for real-time shot processing are included;
 /// diagnostic data (`SpeedProfile`, `PrcData`, `ClubPrc`) is available
-/// in the accumulated [`ShotData`] via [`ShotSequencer::into_result()`].
+/// in the accumulated [`ShotData`] of `BinaryEvent::ShotComplete`.
 #[derive(Debug, Clone)]
 pub enum ShotDatum {
     /// Primary ball flight (0xD4). Normally arrives before PROCESSED, after
@@ -2113,7 +2106,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Gen1 sends both after a ConfigQuery (0x21), but Gen2 firmware skips the
 /// ConfigQuery/ConfigResp exchange entirely. By not requiring either message,
 /// the sequencer works identically across firmware generations.
-pub struct ShotSequencer {
+pub(crate) struct ShotSequencer {
     step: ShotStep,
     data: ShotData,
     /// Latest shot data message to yield to the caller. Set during drain
@@ -2159,12 +2152,6 @@ impl ShotSequencer {
         self.data
     }
 
-    /// Borrow the shot data accumulated so far (e.g. to read flight/club
-    /// results during draining, before the sequence is complete).
-    pub fn data(&self) -> &ShotData {
-        &self.data
-    }
-
     /// Take the pending shot datum (if any). Called by `BinaryClient` after
     /// each `feed()` to yield individual data messages as they arrive.
     pub fn take_pending(&mut self) -> Option<ShotDatum> {
@@ -2178,7 +2165,7 @@ impl ShotSequencer {
     /// When the drain deadline expires, skip the redundant ShotResultReq
     /// (ClubResult already accumulated during drain) and proceed directly
     /// to ARM.
-    pub fn check_drain_timeout(&mut self, now: Instant) -> Vec<Action> {
+    pub fn check_timers(&mut self, now: Instant) -> Vec<Action> {
         if !matches!(self.step, ShotStep::Draining) {
             return vec![];
         }
@@ -2327,10 +2314,10 @@ mod tests {
         let (mut seq, _) = DspSequencer::new();
         seq.feed(&dsp_status(), t0());
         let due = t0() + DSP_QUERY_TIMEOUT;
-        assert!(seq.check_timeout(due - MS).is_empty());
-        assert_eq!(sent(&seq.check_timeout(due)), [(BusAddr::Dsp, 0x67)]);
+        assert!(seq.check_timers(due - MS).is_empty());
+        assert_eq!(sent(&seq.check_timers(due)), [(BusAddr::Dsp, 0x67)]);
         // Only once.
-        assert!(seq.check_timeout(due + MS).is_empty());
+        assert!(seq.check_timers(due + MS).is_empty());
     }
 
     /// DSP device info naming the model `text`.
@@ -2423,9 +2410,9 @@ mod tests {
         let (mut seq, _) = DspSequencer::new();
         dsp_sync_to_config(&mut seq, b"0.38 FS Xi    ");
         let due = t0() + DSP_QUERY_TIMEOUT;
-        assert!(seq.check_timeout(due - MS).is_empty());
+        assert!(seq.check_timers(due - MS).is_empty());
         assert!(!seq.is_complete());
-        assert!(seq.check_timeout(due).is_empty());
+        assert!(seq.check_timers(due).is_empty());
         assert!(seq.is_complete());
         assert!(seq.take_refused().is_none());
         let sync = seq.into_result();
@@ -2461,11 +2448,11 @@ mod tests {
             assert!(seq.feed(&nack, t).is_empty());
             // Not before the interval.
             t += STATUS_REPOLL_INTERVAL;
-            assert!(seq.check_cal_timeout(t - MS).is_empty());
-            assert_eq!(sent(&seq.check_cal_timeout(t)), [(BusAddr::Avr, 0xAA)]);
+            assert!(seq.check_timers(t - MS).is_empty());
+            assert_eq!(sent(&seq.check_timers(t)), [(BusAddr::Avr, 0xAA)]);
             // Once per refusal.
             t += STATUS_REPOLL_INTERVAL;
-            assert!(seq.check_cal_timeout(t).is_empty());
+            assert!(seq.check_timers(t).is_empty());
         }
         // A NACK of another command is not a refused poll.
         assert!(
@@ -2477,7 +2464,7 @@ mod tests {
         assert_eq!(sent(&seq.feed(&status, t)), [(BusAddr::Avr, 0xAA)]);
         assert!(seq.feed(&nack, t).is_empty());
         t += STATUS_REPOLL_INTERVAL;
-        assert_eq!(sent(&seq.check_cal_timeout(t)), [(BusAddr::Avr, 0xAA)]);
+        assert_eq!(sent(&seq.check_timers(t)), [(BusAddr::Avr, 0xAA)]);
         assert_eq!(sent(&seq.feed(&status, t)), [(BusAddr::Avr, 0x67)]);
         // Past the status polls a refused poll schedules nothing.
         assert!(seq.feed(&nack, t0()).is_empty());
@@ -2493,9 +2480,9 @@ mod tests {
         status[0] = 0x18;
         let status = env(BusAddr::Avr, 0xAA, status);
         assert_eq!(sent(&seq.feed(&status, t0())), [(BusAddr::Avr, 0xAA)]);
-        assert!(seq.check_cal_timeout(t0()).is_empty());
+        assert!(seq.check_timers(t0()).is_empty());
         assert_eq!(sent(&seq.feed(&status, t0())), [(BusAddr::Avr, 0x67)]);
-        assert!(seq.check_cal_timeout(t0()).is_empty());
+        assert!(seq.check_timers(t0()).is_empty());
         assert!(seq.repoll_at.is_none());
     }
 
@@ -2535,7 +2522,7 @@ mod tests {
         seq.step = AvrStep::WaitIfCal;
         seq.status = Some(AvrStatus::decode(&[0u8; 25]).unwrap());
         seq.cal_deadline = Some(t0());
-        assert!(seq.check_cal_timeout(t0()).is_empty());
+        assert!(seq.check_timers(t0()).is_empty());
         assert!(seq.is_complete());
     }
 
@@ -3009,7 +2996,7 @@ mod tests {
     #[test]
     fn keepalive_polls_pi_only_with_camera() {
         assert_eq!(
-            sent(&keepalive_actions_for(DeviceModel::Mevo)),
+            sent(&keepalive_polls(DeviceModel::Mevo)),
             [
                 (BusAddr::Dsp, 0xAA),
                 (BusAddr::Avr, 0xAA),
@@ -3017,7 +3004,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            sent(&keepalive_actions_for(DeviceModel::Xi)),
+            sent(&keepalive_polls(DeviceModel::Xi)),
             [(BusAddr::Dsp, 0xAA), (BusAddr::Avr, 0xAA)]
         );
     }

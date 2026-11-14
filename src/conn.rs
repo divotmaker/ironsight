@@ -116,22 +116,21 @@ impl From<WireError> for ConnError {
 /// Binary protocol connection to a Mevo+ device.
 ///
 /// Generic over `S: Read + Write` so callers can use any stream type.
-/// For non-blocking usage, configure the stream's read timeout externally
-/// and call [`recv()`](Self::recv) — it returns `Ok(None)` on
-/// `WouldBlock`/`TimedOut` instead of blocking.
+/// Set the stream non-blocking ([`BinaryClient::from_tcp`](crate::BinaryClient::from_tcp)
+/// does) and [`recv()`](Self::recv) returns `Ok(None)` when nothing has
+/// arrived instead of blocking.
 ///
 /// # Example (TcpStream)
 ///
 /// ```no_run
-/// use std::time::Duration;
 /// use ironsight::{BinaryConnection, ConnError};
 ///
 /// let mut conn = BinaryConnection::connect(ironsight::conn::DEFAULT_ADDR)?;
-/// conn.stream_mut().set_read_timeout(Some(Duration::from_millis(100)))?;
+/// conn.stream().set_nonblocking(true)?;
 /// loop {
 ///     match conn.recv()? {
 ///         Some(env) => println!("{:?}", env.message),
-///         None => { /* send keepalive */ }
+///         None => { /* nothing yet: do other work, then try again */ }
 ///     }
 /// }
 /// # Ok::<(), ConnError>(())
@@ -170,7 +169,7 @@ impl<S: Read + Write> BinaryConnection<S> {
         &self.stream
     }
 
-    /// Mutably borrow the underlying stream (e.g. to set read timeout).
+    /// Mutably borrow the underlying stream.
     pub fn stream_mut(&mut self) -> &mut S {
         &mut self.stream
     }
@@ -209,8 +208,8 @@ impl<S: Read + Write> BinaryConnection<S> {
     /// - `Err(Disconnected)` — stream closed by peer.
     /// - `Err(Wire|Io)` — decode or I/O error.
     ///
-    /// The stream's read timeout controls whether this blocks or returns
-    /// `Ok(None)` immediately. Set the timeout on the stream before calling.
+    /// On a non-blocking stream this returns `Ok(None)` at once when no
+    /// whole frame has arrived; on a blocking stream it waits for one.
     pub fn recv(&mut self) -> Result<Option<Envelope>, ConnError> {
         loop {
             // Drain pending frames first.

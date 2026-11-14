@@ -17,9 +17,9 @@ pub const DEFAULT_PORT: u16 = 1258;
 /// GVP camera processor connection.
 ///
 /// Generic over `S: Read + Write` so callers can use any stream type.
-/// For non-blocking usage, configure the stream's read timeout externally
-/// and call [`recv()`](Self::recv) — it returns `Ok(None)` on
-/// `WouldBlock`/`TimedOut`.
+/// Set the stream non-blocking ([`GvpClient::from_tcp`](super::GvpClient::from_tcp)
+/// does) and [`recv()`](Self::recv) returns `Ok(None)` when nothing has
+/// arrived instead of blocking.
 ///
 /// Mirrors [`crate::conn::BinaryConnection`] for the binary protocol.
 pub struct GvpConnection<S: Read + Write> {
@@ -58,7 +58,7 @@ impl<S: Read + Write> GvpConnection<S> {
         &self.stream
     }
 
-    /// Mutably borrow the underlying stream (e.g. to set read timeout).
+    /// Mutably borrow the underlying stream.
     pub fn stream_mut(&mut self) -> &mut S {
         &mut self.stream
     }
