@@ -1,25 +1,18 @@
 //! Handshake sequences, operational routines, and pollable state machines.
 //!
-//! Two layers:
-//!
-//! 1. **Sequencers** — pollable state machines ([`Sequence`] trait). Each
-//!    sequencer's `feed()` accepts a received [`Envelope`] and the time it
-//!    is handled, and returns [`Action`]s to send. The timed steps
-//!    (`check_timeout()` and friends) compare against a `now` the caller
-//!    passes too, so a sequencer reads no clock. Callers own the event loop.
-//!
-//! 2. **Blocking functions** — convenience wrappers that call [`drive()`] to
-//!    run a sequencer to completion on a blocking [`Connection`] (TcpStream).
-//!    These preserve the pre-v0.1 API for callers that don't need non-blocking.
-//!
-//! All protocol logic lives in the sequencers. The blocking functions are thin
-//! wrappers.
+//! Each sequencer is a pollable state machine ([`Sequence`] trait). Its
+//! `feed()` accepts a received [`Envelope`] and the time it is handled, and
+//! returns [`Action`]s to send. The timed steps (`check_timeout()` and
+//! friends) compare against a `now` the caller passes too, so a sequencer
+//! reads no clock. Callers own the event loop: receive an envelope, `feed()`
+//! it, and send the returned actions with [`send_action`].
+//! [`BinaryClient`](crate::BinaryClient) runs the sequencers this way.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use crate::addr::BusAddr;
-use crate::conn::{BinaryConnection, ConnError, Connection, Envelope};
+use crate::conn::{BinaryConnection, ConnError, Envelope};
 use crate::protocol::camera::{CamConfig, CamConfigReq, CamState};
 use crate::protocol::config::{
     AvrConfigCmd, AvrConfigResp, ConfigResp, ModeSet, ParamData, ParamReadReq, ParamValue, RadarCal,
@@ -31,13 +24,13 @@ use crate::protocol::handshake::{
 use crate::protocol::shot::{
     ClubPrc, ClubResult, FlightResult, FlightResultV1, PrcData, SpeedProfile, SpinResult,
 };
-use crate::protocol::status::{AvrStatus, ConfigAck, DspStatus, PiStatus, StatusPoll};
+use crate::protocol::status::{AvrStatus, ConfigAck, DspStatus, StatusPoll};
 use crate::protocol::{
     Command, Message, TYPE_DSP_QUERY, TYPE_FLIGHT_RESULT, TYPE_FLIGHT_RESULT_V1, TYPE_PARAM_VALUE,
     TYPE_STATUS,
 };
 
-/// Per-exchange timeout (2s for blocking wrappers).
+/// Per-exchange timeout.
 pub const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long the DSP sequencer waits for the DSP query response (0xC8) before
@@ -51,7 +44,7 @@ pub const DSP_QUERY_TIMEOUT: Duration = TIMEOUT;
 pub const STATUS_REPOLL_INTERVAL: Duration = Duration::from_secs(1);
 
 // ===========================================================================
-// Action, Sequence trait, drive(), infrastructure
+// Action, Sequence trait, infrastructure
 // ===========================================================================
 
 /// An action returned by a sequencer's `feed()` or `new()`.
@@ -106,43 +99,6 @@ pub fn result_ack(model: DeviceModel, env: &Envelope) -> Option<Action> {
     })
 }
 
-/// Run a sequence to completion on a blocking stream.
-///
-/// Sends initial actions, then loops recv→feed until complete.
-/// The stream must have a read timeout set to pace the loop. The
-/// `deadline` parameter controls the overall timeout for the sequence.
-pub fn drive<S: Read + Write>(
-    conn: &mut BinaryConnection<S>,
-    seq: &mut impl Sequence,
-    actions: Vec<Action>,
-    deadline: Instant,
-) -> Result<(), ConnError> {
-    for a in actions {
-        send_action(conn, a)?;
-    }
-    loop {
-        if Instant::now() >= deadline {
-            return Err(ConnError::Timeout);
-        }
-        if let Some(env) = conn.recv()? {
-            let actions = seq.feed(&env, Instant::now());
-            for a in actions {
-                send_action(conn, a)?;
-            }
-            if seq.is_complete() {
-                return Ok(());
-            }
-        }
-    }
-}
-
-/// Commands for a keepalive poll on a Mevo (DSP + AVR + PI).
-/// Fire-and-forget — responses arrive via recv().
-#[must_use]
-pub fn keepalive_actions() -> Vec<Action> {
-    keepalive_actions_for(DeviceModel::Mevo)
-}
-
 /// Commands for a keepalive poll on the given model. The PI is polled only
 /// on models that have one.
 #[must_use]
@@ -183,7 +139,7 @@ fn should_skip(env: &Envelope, expected_src: BusAddr) -> bool {
         )
 }
 
-/// Like `should_skip` but also skips ModeAck (for send_recv compatibility).
+/// Like `should_skip` but also skips ModeAck .
 fn should_skip_with_mode_ack(env: &Envelope, expected_src: BusAddr) -> bool {
     should_skip(env, expected_src) || matches!(&env.message, Message::ModeAck(_))
 }
@@ -2353,252 +2309,6 @@ impl Sequence for ShotSequencer {
     }
 }
 
-// ===========================================================================
-// Blocking convenience wrappers (preserve pre-v0.1 API)
-// ===========================================================================
-
-/// Receive the next message, silently skipping 0xE3 Text debug logs.
-///
-/// Uses deadline tracking so Text messages don't extend the timeout.
-pub fn recv_msg(conn: &mut Connection, timeout: Duration) -> Result<Envelope, ConnError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ConnError::Timeout);
-        }
-        let env = conn.recv_timeout(remaining)?;
-        if matches!(env.message, Message::Text(_) | Message::DspDebug(_)) {
-            continue;
-        }
-        return Ok(env);
-    }
-}
-
-/// Send a command to `dest`, then receive the next non-Text response from that bus.
-pub fn send_recv(
-    conn: &mut Connection,
-    cmd: &Command,
-    dest: BusAddr,
-    timeout: Duration,
-) -> Result<Envelope, ConnError> {
-    conn.send(cmd, dest)?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ConnError::Timeout);
-        }
-        let env = conn.recv_timeout(remaining)?;
-        if env.src != dest {
-            continue;
-        }
-        match &env.message {
-            Message::Text(_)
-            | Message::DspDebug(_)
-            | Message::CamState(_)
-            | Message::ModeAck(_)
-            | Message::ConfigNack(_)
-            | Message::Unknown { .. } => continue,
-            _ => {}
-        }
-        return Ok(env);
-    }
-}
-
-/// Destructure an Envelope's message or return ConnError::Protocol.
-macro_rules! expect {
-    ($env:expr, $pat:path) => {
-        match $env.message {
-            $pat(inner) => Ok(inner),
-            _ => {
-                let hex: String = $env
-                    .raw
-                    .iter()
-                    .map(|b| format!("{b:02X}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                Err(ConnError::Protocol(format!(
-                    "expected {}, got UnknownMessage(\"0x{:02X}\", [{}])",
-                    stringify!($pat),
-                    $env.type_id,
-                    hex,
-                )))
-            }
-        }
-    };
-}
-
-/// Phase 1: Query DSP (blocking wrapper).
-pub fn sync_dsp(conn: &mut Connection) -> Result<DspSync, ConnError> {
-    conn.stream_mut()
-        .set_read_timeout(Some(Duration::from_millis(100)))?;
-    let (mut seq, actions) = DspSequencer::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-
-    // DspSequencer has an optional DSP query step that can time out
-    for a in actions {
-        send_action(conn, a)?;
-    }
-    loop {
-        if Instant::now() >= deadline {
-            return Err(ConnError::Timeout);
-        }
-        for a in seq.check_timeout(Instant::now()) {
-            send_action(conn, a)?;
-        }
-        if let Some(env) = conn.recv()? {
-            for a in seq.feed(&env, Instant::now()) {
-                send_action(conn, a)?;
-            }
-            if seq.is_complete() {
-                return Ok(seq.into_result());
-            }
-        }
-    }
-}
-
-/// Phase 2: Query AVR on a Mevo (blocking wrapper).
-pub fn sync_avr(conn: &mut Connection) -> Result<AvrSync, ConnError> {
-    sync_avr_for(conn, DeviceModel::Mevo)
-}
-
-/// Phase 2: Query AVR on the given model family (blocking wrapper).
-pub fn sync_avr_for(conn: &mut Connection, model: DeviceModel) -> Result<AvrSync, ConnError> {
-    conn.stream_mut()
-        .set_read_timeout(Some(Duration::from_millis(100)))?;
-    let (mut seq, actions) = AvrSequencer::new_for(model);
-    let deadline = Instant::now() + Duration::from_secs(30);
-
-    // AvrSequencer has optional cal steps that can timeout
-    for a in actions {
-        send_action(conn, a)?;
-    }
-    loop {
-        if Instant::now() >= deadline {
-            return Err(ConnError::Timeout);
-        }
-        // Check cal timeouts
-        let timeout_actions = seq.check_cal_timeout(Instant::now());
-        for a in timeout_actions {
-            send_action(conn, a)?;
-        }
-        if seq.is_complete() {
-            return Ok(seq.into_result());
-        }
-        if let Some(env) = conn.recv()? {
-            let actions = seq.feed(&env, Instant::now());
-            for a in actions {
-                send_action(conn, a)?;
-            }
-            if seq.is_complete() {
-                return Ok(seq.into_result());
-            }
-        }
-    }
-}
-
-/// Phase 3: Query PI (blocking wrapper).
-pub fn sync_pi(conn: &mut Connection) -> Result<PiSync, ConnError> {
-    conn.stream_mut()
-        .set_read_timeout(Some(Duration::from_millis(100)))?;
-    let (mut seq, actions) = PiSequencer::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    drive(conn, &mut seq, actions, deadline)?;
-    Ok(seq.into_result())
-}
-
-/// Phase 4: Write AVR parameters, set detection mode, radar calibration (blocking wrapper).
-pub fn configure_avr(conn: &mut Connection, settings: &AvrSettings) -> Result<(), ConnError> {
-    conn.stream_mut()
-        .set_read_timeout(Some(Duration::from_millis(100)))?;
-    let (mut seq, actions) = AvrConfigSequencer::new(settings.clone());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    drive(conn, &mut seq, actions, deadline)
-}
-
-/// Phase 5: Push camera config, start camera, set PI keepalive param (blocking wrapper).
-pub fn configure_camera(conn: &mut Connection, config: &CamConfig) -> Result<(), ConnError> {
-    conn.stream_mut()
-        .set_read_timeout(Some(Duration::from_millis(100)))?;
-    let (mut seq, actions) = CameraConfigSequencer::new(config);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    drive(conn, &mut seq, actions, deadline)
-}
-
-/// Phase 6: Final status checks, arm a Mevo, wait for "ARMED" (blocking wrapper).
-pub fn arm(conn: &mut Connection) -> Result<(), ConnError> {
-    arm_for(conn, DeviceModel::Mevo)
-}
-
-/// Phase 6: Final status checks, arm the given model family, wait for "ARMED"
-/// (blocking wrapper).
-pub fn arm_for(conn: &mut Connection, model: DeviceModel) -> Result<(), ConnError> {
-    conn.stream_mut()
-        .set_read_timeout(Some(Duration::from_millis(100)))?;
-    let (mut seq, actions) = ArmSequencer::new_for(model);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    drive(conn, &mut seq, actions, deadline)
-}
-
-/// Status from all three nodes, collected during a keepalive poll.
-#[derive(Debug, Clone)]
-pub struct KeepaliveStatus {
-    pub dsp: DspStatus,
-    pub avr: AvrStatus,
-    pub pi: PiStatus,
-}
-
-/// Poll DSP → AVR → PI sequentially on a Mevo (blocking wrapper).
-///
-/// This always polls the PI, which the Xi does not have, so the blocking
-/// API cannot drive an Xi end to end; use [`BinaryClient`](crate::BinaryClient)
-/// (or [`keepalive_actions_for`]) for the Xi.
-pub fn keepalive(conn: &mut Connection) -> Result<KeepaliveStatus, ConnError> {
-    let t = TIMEOUT;
-
-    let env = send_recv(
-        conn,
-        &Command::StatusPoll(StatusPoll { pi_mode: false }),
-        BusAddr::Dsp,
-        t,
-    )?;
-    let dsp = expect!(env, Message::DspStatus)?;
-
-    let env = send_recv(
-        conn,
-        &Command::StatusPoll(StatusPoll { pi_mode: false }),
-        BusAddr::Avr,
-        t,
-    )?;
-    let avr = expect!(env, Message::AvrStatus)?;
-
-    let env = send_recv(
-        conn,
-        &Command::StatusPoll(StatusPoll { pi_mode: true }),
-        BusAddr::Pi,
-        t,
-    )?;
-    let pi = expect!(env, Message::PiStatus)?;
-
-    Ok(KeepaliveStatus { dsp, avr, pi })
-}
-
-/// Handle the entire post-shot cycle (blocking wrapper).
-///
-/// Called after receiving E5 "PROCESSED". Drives: ack → drain to IDLE →
-/// ConfigQuery → ShotResultReq → ARM → wait ARMED.
-pub fn complete_shot(conn: &mut Connection, log: impl Fn(&str)) -> Result<ShotData, ConnError> {
-    conn.stream_mut()
-        .set_read_timeout(Some(Duration::from_millis(100)))?;
-    log("waiting for IDLE...");
-    let (mut seq, actions) = ShotSequencer::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    drive(conn, &mut seq, actions, deadline)?;
-    log("RE-ARMED");
-    Ok(seq.into_result())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3391,7 +3101,7 @@ mod tests {
     #[test]
     fn keepalive_polls_pi_only_with_camera() {
         assert_eq!(
-            sent(&keepalive_actions()),
+            sent(&keepalive_actions_for(DeviceModel::Mevo)),
             [
                 (BusAddr::Dsp, 0xAA),
                 (BusAddr::Avr, 0xAA),

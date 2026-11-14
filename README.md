@@ -24,9 +24,9 @@ non-blocking clients share the same `poll()` pattern:
   shots as FRP messages. The `ironsight-frp` binary (`frp` feature) runs it as
   a launch monitor actor on an FRP bus over WebSocket.
 
-Both clients are generic over any `Read + Write` stream. Blocking convenience
-wrappers and low-level sequencer state machines are also available. No async
-runtime or heavyweight dependencies.
+Both clients are generic over any `Read + Write` stream. The low-level
+sequencer state machines are also available. No async runtime or heavyweight
+dependencies.
 
 ## Legal Basis — DMCA Section 1201(f)
 
@@ -256,9 +256,9 @@ For callers that need full control over the event loop, the `Sequence` trait
 exposes the underlying pollable state machines. Each sequencer has `feed()`
 (accept a message and the time it is handled, return commands to send) and
 `is_complete()`; the timed steps (`check_timeout()`, `check_cal_timeout()`,
-`check_drain_timeout()`) take a `now` too, so no sequencer reads a clock. The `drive()`
-function runs any sequencer to completion on a blocking stream. See
-[`examples/event_loop.rs`](examples/event_loop.rs).
+`check_drain_timeout()`) take a `now` too, so no sequencer reads a clock. Call
+`feed()` with each received `Envelope` and send the returned `Action`s with
+`seq::send_action`; `BinaryClient` is built that way.
 
 ### Device driver and FRP binary
 

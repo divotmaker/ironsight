@@ -297,25 +297,7 @@ impl BinaryConnection<TcpStream> {
         self.stream.shutdown(std::net::Shutdown::Both)?;
         Ok(())
     }
-
-    /// Block up to `timeout` for a complete frame.
-    ///
-    /// Returns `ConnError::Timeout` if no complete frame arrives in time.
-    ///
-    /// This is a convenience wrapper for callers that prefer the old
-    /// timeout-per-call style. Prefer setting the stream read timeout
-    /// once and using [`recv()`](Self::recv) directly.
-    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Envelope, ConnError> {
-        self.stream.set_read_timeout(Some(timeout))?;
-        match self.recv()? {
-            Some(env) => Ok(env),
-            None => Err(ConnError::Timeout),
-        }
-    }
 }
-
-/// Type alias for backwards compatibility.
-pub type Connection = BinaryConnection<TcpStream>;
 
 #[cfg(test)]
 mod tests {

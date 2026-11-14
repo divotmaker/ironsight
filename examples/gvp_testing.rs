@@ -12,7 +12,7 @@
 //! Both connections use non-blocking I/O. The event loop polls both clients
 //! in a tight loop, eliminating the need for threads and cross-thread signals.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::process;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,11 +25,11 @@ use ironsight::gvp::conn::DEFAULT_PORT;
 use ironsight::gvp::track::ExpectedTrack;
 use ironsight::gvp::trigger::Trigger;
 use ironsight::gvp::{GvpConnection, GvpError, GvpEvent};
-use ironsight::protocol::camera::{CamConfig, CamConfigReq, CamState};
+use ironsight::protocol::camera::{CamConfig, WARMUP};
 use ironsight::protocol::config::{MODE_CHIPPING, ParamData, ParamValue, RadarCal};
 use ironsight::protocol::shot::{ClubResult, FlightResult};
-use ironsight::seq::{self, AvrSettings, ShotData};
-use ironsight::{BinaryConnection, BusAddr, Command, ConnError, Message};
+use ironsight::seq::{AvrSettings, ShotData};
+use ironsight::{BinaryConnection, ConnError, Message};
 
 // -------------------------------------------------------------------------
 // Helpers
@@ -472,55 +472,54 @@ fn print_gvp_event(event: &GvpEvent) {
 }
 
 // -------------------------------------------------------------------------
-// Camera startup helpers
+// Setup helpers
 // -------------------------------------------------------------------------
 
-fn cam_state_poll(
-    conn: &mut BinaryConnection<std::net::TcpStream>,
-    state: u8,
-) -> Result<u8, ConnError> {
-    conn.send(&Command::CamState(CamState { state }), BusAddr::Pi)?;
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ConnError::Timeout);
-        }
-        let env = conn.recv_timeout(remaining)?;
-        if matches!(env.src, BusAddr::Pi)
-            && let Message::CamState(cs) = env.message
-        {
-            return Ok(cs.state);
-        }
-    }
-}
-
-fn start_camera(
-    conn: &mut BinaryConnection<std::net::TcpStream>,
-    config: &CamConfig,
-    label: &str,
+/// Poll the client until `done` accepts an event, or `limit` passes.
+fn poll_until(
+    client: &mut BinaryClient<TcpStream>,
+    limit: Duration,
+    mut done: impl FnMut(&BinaryEvent) -> bool,
 ) -> Result<(), ConnError> {
-    let t = Duration::from_secs(2);
-
-    conn.send(&Command::CamConfig(config.clone()), BusAddr::Pi)?;
-    let _ = seq::recv_msg(conn, t)?;
-
-    conn.send(&Command::CamConfigReq(CamConfigReq), BusAddr::Pi)?;
-    let _ = seq::recv_msg(conn, t)?;
-
-    let state = cam_state_poll(conn, 0x00)?;
-    println!("  [{label}] stop → state=0x{state:02X}");
-
-    for attempt in 1..=8 {
-        thread::sleep(Duration::from_secs(5));
-        let state = cam_state_poll(conn, 0x03)?;
-        println!("  [{label}] poll {attempt}: state=0x{state:02X}");
-        if state == 0x01 {
-            println!("  [{label}] Camera ready.");
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if let Some(event) = client.poll()?
+            && done(&event)
+        {
             return Ok(());
         }
+        thread::sleep(Duration::from_millis(5));
     }
     Err(ConnError::Timeout)
+}
+
+/// Poll the client for `duration`, keeping its keepalives running.
+fn poll_for(client: &mut BinaryClient<TcpStream>, duration: Duration) -> Result<(), ConnError> {
+    let end = Instant::now() + duration;
+    while Instant::now() < end {
+        client.poll()?;
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+/// Queue a camera configuration and wait until the client reports it done.
+fn configure_camera(
+    client: &mut BinaryClient<TcpStream>,
+    config: CamConfig,
+    label: &str,
+) -> Result<(), ConnError> {
+    client.configure_cam(config);
+    poll_until(client, Duration::from_secs(30), |event| match event {
+        BinaryEvent::Configured => true,
+        BinaryEvent::CameraSetupUnfinished { step, .. } => {
+            println!("  [{label}] WARNING: camera setup unfinished at {step}, continuing");
+            true
+        }
+        _ => false,
+    })?;
+    println!("  [{label}] camera configured.");
+    Ok(())
 }
 
 // -------------------------------------------------------------------------
@@ -540,8 +539,7 @@ fn run() -> Result<(), ConnError> {
         .parse()
         .unwrap();
 
-    // --- Blocking setup: handshake + configure + camera startup -----------
-    // These require blocking send/recv and cannot go through BinaryClient.
+    // --- Setup: handshake, configure, camera warmup, arm -------------------
     println!("Connecting to binary protocol at {binary_addr}...");
     let mut conn = BinaryConnection::connect_timeout(&binary_addr, Duration::from_secs(5))?;
     println!("Connected to binary protocol.");
@@ -551,18 +549,28 @@ fn run() -> Result<(), ConnError> {
         println!("  << {} 0x{:02X} {}B", env.src, env.type_id, env.raw.len());
     });
 
-    println!("\nDSP sync...");
-    let dsp = seq::sync_dsp(&mut conn)?;
-    println!("AVR sync...");
-    let avr = seq::sync_avr(&mut conn)?;
-    println!("PI sync...");
-    let pi = seq::sync_pi(&mut conn)?;
+    let mut binary = BinaryClient::from_tcp(conn)?;
+
+    println!("\nHandshake...");
+    binary.handshake();
+    let mut handshake = None;
+    poll_until(&mut binary, Duration::from_secs(30), |event| {
+        if let BinaryEvent::Handshake(h) = event {
+            handshake = Some(h.clone());
+            true
+        } else {
+            false
+        }
+    })?;
+    let h = handshake.expect("poll_until returned after a handshake event");
 
     println!("\n--- Handshake complete ---");
-    println!("  DSP: {}", dsp.dev_info.text);
-    println!("  AVR: {}", avr.dev_info.text);
-    println!("  PI:  {}", pi.dev_info.text);
-    println!("  Battery: {}%", dsp.status.battery_percent());
+    println!("  DSP: {}", h.dsp.dev_info.text);
+    println!("  AVR: {}", h.avr.dev_info.text);
+    if let Some(ref pi) = h.pi {
+        println!("  PI:  {}", pi.dev_info.text);
+    }
+    println!("  Battery: {}%", h.dsp.status.battery_percent());
 
     let settings = AvrSettings {
         mode: MODE_CHIPPING,
@@ -587,10 +595,20 @@ fn run() -> Result<(), ConnError> {
     };
 
     println!("\nConfiguring AVR...");
-    seq::configure_avr(&mut conn, &settings)?;
+    binary.configure_avr(settings.clone());
+    poll_until(&mut binary, Duration::from_secs(30), |event| {
+        matches!(event, BinaryEvent::Configured)
+    })?;
 
+    // The camera accepts a Fusion configuration only after it has run in
+    // standard mode for `camera::WARMUP`.
     println!("\nPhase A: Standard camera warmup...");
-    start_camera(&mut conn, &CamConfig::standard_preset(), "std")?;
+    configure_camera(&mut binary, CamConfig::standard_preset(), "std")?;
+    println!(
+        "  Waiting {}s for the camera to warm up...",
+        WARMUP.as_secs()
+    );
+    poll_for(&mut binary, WARMUP)?;
 
     let fusion_config = CamConfig::raw_fusion_preset();
     println!(
@@ -600,11 +618,9 @@ fn run() -> Result<(), ConnError> {
         fusion_config.raw_camera_mode,
         fusion_config.fusion_camera_mode,
     );
-    start_camera(&mut conn, &fusion_config, "fusion")?;
+    configure_camera(&mut binary, fusion_config, "fusion")?;
     println!("Camera ready.\n");
 
-    // --- Switch to non-blocking clients for the event loop ---------------
-    let mut binary = BinaryClient::from_tcp(conn)?;
     println!("Arming...");
     binary.arm();
 

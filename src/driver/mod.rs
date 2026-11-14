@@ -519,7 +519,7 @@ impl<S: Read + Write> MevoSession<S> {
     /// # Errors
     ///
     /// Returns what ended the session, [`Error::Stale`] once nothing has
-    /// arrived for [`STALE_TIMEOUT`] before `now`.
+    /// arrived for `STALE_TIMEOUT` before `now`.
     pub fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
         self.flush_backlog(out);
         self.apply_fusion_cam(now, out);

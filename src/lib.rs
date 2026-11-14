@@ -17,7 +17,7 @@ pub mod testing;
 
 pub use addr::BusAddr;
 pub use client::{BinaryClient, BinaryEvent, HandshakeOutcome, StatusSnapshot};
-pub use conn::{BinaryConnection, ConnError, Connection, Envelope};
+pub use conn::{BinaryConnection, ConnError, Envelope};
 pub use error::WireError;
 pub use frame::{FrameSplitter, RawFrame};
 pub use protocol::{Command, Message};
