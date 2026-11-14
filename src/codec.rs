@@ -40,17 +40,6 @@ pub fn read_uint24(data: &[u8], offset: usize) -> Result<u32> {
     Ok(((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | data[offset + 2] as u32)
 }
 
-/// Read a big-endian signed 32-bit integer.
-pub fn read_int32(data: &[u8], offset: usize) -> Result<i32> {
-    check_len(data, offset, 4, "INT32")?;
-    Ok(i32::from_be_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-    ]))
-}
-
 /// Read a big-endian unsigned 32-bit integer.
 pub fn read_uint32(data: &[u8], offset: usize) -> Result<u32> {
     check_len(data, offset, 4, "UINT32")?;
@@ -115,17 +104,6 @@ pub fn write_uint16(buf: &mut Vec<u8>, val: u16) {
 pub fn write_int24(buf: &mut Vec<u8>, val: i32) {
     let bytes = val.to_be_bytes(); // [b3, b2, b1, b0]
     buf.extend_from_slice(&bytes[1..4]); // take low 3 bytes
-}
-
-/// Write a big-endian unsigned 24-bit integer.
-pub fn write_uint24(buf: &mut Vec<u8>, val: u32) {
-    let bytes = val.to_be_bytes();
-    buf.extend_from_slice(&bytes[1..4]);
-}
-
-/// Write a big-endian signed 32-bit integer.
-pub fn write_int32(buf: &mut Vec<u8>, val: i32) {
-    buf.extend_from_slice(&val.to_be_bytes());
 }
 
 /// Write a big-endian unsigned 32-bit integer.
@@ -290,15 +268,6 @@ mod tests {
             let mut buf = Vec::new();
             write_uint16(&mut buf, val);
             assert_eq!(read_uint16(&buf, 0).unwrap(), val);
-        }
-    }
-
-    #[test]
-    fn int32_round_trip() {
-        for val in [0i32, 1, -1, i32::MAX, i32::MIN] {
-            let mut buf = Vec::new();
-            write_int32(&mut buf, val);
-            assert_eq!(read_int32(&buf, 0).unwrap(), val);
         }
     }
 }

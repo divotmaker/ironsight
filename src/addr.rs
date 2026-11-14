@@ -5,6 +5,7 @@ use crate::error::{Result, WireError};
 /// Bus addresses on the Mevo+ internal network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum BusAddr {
     /// Client application (phone, PC, our tool)
     App = 0x10,

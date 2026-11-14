@@ -165,6 +165,7 @@ fn should_skip_for_cal(env: &Envelope, expected_src: BusAddr) -> bool {
 
 /// Results from Phase 1 — DSP sync.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DspSync {
     pub status: DspStatus,
     /// DSP hardware info (0xC8). `None` when the DSP query is rejected or
@@ -436,6 +437,7 @@ impl Sequence for DspSequencer {
 
 /// Results from Phase 2 — AVR sync.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AvrSync {
     pub status: AvrStatus,
     pub dev_info: DevInfoResp,
@@ -761,6 +763,7 @@ impl Sequence for AvrSequencer {
 
 /// Results from Phase 3 — PI sync.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PiSync {
     pub dev_info: DevInfoResp,
     pub cam_config: CamConfig,
@@ -1001,7 +1004,7 @@ const MEVO_TEE_HEIGHT_ID: u8 = 0x26;
 ///
 /// ```
 /// use ironsight::protocol::config::{MODE_LIMITED_FLIGHT, RadarCal};
-/// use ironsight::seq::{AvrSettings, MevoSettings};
+/// use ironsight::{AvrSettings, MevoSettings};
 ///
 /// let settings: AvrSettings = MevoSettings::new(
 ///     MODE_LIMITED_FLIGHT,
@@ -1269,6 +1272,7 @@ impl XiShotType {
 /// Build one with [`full_swing`](Self::full_swing) or
 /// [`pitching`](Self::pitching).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct XiSettings {
     /// Detection mode commsIndex:
     /// [`MODE_LIMITED_FLIGHT`](crate::protocol::config::MODE_LIMITED_FLIGHT)
@@ -2041,6 +2045,7 @@ impl Sequence for ArmSequencer {
 /// "PROCESSED"; late ones may still arrive after "PROCESSED", before "IDLE".
 /// This struct captures them from either window.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ShotData {
     /// Primary ball flight result (0xD4).
     pub flight: Option<FlightResult>,
@@ -2064,6 +2069,7 @@ pub struct ShotData {
 /// diagnostic data (`SpeedProfile`, `PrcData`, `ClubPrc`) is available
 /// in the accumulated [`ShotData`] of `BinaryEvent::ShotComplete`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ShotDatum {
     /// Primary ball flight (0xD4). Normally arrives before PROCESSED, after
     /// the E8.

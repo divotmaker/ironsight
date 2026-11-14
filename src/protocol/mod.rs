@@ -145,6 +145,7 @@ pub fn is_bulk_shot_data(type_id: u8) -> bool {
 
 /// A message we send to the Mevo+ (APP → DSP/AVR/PI).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Command {
     // -- Status --
     StatusPoll(status::StatusPoll),
@@ -250,6 +251,7 @@ impl Command {
 /// Covers both solicited responses (handshake, config) and unsolicited
 /// device pushes (shot results, state notifications).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Message {
     // -- Status & keepalive --
     AvrStatus(status::AvrStatus),

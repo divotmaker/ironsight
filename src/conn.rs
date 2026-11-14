@@ -19,6 +19,7 @@ pub const DEFAULT_ADDR: &str = "192.168.2.1:5100";
 
 /// A decoded device message with its source bus address and raw payload.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct Envelope {
     pub src: BusAddr,
     /// Wire message type ID (e.g. 0xD4).
@@ -51,6 +52,7 @@ impl fmt::Debug for Envelope {
 
 /// Errors from connection operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ConnError {
     /// I/O error from the underlying stream.
     Io(io::Error),
@@ -125,7 +127,7 @@ impl From<WireError> for ConnError {
 /// ```no_run
 /// use ironsight::{BinaryConnection, ConnError};
 ///
-/// let mut conn = BinaryConnection::connect(ironsight::conn::DEFAULT_ADDR)?;
+/// let mut conn = BinaryConnection::connect(ironsight::DEFAULT_ADDR)?;
 /// conn.stream().set_nonblocking(true)?;
 /// loop {
 ///     match conn.recv()? {

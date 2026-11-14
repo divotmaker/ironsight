@@ -17,8 +17,7 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ironsight::client::{BinaryClient, BinaryEvent};
-use ironsight::conn::DEFAULT_ADDR;
+use ironsight::DEFAULT_ADDR;
 use ironsight::gvp::client::GvpClient;
 use ironsight::gvp::config::GvpConfig;
 use ironsight::gvp::conn::DEFAULT_PORT;
@@ -28,7 +27,8 @@ use ironsight::gvp::{GvpConnection, GvpError, GvpEvent};
 use ironsight::protocol::camera::{CamConfig, WARMUP};
 use ironsight::protocol::config::{MODE_CHIPPING, ParamData, ParamValue, RadarCal};
 use ironsight::protocol::shot::{ClubResult, FlightResult};
-use ironsight::seq::{AvrSettings, ShotData};
+use ironsight::{AvrSettings, ShotData};
+use ironsight::{BinaryClient, BinaryEvent};
 use ironsight::{BinaryConnection, ConnError, Message};
 
 // -------------------------------------------------------------------------
@@ -468,6 +468,7 @@ fn print_gvp_event(event: &GvpEvent) {
         GvpEvent::Unknown { msg_type, .. } => {
             println!("  [gvp] {msg_type} (unknown)");
         }
+        _ => {}
     }
 }
 
@@ -788,6 +789,7 @@ fn run() -> Result<(), ConnError> {
                 | BinaryEvent::Keepalive(_)
                 | BinaryEvent::StepRefused(_)
                 | BinaryEvent::CameraSetupUnfinished { .. } => {}
+                _ => {}
             }
         }
 

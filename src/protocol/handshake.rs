@@ -11,6 +11,7 @@ fn decode_cstr(slot: &[u8]) -> String {
 
 /// Device hardware generation, detected from the C8 `dspType` byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeviceGen {
     /// Mevo+ (dspType 0x80)
     MevoPlus,

@@ -28,6 +28,7 @@ use super::{GvpCommand, GvpError, GvpMessage};
 
 /// Events emitted by [`GvpClient::poll()`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum GvpEvent {
     /// Camera configuration (response to config query or push).
     Config(GvpConfig),

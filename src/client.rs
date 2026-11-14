@@ -37,6 +37,7 @@ use crate::seq::{
 
 /// Events emitted by [`BinaryClient::poll()`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BinaryEvent {
     /// Handshake (DSP + AVR sync, plus PI sync on models with a camera)
     /// complete.
@@ -91,6 +92,7 @@ pub enum BinaryEvent {
 
 /// Combined results from the handshake.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HandshakeOutcome {
     /// Model family, detected from the DSP device info.
     pub model: DeviceModel,
@@ -102,6 +104,7 @@ pub struct HandshakeOutcome {
 
 /// Latest cached status from keepalive responses.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct StatusSnapshot {
     pub dsp: Option<DspStatus>,
     pub avr: Option<AvrStatus>,
@@ -227,9 +230,9 @@ const TRIGGER_TIMEOUT: Duration = Duration::from_secs(30);
 /// # Usage
 ///
 /// ```no_run
-/// use ironsight::client::{BinaryClient, BinaryEvent};
+/// use ironsight::{BinaryClient, BinaryEvent};
 /// use ironsight::BinaryConnection;
-/// use ironsight::conn::DEFAULT_ADDR;
+/// use ironsight::DEFAULT_ADDR;
 ///
 /// let conn = BinaryConnection::connect(DEFAULT_ADDR)?;
 /// let mut client = BinaryClient::from_tcp(conn)?;

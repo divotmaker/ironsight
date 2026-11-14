@@ -72,6 +72,7 @@ impl AvrStatus {
 /// - `0x80` (128): Gen1 Mevo+, 129 bytes. Fully decoded.
 /// - `0x46` (70):  Gen2 Mevo,   71 bytes. Field layout differs; raw bytes preserved.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum DspStatus {
     /// Gen1 Mevo+ (version 0x80, 129 bytes). All fields decoded.
     V80(DspStatus80),

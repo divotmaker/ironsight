@@ -104,6 +104,7 @@ pub struct Config {
 /// yields no Fusion club data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CameraMode {
     /// Ball flight and radar club data, no Fusion processing. The default.
     #[default]
@@ -118,6 +119,7 @@ pub enum CameraMode {
 /// mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FlightScopeEnvironment {
     /// Nets and simulator screens, where the ball's flight is cut short. The
     /// default.
@@ -135,6 +137,7 @@ pub enum FlightScopeEnvironment {
 /// gives the same shot there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SpinSource {
     /// Backspin and sidespin from the full result, as reported. The default.
     #[default]

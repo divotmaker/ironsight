@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Errors arising from wire protocol parsing and encoding.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum WireError {
     #[error("frame too short ({len} bytes, minimum 7)")]
     FrameTooShort { len: usize },

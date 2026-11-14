@@ -8,14 +8,14 @@ use std::net::SocketAddr;
 use std::process;
 use std::time::{Duration, Instant};
 
+use ironsight::AvrSettings;
 use ironsight::BinaryConnection;
-use ironsight::client::{BinaryClient, BinaryEvent};
-use ironsight::conn::DEFAULT_ADDR;
+use ironsight::DEFAULT_ADDR;
 use ironsight::protocol::camera::CamConfig;
 use ironsight::protocol::config::{
     MODE_CHIPPING, MODE_LIMITED_FLIGHT, MODE_PUTTING, ParamData, ParamValue, RadarCal,
 };
-use ironsight::seq::AvrSettings;
+use ironsight::{BinaryClient, BinaryEvent};
 
 // ── Test steps ───────────────────────────────────────────────────────────────
 

@@ -73,6 +73,7 @@ const VERSION_EXPECTED_TRACK: i32 = 1;
 
 /// Errors from GVP protocol operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum GvpError {
     /// TCP I/O error.
     #[error("I/O error: {0}")]
@@ -101,6 +102,7 @@ pub enum GvpError {
 
 /// A message received from the GVP (GVP → APP).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum GvpMessage {
     /// Camera configuration (response to CONFIG_REQUEST or echo).
     Config(config::GvpConfig),
@@ -165,6 +167,7 @@ impl GvpMessage {
 
 /// A message we send to the GVP (APP → GVP).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum GvpCommand {
     /// Request current camera configuration.
     ConfigRequest,
