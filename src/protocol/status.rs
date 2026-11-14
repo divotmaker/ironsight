@@ -201,6 +201,13 @@ pub struct DspStatus46 {
 
 impl DspStatus46 {
     pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() < 2 {
+            return Err(WireError::payload_too_short(
+                "DspStatus46",
+                2,
+                payload.len(),
+            ));
+        }
         Ok(Self {
             state: payload[1],
             version: payload[0],
@@ -316,5 +323,16 @@ impl Text {
         Ok(Self {
             text: String::from_utf8_lossy(&payload[start..end]).into_owned(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_version_46_status_shorter_than_its_header_is_an_error() {
+        assert!(DspStatus46::decode(&[0x46]).is_err());
+        assert!(DspStatus46::decode(&[]).is_err());
     }
 }

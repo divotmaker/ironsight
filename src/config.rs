@@ -57,6 +57,7 @@ pub const DEFAULT_TRACK_PCT: f64 = 80.0;
 /// table works in both.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct Config {
     /// The device's address, `host:port`. Unset: [`DEFAULT_ADDRESS`]
     /// (`192.168.2.1:5100`, the device's own WiFi network).

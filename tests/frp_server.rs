@@ -68,11 +68,9 @@ fn fake_xi_over_tcp(stop: Stop) -> (SocketAddr, mpsc::Sender<Shot>, std::thread:
 fn a_controller_reads_an_xi_shot() {
     let stop = Stop::new();
     let (device_addr, todo, device) = fake_xi_over_tcp(stop.clone());
-    let driver = Mevo::new(Config {
-        address: Some(device_addr.to_string()),
-        ..Config::default()
-    })
-    .expect("config");
+    let mut config = Config::default();
+    config.address = Some(device_addr.to_string());
+    let driver = Mevo::new(config).expect("config");
     assert_eq!(Mevo::info(driver.config()).source, Source::Measured);
 
     let (addr_tx, addr_rx) = mpsc::channel();

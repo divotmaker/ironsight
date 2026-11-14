@@ -67,6 +67,8 @@ pub use addr::BusAddr;
 pub use client::{
     BinaryClient, BinaryEvent, CAMERA_SETUP_TIMEOUT, HandshakeOutcome, StatusSnapshot,
 };
+#[cfg(feature = "config")]
+pub use config::Config;
 pub use conn::{BinaryConnection, ConnError, DEFAULT_ADDR, Envelope};
 pub use error::WireError;
 pub use frame::{FrameSplitter, RawFrame};
