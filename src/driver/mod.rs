@@ -390,12 +390,11 @@ impl Wire {
             .push(frame);
     }
 
-    /// Emit the collected frames: as `shot.raw` frames while raw frames are
-    /// on and `raw` allows them (after the handshake), or as audit lines for a
-    /// frame that is audit-only ([`audit_only`]) and every frame while `raw`
-    /// is false. Keeps the latest full and early result payloads in
+    /// Emit the collected frames: as `shot.raw` frames once the handshake is
+    /// done (`after_handshake`), except a frame that is audit-only
+    /// ([`audit_only`]), and as audit lines before then. Keeps the latest full and early result payloads in
     /// `results`. Returns whether a frame from the device was among them.
-    fn emit(&self, out: &mut Events<'_>, results: &mut LastResults, raw: bool) -> bool {
+    fn emit(&self, out: &mut Events<'_>, results: &mut LastResults, after_handshake: bool) -> bool {
         let frames = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
         let mut received = false;
         for f in frames {
@@ -413,7 +412,7 @@ impl Wire {
                 label,
                 f.payload,
                 f.at_ms,
-                !raw || audit_only(f.type_id),
+                !after_handshake || audit_only(f.type_id),
             );
         }
         received

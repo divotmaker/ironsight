@@ -265,9 +265,9 @@ impl Config {
     #[must_use]
     pub fn mevo_mode(&self, mode: Mode) -> u8 {
         match mode {
-            Mode::Full => self.full_swing_mode(),
             Mode::Putting => MODE_PUTTING,
             Mode::Chipping => MODE_CHIPPING,
+            _ => self.full_swing_mode(),
         }
     }
 
@@ -300,8 +300,8 @@ impl Config {
     #[must_use]
     pub fn xi_settings(&self, mode: Mode) -> XiSettings {
         match mode {
-            Mode::Full => XiSettings::full_swing(self.full_swing_mode(), self.radar_cal()),
             Mode::Chipping | Mode::Putting => XiSettings::pitching(self.radar_cal()),
+            _ => XiSettings::full_swing(self.full_swing_mode(), self.radar_cal()),
         }
     }
 
@@ -315,10 +315,10 @@ impl Config {
             (DeviceModel::Xi, Mode::Full, false) => "full-swing limited-flight(9)",
             (DeviceModel::Xi, Mode::Full, true) => "full-swing outdoor(8)",
             (DeviceModel::Xi, _, _) => "pitching limited-flight(9)",
-            (DeviceModel::Mevo, Mode::Full, false) => "limited-flight(9)",
-            (DeviceModel::Mevo, Mode::Full, true) => "outdoor(8)",
             (DeviceModel::Mevo, Mode::Putting, _) => "putting(3)",
             (DeviceModel::Mevo, Mode::Chipping, _) => "chipping(5)",
+            (DeviceModel::Mevo, _, false) => "limited-flight(9)",
+            (DeviceModel::Mevo, _, true) => "outdoor(8)",
         }
     }
 

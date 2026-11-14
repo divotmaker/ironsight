@@ -10,7 +10,7 @@ use std::sync::mpsc;
 
 use flightrelay::driver::{FrpDriver, Stop};
 use flightrelay::{
-    EndpointConfig, FrpBody, FrpEndpoint, FrpServer, ServerConfig, ServerEvent, Source, Transport,
+    EndpointConfig, FrpBody, FrpEndpoint, FrpServer, ServerConfig, ServerEvent, Source, Target,
 };
 use ironsight::config::Config;
 use ironsight::driver::Mevo;
@@ -80,7 +80,7 @@ fn a_controller_reads_an_xi_shot() {
     let server = std::thread::spawn(move || {
         FrpServer::new(
             driver,
-            ServerConfig::new(Transport::listen("127.0.0.1:0"), ACTOR),
+            ServerConfig::new(Target::listen("127.0.0.1:0"), ACTOR),
         )
         .on_event(move |event| {
             if let ServerEvent::Listening(addr) = event {
@@ -91,7 +91,7 @@ fn a_controller_reads_an_xi_shot() {
     });
     let addr: SocketAddr = addr_rx.recv().expect("listening");
 
-    let mut peer = FrpEndpoint::open(EndpointConfig::new(Transport::connect(format!(
+    let mut peer = FrpEndpoint::open(EndpointConfig::new(Target::connect(format!(
         "ws://{addr}/frp"
     ))))
     .expect("open");

@@ -11,7 +11,7 @@
 //! way, for a shot whose full result never came.
 
 use flightrelay::types::{Basis, ClubData, FlightResult, Launch};
-use flightrelay::units::{Distance, Velocity};
+use flightrelay::{Distance, Velocity};
 
 use crate::protocol::shot::{ClubResult, FlightResult as FullResult, FlightResultV1};
 
