@@ -468,7 +468,7 @@ enum AvrStep {
 /// ConfigQuery → factory cal (0xD2, optional) → IF cal (0xD0, optional) →
 /// AvrConfigQuery (0x23) → ParamRead 0x64 → TimeSync.
 ///
-/// Xi sequence ([`new_for(DeviceModel::Xi)`](Self::new_for)): the same up to
+/// Xi sequence ([`new(DeviceModel::Xi)`](Self::new)): the same up to
 /// ConfigQuery, then IF cal (0xD0, optional) and done. The factory cal
 /// request, AvrConfigQuery (which the Xi rejects), param 0x64 and TimeSync
 /// are not sent.
@@ -494,15 +494,9 @@ pub struct AvrSequencer {
 }
 
 impl AvrSequencer {
-    /// AVR sync for a Mevo.
-    #[must_use]
-    pub fn new() -> (Self, Vec<Action>) {
-        Self::new_for(DeviceModel::Mevo)
-    }
-
     /// AVR sync for the given model family.
     #[must_use]
-    pub fn new_for(model: DeviceModel) -> (Self, Vec<Action>) {
+    pub fn new(model: DeviceModel) -> (Self, Vec<Action>) {
         let seq = Self {
             step: AvrStep::WaitStatus1,
             model,
@@ -973,33 +967,6 @@ impl AvrSettings {
             params: vec![],
             radar_cal: None,
         }
-    }
-
-    /// Mode-only configuration for the Xi in limited-flight mode
-    /// ([`MODE_LIMITED_FLIGHT`](crate::protocol::config::MODE_LIMITED_FLIGHT),
-    /// 9). Same as [`xi_with_mode`](Self::xi_with_mode) with that mode.
-    #[deprecated(
-        note = "sends the detection mode only; use BinaryClient::configure_xi with XiSettings"
-    )]
-    #[must_use]
-    pub fn xi() -> Self {
-        #[allow(deprecated)]
-        Self::xi_with_mode(crate::protocol::config::MODE_LIMITED_FLIGHT)
-    }
-
-    /// Mode-only configuration for the Xi in the given detection mode
-    /// (commsIndex). [`AvrConfigSequencer`] sends B0 `[01 00]`, A5
-    /// `[02 00 mode]` and B0 `[01 00]`: no parameter writes and no radar
-    /// calibration, so the Xi runs on whatever values it holds.
-    ///
-    /// [`BinaryClient::configure_xi`](crate::BinaryClient::configure_xi)
-    /// sends the Xi its full configuration; see [`XiSettings`].
-    #[deprecated(
-        note = "sends the detection mode only; use BinaryClient::configure_xi with XiSettings"
-    )]
-    #[must_use]
-    pub fn xi_with_mode(mode: u8) -> Self {
-        Self::mode_only(mode)
     }
 }
 
@@ -1920,7 +1887,7 @@ enum ArmStep {
 /// can still produce ConfigNack retries, but typically fewer.
 /// The overall operation timeout (set by the caller) limits retries.
 ///
-/// On a model without a camera Pi ([`new_for(DeviceModel::Xi)`](Self::new_for))
+/// On a model without a camera Pi ([`new(DeviceModel::Xi)`](Self::new))
 /// step 4 skips the PI poll and waits for the "ARMED" text alone.
 pub struct ArmSequencer {
     step: ArmStep,
@@ -1930,15 +1897,9 @@ pub struct ArmSequencer {
 }
 
 impl ArmSequencer {
-    /// Arm a Mevo.
-    #[must_use]
-    pub fn new() -> (Self, Vec<Action>) {
-        Self::new_for(DeviceModel::Mevo)
-    }
-
     /// Arm the given model family.
     #[must_use]
-    pub fn new_for(model: DeviceModel) -> (Self, Vec<Action>) {
+    pub fn new(model: DeviceModel) -> (Self, Vec<Action>) {
         let seq = Self {
             step: ArmStep::WaitDspStatus,
             retries: 0,
@@ -2488,7 +2449,7 @@ mod tests {
     /// answers.
     #[test]
     fn avr_status_nack_repolls() {
-        let (mut seq, actions) = AvrSequencer::new_for(DeviceModel::Xi);
+        let (mut seq, actions) = AvrSequencer::new(DeviceModel::Xi);
         assert_eq!(sent(&actions), [(BusAddr::Avr, 0xAA)]);
         let nack = env(BusAddr::Avr, 0x94, hex("02302a"));
         let mut status = vec![0u8; 25];
@@ -2526,7 +2487,7 @@ mod tests {
     /// Without a refusal the AVR sync sends exactly what it always has.
     #[test]
     fn mevo_avr_sync_without_nack_is_unchanged() {
-        let (mut seq, actions) = AvrSequencer::new();
+        let (mut seq, actions) = AvrSequencer::new(DeviceModel::Mevo);
         assert_eq!(sent(&actions), [(BusAddr::Avr, 0xAA)]);
         let mut status = vec![0u8; 25];
         status[0] = 0x18;
@@ -2540,7 +2501,7 @@ mod tests {
 
     #[test]
     fn xi_avr_sync_ends_after_if_cal() {
-        let (mut seq, actions) = AvrSequencer::new_for(DeviceModel::Xi);
+        let (mut seq, actions) = AvrSequencer::new(DeviceModel::Xi);
         assert_eq!(sent(&actions), [(BusAddr::Avr, 0xAA)]);
         let mut status = vec![0u8; 25];
         status[0] = 0x18;
@@ -2570,7 +2531,7 @@ mod tests {
 
     #[test]
     fn xi_avr_sync_if_cal_timeout_completes() {
-        let (mut seq, _) = AvrSequencer::new_for(DeviceModel::Xi);
+        let (mut seq, _) = AvrSequencer::new(DeviceModel::Xi);
         seq.step = AvrStep::WaitIfCal;
         seq.status = Some(AvrStatus::decode(&[0u8; 25]).unwrap());
         seq.cal_deadline = Some(t0());
@@ -2580,7 +2541,7 @@ mod tests {
 
     #[test]
     fn xi_arm_waits_for_armed_text_only() {
-        let (mut seq, actions) = ArmSequencer::new_for(DeviceModel::Xi);
+        let (mut seq, actions) = ArmSequencer::new(DeviceModel::Xi);
         assert_eq!(sent(&actions), [(BusAddr::Dsp, 0xAA)]);
         assert_eq!(sent(&seq.feed(&dsp_status(), t0())), [(BusAddr::Avr, 0xAA)]);
         let avr_status = env(BusAddr::Avr, 0xAA, vec![0u8; 25]);
@@ -2595,7 +2556,7 @@ mod tests {
 
     #[test]
     fn mevo_arm_polls_pi() {
-        let (mut seq, _) = ArmSequencer::new();
+        let (mut seq, _) = ArmSequencer::new(DeviceModel::Mevo);
         seq.feed(&dsp_status(), t0());
         seq.feed(&env(BusAddr::Avr, 0xAA, vec![0u8; 25]), t0());
         let ack = env(BusAddr::Avr, 0x95, vec![0x02, 0x30, 0x30]);
@@ -2604,59 +2565,6 @@ mod tests {
         assert!(!seq.is_complete());
         seq.feed(&env(BusAddr::Pi, 0xAA, vec![0u8; 17]), t0());
         assert!(seq.is_complete());
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn xi_settings_mode_only() {
-        use crate::protocol::config::{MODE_FULL_OUTDOOR, MODE_LIMITED_FLIGHT};
-        assert_eq!(MODE_LIMITED_FLIGHT, 9);
-        assert_eq!(MODE_FULL_OUTDOOR, 8);
-        let s = AvrSettings::xi();
-        assert_eq!(s.mode, MODE_LIMITED_FLIGHT);
-        assert!(s.params.is_empty());
-        assert!(s.radar_cal.is_none());
-        let s = AvrSettings::xi_with_mode(MODE_FULL_OUTDOOR);
-        assert_eq!(s.mode, MODE_FULL_OUTDOOR);
-        assert!(s.params.is_empty());
-        assert!(s.radar_cal.is_none());
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn xi_avr_config_writes_only_the_mode() {
-        use crate::protocol::config::MODE_FULL_OUTDOOR;
-        let (mut seq, actions) =
-            AvrConfigSequencer::new(AvrSettings::xi_with_mode(MODE_FULL_OUTDOOR));
-        let mut all = actions;
-        let ack = env(BusAddr::Avr, 0x95, vec![0x02, 0x30, 0x30]);
-        let mut guard = 0;
-        while !seq.is_complete() {
-            guard += 1;
-            assert!(guard < 10, "config sequence did not finish: {all:?}");
-            let reply = match all.last() {
-                Some(Action::Send(Command::ModeSet(m), _)) => {
-                    env(BusAddr::Avr, 0xA5, vec![0x02, 0x00, m.mode])
-                }
-                _ => ack.clone(),
-            };
-            all.extend(seq.feed(&reply, t0()));
-        }
-        let wire: Vec<(u8, Vec<u8>)> = all
-            .iter()
-            .map(|Action::Send(cmd, dest)| {
-                let f = cmd.encode(*dest);
-                (f.type_id, f.payload)
-            })
-            .collect();
-        assert_eq!(
-            wire,
-            [
-                (0xB0, vec![0x01, 0x00]),
-                (0xA5, vec![0x02, 0x00, 0x08]),
-                (0xB0, vec![0x01, 0x00]),
-            ]
-        );
     }
 
     fn hex(s: &str) -> Vec<u8> {

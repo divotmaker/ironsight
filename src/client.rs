@@ -736,7 +736,7 @@ impl<S: Read + Write> BinaryClient<S> {
                 self.active = Some(ActiveOp::Configure(ConfigurePhase::Camera(cam_seq)));
             }
             QueuedOp::Arm => {
-                let (seq, actions) = ArmSequencer::new_for(self.model());
+                let (seq, actions) = ArmSequencer::new(self.model());
                 for a in actions {
                     seq::send_action(&mut self.conn, a)?;
                 }
@@ -902,7 +902,7 @@ impl<S: Read + Write> BinaryClient<S> {
             ActiveOp::Handshake { phase, dsp, avr } => match *phase {
                 HandshakePhase::Dsp(seq) => {
                     let dsp_result = seq.into_result();
-                    let (avr_seq, actions) = AvrSequencer::new_for(dsp_result.model);
+                    let (avr_seq, actions) = AvrSequencer::new(dsp_result.model);
                     for a in actions {
                         seq::send_action(&mut self.conn, a)?;
                     }

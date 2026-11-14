@@ -82,10 +82,6 @@ pub enum GvpError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// No complete message available (stream returned `WouldBlock`/`TimedOut`).
-    #[error("recv timed out")]
-    Timeout,
-
     /// TCP stream closed by peer.
     #[error("connection closed by GVP")]
     Disconnected,

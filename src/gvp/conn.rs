@@ -161,18 +161,4 @@ impl GvpConnection<TcpStream> {
         self.stream.shutdown(std::net::Shutdown::Both)?;
         Ok(())
     }
-
-    /// Block up to `timeout` for a complete message.
-    ///
-    /// Returns `GvpError::Timeout` if no complete message arrives in time.
-    ///
-    /// Convenience wrapper. Prefer setting the stream read timeout once
-    /// and using [`recv()`](Self::recv) directly.
-    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<GvpMessage, GvpError> {
-        self.stream.set_read_timeout(Some(timeout))?;
-        match self.recv()? {
-            Some(msg) => Ok(msg),
-            None => Err(GvpError::Timeout),
-        }
-    }
 }
