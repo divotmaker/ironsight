@@ -11,8 +11,7 @@ use std::time::{Duration, Instant};
 
 use flightrelay::driver::{FrpDriver, Stop};
 use flightrelay::{
-    BusActor, EndpointConfig, FrpBody, FrpEndpoint, FrpServer, ServerConfig, ServerEvent, Source,
-    Transport,
+    EndpointConfig, FrpBody, FrpEndpoint, FrpServer, ServerConfig, ServerEvent, Source, Transport,
 };
 use ironsight::config::Config;
 use ironsight::driver::Mevo;
@@ -20,16 +19,6 @@ use ironsight::testing::{FakeDevice, Shot};
 
 /// The launch monitor actor's id.
 const ACTOR: &str = "3c9e1f27b04d68a5";
-
-/// The actor's blockers as `"true"` (none: armed) or `"false"`
-/// (`not_armed`).
-fn ready(actor: &BusActor) -> String {
-    match actor.blockers.as_slice() {
-        [] => "true".to_owned(),
-        [b] if b == "not_armed" => "false".to_owned(),
-        other => panic!("unexpected blockers {other:?}"),
-    }
-}
 
 /// What the scripted device does next.
 enum Do {
@@ -143,7 +132,7 @@ fn a_controller_reads_an_xi_shot_and_the_driver_reconnects() {
                 if device.model.is_some() {
                     identity = Some((device.model.clone(), device.firmware.clone()));
                 }
-                if ready(&actor) == "true" {
+                if actor.blockers.is_empty() {
                     ready_seen = true;
                 }
             }
@@ -174,18 +163,18 @@ fn a_controller_reads_an_xi_shot_and_the_driver_reconnects() {
     let mut states = Vec::new();
     let mut lost = false;
     // (The shot's own re-arm may still be on its way.)
-    let reconnected = |states: &[String]| {
+    let reconnected = |states: &[bool]| {
         states
             .iter()
-            .position(|r| r == "false")
-            .is_some_and(|i| states[i..].iter().any(|r| r == "true"))
+            .position(|ready| !ready)
+            .is_some_and(|i| states[i..].iter().any(|ready| *ready))
     };
     while !(lost && reconnected(&states)) {
         assert!(Instant::now() < give_up, "saw {states:?}");
         let msg = conn.recv().expect("recv");
         assert_eq!(msg.from, ACTOR);
         match msg.body {
-            FrpBody::BusActor(actor) => states.push(ready(&actor)),
+            FrpBody::BusActor(actor) => states.push(actor.blockers.is_empty()),
             // The driver's alert about the loss, under the actor's id.
             FrpBody::BusAlert(alert) => {
                 assert!(alert.message.contains("closed"), "{}", alert.message);

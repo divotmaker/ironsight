@@ -8,8 +8,10 @@ use std::time::Duration;
 
 use flightrelay::config::DriverConfig;
 use flightrelay::driver::{DeviceEvent, FrpDriver, Level, TurnHints};
-use flightrelay::testing::TestHost;
-use flightrelay::types::{Basis, ClubData, FlightResult as Flight, Launch};
+use flightrelay::testing::{
+    TestHost, alerts, clubs, flights, kinds, launches, raw_frames, status, statuses,
+};
+use flightrelay::types::Basis;
 use flightrelay::{FrpBody, Mode, RawDir, Severity, Source};
 
 use super::*;
@@ -135,100 +137,30 @@ impl Run {
         self.events[start..].to_vec()
     }
 
+    /// Hand `session` the hints of a new turn.
+    fn hints<S: Read + Write>(&mut self, session: &mut MevoSession<S>, hints: &TurnHints) {
+        self.host
+            .with(|_, out| session.hints(hints, out))
+            .expect("hints");
+        self.collect();
+    }
+
     fn close<S: Read + Write>(&mut self, session: MevoSession<S>) {
         self.host.with(|_, out| session.close(out)).expect("close");
         self.collect();
     }
 }
 
-/// A value of a device status, as text: `"ready"` is `"true"` for no
-/// blockers and `"false"` for `not_armed`; `tilt`, `roll` and `battery_pct`
-/// come from their fields (none: no reading), any other key from the
-/// telemetry.
-fn status(e: &DeviceEvent, key: &str) -> Option<String> {
-    let DeviceEvent::Status(s) = e else {
-        return None;
-    };
-    match key {
-        "ready" => Some(if s.blockers.is_empty() {
-            "true".to_owned()
-        } else {
-            assert_eq!(s.blockers, [blockers::NOT_ARMED]);
-            "false".to_owned()
-        }),
-        "tilt" => s.tilt.map(|v| format!("{v:.1}")),
-        "roll" => s.roll.map(|v| format!("{v:.1}")),
-        "battery_pct" => s.battery_pct.map(|v| v.to_string()),
-        key => s.telemetry.get(key).cloned(),
-    }
+/// The kinds of what the driver sent, without its raw frames.
+fn lifecycle(events: &[DeviceEvent]) -> Vec<&str> {
+    let mut kinds = kinds(events);
+    kinds.retain(|k| *k != "shot.raw");
+    kinds
 }
 
-/// Whether `e` is a status change with no blockers: armed and ready.
+/// Whether `e` is a status with no blockers: armed and ready.
 fn is_ready(e: &DeviceEvent) -> bool {
-    status(e, "ready").as_deref() == Some("true")
-}
-
-/// The shot lifecycle events and alerts, by kind, in order.
-fn kinds(events: &[DeviceEvent]) -> Vec<&'static str> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            DeviceEvent::Frp(FrpBody::ShotTrigger(_)) => Some("trigger"),
-            DeviceEvent::Frp(FrpBody::ShotLaunch(_)) => Some("launch"),
-            DeviceEvent::Frp(FrpBody::ShotFlight(_)) => Some("flight"),
-            DeviceEvent::Frp(FrpBody::ShotClub(_)) => Some("club"),
-            DeviceEvent::Frp(FrpBody::ShotFinished(_)) => Some("finished"),
-            DeviceEvent::Frp(FrpBody::BusAlert(_)) => Some("alert"),
-            _ => None,
-        })
-        .collect()
-}
-
-fn launch_of(events: &[DeviceEvent]) -> Launch {
-    events
-        .iter()
-        .find_map(|e| match e {
-            DeviceEvent::Frp(FrpBody::ShotLaunch(m)) => Some(m.launch.clone()),
-            _ => None,
-        })
-        .expect("a launch")
-}
-
-fn flight_of(events: &[DeviceEvent]) -> Option<Flight> {
-    events.iter().find_map(|e| match e {
-        DeviceEvent::Frp(FrpBody::ShotFlight(m)) => Some(m.flight.clone()),
-        _ => None,
-    })
-}
-
-fn club_of(events: &[DeviceEvent]) -> Option<ClubData> {
-    events.iter().find_map(|e| match e {
-        DeviceEvent::Frp(FrpBody::ShotClub(m)) => Some(m.club.clone()),
-        _ => None,
-    })
-}
-
-fn alerts(events: &[DeviceEvent]) -> Vec<String> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            DeviceEvent::Frp(FrpBody::BusAlert(alert)) => {
-                assert_eq!(alert.severity, Severity::Warn);
-                Some(alert.message.clone())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn raw_frames(events: &[DeviceEvent]) -> Vec<&flightrelay::RawFrame> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            DeviceEvent::Frp(FrpBody::ShotRaw(f)) => Some(f),
-            _ => None,
-        })
-        .collect()
+    matches!(e, DeviceEvent::Status(s) if s.blockers.is_empty())
 }
 
 fn driver(config: Config) -> Mevo {
@@ -307,8 +239,14 @@ fn a_whole_xi_session_identifies_arms_and_reports_a_shot_once() {
     run.armed(&mut session);
     let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
     assert_eq!(
-        kinds(&shot),
-        ["trigger", "launch", "flight", "club", "finished"]
+        lifecycle(&shot),
+        [
+            "shot.trigger",
+            "shot.launch",
+            "shot.flight",
+            "shot.club",
+            "shot.finished"
+        ]
     );
     let key = match &shot
         .iter()
@@ -322,7 +260,7 @@ fn a_whole_xi_session_identifies_arms_and_reports_a_shot_once() {
     };
     assert_eq!(key.shot_number, 1);
 
-    let launch = launch_of(&shot);
+    let launch = launches(&shot)[0].clone();
     assert_eq!(launch.backspin_rpm, Some(7127));
     assert_eq!(launch.sidespin_rpm, Some(652)); // curving right: FRP positive
     assert!(
@@ -331,7 +269,7 @@ fn a_whole_xi_session_identifies_arms_and_reports_a_shot_once() {
             .is_some_and(|a| (a + 8.141).abs() < 1e-9)
     );
     assert!(launch.total_spin_rpm.is_some() && launch.spin_axis.is_some());
-    let flight = flight_of(&shot).expect("a flight result");
+    let flight = flights(&shot).first().copied().expect("a flight result");
     assert_eq!(flight.basis, Basis::Modeled);
     // Landing 10.756 m left of the origin: FRP negative.
     assert!(
@@ -340,22 +278,22 @@ fn a_whole_xi_session_identifies_arms_and_reports_a_shot_once() {
             .is_some_and(|d| (d.as_meters() + 10.756).abs() < 1e-9)
     );
     assert!(flight.descent_angle.is_some());
-    let club = club_of(&shot).expect("club data");
+    let club = clubs(&shot).first().copied().expect("club data");
     assert!(club.path.is_some_and(|p| (p + 11.40).abs() < 0.01));
 
     // Ready drops at the trigger and comes back after the shot.
-    let mut ready: Vec<String> = shot.iter().filter_map(|e| status(e, "ready")).collect();
+    let mut ready: Vec<bool> = statuses(&shot)
+        .iter()
+        .map(|s| s.blockers.is_empty())
+        .collect();
     ready.dedup();
-    assert_eq!(ready, ["false", "true"]);
+    assert_eq!(ready, [false, true]);
 
     run.close(session);
-    assert_eq!(
-        run.events
-            .last()
-            .and_then(|e| status(e, "ready"))
-            .as_deref(),
-        Some("false")
-    );
+    assert!(matches!(
+        run.events.last(),
+        Some(DeviceEvent::Status(s)) if s.blockers == [blockers::NOT_ARMED]
+    ));
 }
 
 #[test]
@@ -367,20 +305,15 @@ fn the_identity_status_comes_before_the_first_shot_and_has_no_placeholders() {
         .connect(&mut mevo, device.clone(), full())
         .expect("connect");
     run.armed(&mut session);
-    let first = run
-        .events
-        .iter()
-        .find(|e| matches!(e, DeviceEvent::Status(_)))
-        .expect("status at connect");
-    assert_eq!(status(first, "ready").as_deref(), Some("false"));
-    assert_eq!(status(first, "tilt").as_deref(), Some("0.0"));
-    assert!(status(first, "roll").is_some());
+    let statuses = statuses(&run.events);
+    let first = &statuses[0];
+    assert_eq!(first.blockers, [blockers::NOT_ARMED]);
+    assert_eq!(first.tilt, Some(0.0));
+    assert!(first.roll.is_some());
     // The Xi's status layout has no decoded battery, temperature or power.
-    for key in ["battery_pct", "temp_c", "external_power"] {
-        assert!(
-            !run.events.iter().any(|e| status(e, key).is_some()),
-            "{key}"
-        );
+    for s in &statuses {
+        assert_eq!(s.battery_pct, None);
+        assert!(s.telemetry.is_empty(), "{:?}", s.telemetry);
     }
 }
 
@@ -406,8 +339,14 @@ fn club_data_waits_for_the_ball_and_the_launch_goes_out_at_the_full_result() {
     let shot = run.shot(&device, &mut session, &club_first);
     // The club result came first; it goes out after the ball.
     assert_eq!(
-        kinds(&shot),
-        ["trigger", "launch", "flight", "club", "finished"]
+        lifecycle(&shot),
+        [
+            "shot.trigger",
+            "shot.launch",
+            "shot.flight",
+            "shot.club",
+            "shot.finished"
+        ]
     );
 }
 
@@ -533,8 +472,11 @@ fn a_launch_only_chip_sends_no_spin_and_no_flight_result() {
         &mut session,
         &shot_with_d4(d4_without_flight(30.0)),
     );
-    assert_eq!(kinds(&shot), ["trigger", "launch", "club", "finished"]);
-    let launch = launch_of(&shot);
+    assert_eq!(
+        lifecycle(&shot),
+        ["shot.trigger", "shot.launch", "shot.club", "shot.finished"]
+    );
+    let launch = launches(&shot)[0].clone();
     assert!(launch.launch_speed.is_some());
     assert_eq!(launch.launch_elevation, Some(30.0));
     assert!(launch.launch_azimuth.is_some());
@@ -547,7 +489,7 @@ fn a_launch_only_chip_sends_no_spin_and_no_flight_result() {
         ),
         (None, None, None, None)
     );
-    assert_eq!(flight_of(&shot), None);
+    assert_eq!(flights(&shot).first().copied(), None);
 }
 
 #[test]
@@ -561,16 +503,22 @@ fn a_low_launch_without_flight_is_a_measured_ground_ball() {
     run.armed(&mut session);
     let shot = run.shot(&device, &mut session, &shot_with_d4(d4_without_flight(2.0)));
     assert_eq!(
-        kinds(&shot),
-        ["trigger", "launch", "flight", "club", "finished"]
+        lifecycle(&shot),
+        [
+            "shot.trigger",
+            "shot.launch",
+            "shot.flight",
+            "shot.club",
+            "shot.finished"
+        ]
     );
-    let launch = launch_of(&shot);
+    let launch = launches(&shot)[0].clone();
     assert_eq!(
         (launch.backspin_rpm, launch.sidespin_rpm),
         (Some(0), Some(0))
     );
     assert_eq!(launch.spin_axis, None);
-    let flight = flight_of(&shot).expect("a flight result");
+    let flight = flights(&shot).first().copied().expect("a flight result");
     assert_eq!(
         flight.max_height.map(flightrelay::Distance::as_meters),
         Some(0.0)
@@ -592,7 +540,7 @@ fn the_xi_spin_source_applies_live_and_an_e8_total_without_an_axis_goes_out_alon
         .expect("connect");
     run.armed(&mut session);
 
-    let d4 = launch_of(&run.shot(&device, &mut session, &xi_draw()));
+    let d4 = launches(&run.shot(&device, &mut session, &xi_draw()))[0].clone();
     assert_eq!(
         (d4.backspin_rpm, d4.sidespin_rpm),
         (Some(2756), Some(-1464))
@@ -607,7 +555,7 @@ fn the_xi_spin_source_applies_live_and_an_e8_total_without_an_axis_goes_out_alon
     assert_eq!(mevo.config().spin_source, SpinSource::E8);
 
     // No club data: the early-result total alone, with no axis.
-    let total = launch_of(&run.shot(&device, &mut session, &xi_draw()));
+    let total = launches(&run.shot(&device, &mut session, &xi_draw()))[0].clone();
     assert_eq!(
         (
             total.backspin_rpm,
@@ -618,7 +566,7 @@ fn the_xi_spin_source_applies_live_and_an_e8_total_without_an_axis_goes_out_alon
         (None, None, Some(6897), None)
     );
     // Club data: the total split by the full result's axis.
-    let split = launch_of(&run.shot(&device, &mut session, &FakeShot::xi_full_swing()));
+    let split = launches(&run.shot(&device, &mut session, &FakeShot::xi_full_swing()))[0].clone();
     assert_eq!(
         (split.backspin_rpm, split.sidespin_rpm),
         (Some(7127), Some(652))
@@ -637,11 +585,12 @@ fn the_xi_spin_source_applies_live_and_an_e8_total_without_an_axis_goes_out_alon
         spin_source: SpinSource::Auto,
         ..Config::default()
     });
-    session
-        .hints(&TurnHints::default().with_mode(Mode::Chipping))
-        .expect("hints");
+    run.hints(
+        &mut session,
+        &TurnHints::default().with_mode(Mode::Chipping),
+    );
     run.armed(&mut session);
-    let chip = launch_of(&run.shot(&device, &mut session, &xi_draw()));
+    let chip = launches(&run.shot(&device, &mut session, &xi_draw()))[0].clone();
     assert_eq!(chip.backspin_rpm, Some(2756));
 }
 
@@ -679,9 +628,7 @@ fn the_session_starts_in_the_hinted_mode_and_reconfigures_only_when_the_wire_cha
     let armed_once = arms(&device);
 
     // Chipping to putting: the same session on the Xi, nothing is sent.
-    session
-        .hints(&TurnHints::default().with_mode(Mode::Putting))
-        .expect("hints");
+    run.hints(&mut session, &TurnHints::default().with_mode(Mode::Putting));
     for _ in 0..20 {
         run.poll(&mut session).expect("poll");
     }
@@ -690,16 +637,16 @@ fn the_session_starts_in_the_hinted_mode_and_reconfigures_only_when_the_wire_cha
 
     // Putting to full swing: reconfigured and re-armed.
     let before = run.events.len();
-    session.hints(&full()).expect("hints");
+    run.hints(&mut session, &full());
     run.poll_until(&mut session, is_ready);
     assert_eq!(session.mode(), Mode::Full);
     assert_eq!(club_type(&device), Some(1));
     assert_eq!(arms(&device), armed_once + 1);
-    let ready: Vec<String> = run.events[before..]
+    let ready: Vec<bool> = statuses(&run.events[before..])
         .iter()
-        .filter_map(|e| status(e, "ready"))
+        .map(|s| s.blockers.is_empty())
         .collect();
-    assert_eq!(ready, ["false", "true"]);
+    assert_eq!(ready, [false, true]);
     assert!(run.events[before..].iter().any(|e| matches!(
         e,
         DeviceEvent::Log(Level::Info, l) if l.starts_with("mode change: putting -> full")
@@ -708,13 +655,12 @@ fn the_session_starts_in_the_hinted_mode_and_reconfigures_only_when_the_wire_cha
     // A handedness or club is not a device setting, and no mode hint keeps
     // the mode: nothing is configured or armed after it.
     let sent = device.sent().len();
-    session
-        .hints(
-            &TurnHints::default()
-                .with_club(flightrelay::Club::Driver)
-                .with_handedness(flightrelay::Handedness::Left),
-        )
-        .expect("hints");
+    run.hints(
+        &mut session,
+        &TurnHints::default()
+            .with_club(flightrelay::Club::Driver)
+            .with_handedness(flightrelay::Handedness::Left),
+    );
     for _ in 0..5 {
         run.poll(&mut session).expect("poll");
     }
@@ -746,13 +692,19 @@ fn a_wire_error_raises_an_alert_and_the_session_continues() {
     let alert = alerts(&run.events[before..]);
     assert_eq!(alert.len(), 1);
     assert!(
-        alert[0].starts_with("Could not process message"),
+        alert[0].message.starts_with("Could not process message"),
         "{alert:?}"
     );
     let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
     assert_eq!(
-        kinds(&shot),
-        ["trigger", "launch", "flight", "club", "finished"]
+        lifecycle(&shot),
+        [
+            "shot.trigger",
+            "shot.launch",
+            "shot.flight",
+            "shot.club",
+            "shot.finished"
+        ]
     );
 }
 
@@ -769,20 +721,31 @@ fn a_shot_the_device_did_not_read_alerts_and_sends_no_ball() {
         .expect("connect");
     run.armed(&mut session);
     let shot = run.shot(&device, &mut session, &FakeShot::xi_no_read());
-    assert_eq!(kinds(&shot), ["trigger", "alert", "finished"]);
     assert_eq!(
-        alerts(&shot),
-        ["Shot #1: Xi didn't track the ball (no read)"]
+        lifecycle(&shot),
+        ["shot.trigger", "bus.alert", "shot.finished"]
     );
+    assert_eq!(
+        alerts(&shot)[0].message,
+        "Shot #1: Xi didn't track the ball (no read)"
+    );
+    assert_eq!(alerts(&shot).len(), 1);
+    assert_eq!(alerts(&shot)[0].severity, Severity::Warn);
 }
 
 #[test]
 fn an_early_result_makes_the_shot_only_with_use_estimated() {
     for (use_estimated, want) in [
-        (None, &["trigger", "club", "finished"][..]),
+        (None, &["shot.trigger", "shot.club", "shot.finished"][..]),
         (
             Some(true),
-            &["trigger", "launch", "flight", "club", "finished"][..],
+            &[
+                "shot.trigger",
+                "shot.launch",
+                "shot.flight",
+                "shot.club",
+                "shot.finished",
+            ][..],
         ),
     ] {
         let mut run = Run::new();
@@ -796,12 +759,15 @@ fn an_early_result_makes_the_shot_only_with_use_estimated() {
             .expect("connect");
         run.armed(&mut session);
         let shot = run.shot(&device, &mut session, &FakeShot::xi_chip());
-        assert_eq!(kinds(&shot), want, "{use_estimated:?}");
+        assert_eq!(lifecycle(&shot), want, "{use_estimated:?}");
         if use_estimated.is_some() {
-            let launch = launch_of(&shot);
+            let launch = launches(&shot)[0].clone();
             assert_eq!(launch.backspin_rpm, Some(4037));
             assert_eq!(launch.sidespin_rpm, None);
-            assert_eq!(flight_of(&shot).map(|f| f.basis), Some(Basis::Modeled));
+            assert_eq!(
+                flights(&shot).first().copied().map(|f| f.basis),
+                Some(Basis::Modeled)
+            );
         }
     }
 }
@@ -1157,7 +1123,7 @@ fn a_short_identity_frame_raises_an_alert_without_its_bytes() {
         run.poll(&mut session).expect("poll");
     }
     let events = &run.events[before..];
-    let alert = alerts(events);
+    let alert: Vec<&str> = alerts(events).iter().map(|a| a.message.as_str()).collect();
     assert_eq!(
         alert,
         [
@@ -1258,9 +1224,15 @@ fn a_second_trigger_finishes_the_open_shot_before_the_next_one_starts() {
     );
     let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
     assert_eq!(
-        kinds(&shot),
+        lifecycle(&shot),
         [
-            "trigger", "finished", "trigger", "launch", "flight", "club", "finished"
+            "shot.trigger",
+            "shot.finished",
+            "shot.trigger",
+            "shot.launch",
+            "shot.flight",
+            "shot.club",
+            "shot.finished"
         ]
     );
     let keys: Vec<(&str, u32)> = shot
@@ -1334,9 +1306,10 @@ fn a_mode_change_during_a_shot_is_applied_when_the_shot_completes() {
     });
     let before = run.events.len();
     let sent = device.sent().len();
-    session
-        .hints(&TurnHints::default().with_mode(Mode::Chipping))
-        .expect("hints");
+    run.hints(
+        &mut session,
+        &TurnHints::default().with_mode(Mode::Chipping),
+    );
     for _ in 0..5 {
         run.poll(&mut session).expect("poll");
     }
@@ -1349,7 +1322,10 @@ fn a_mode_change_during_a_shot_is_applied_when_the_shot_completes() {
     )));
 
     let shot = run.shot(&device, &mut session, &rest);
-    assert_eq!(kinds(&shot), ["launch", "flight", "club", "finished"]);
+    assert_eq!(
+        lifecycle(&shot),
+        ["shot.launch", "shot.flight", "shot.club", "shot.finished"]
+    );
     run.poll_until(&mut session, |_| arms(&device) == armed + 2);
     run.armed(&mut session);
     assert_eq!(session.mode(), Mode::Chipping);
@@ -1373,9 +1349,10 @@ fn a_mode_change_before_the_first_arm_is_applied_once_armed() {
         .connect(&mut mevo, device.clone(), full())
         .expect("connect");
     // The connect queued the configuration and the arm; nothing is armed yet.
-    session
-        .hints(&TurnHints::default().with_mode(Mode::Chipping))
-        .expect("hints");
+    run.hints(
+        &mut session,
+        &TurnHints::default().with_mode(Mode::Chipping),
+    );
     run.poll_until(&mut session, |_| arms(&device) == 2);
     run.armed(&mut session);
     assert_eq!(session.mode(), Mode::Chipping);
@@ -1401,10 +1378,11 @@ fn a_hint_back_to_the_current_mode_drops_the_deferred_change() {
         matches!(e, DeviceEvent::Frp(FrpBody::ShotTrigger(_)))
     });
     let sent = device.sent().len();
-    session
-        .hints(&TurnHints::default().with_mode(Mode::Chipping))
-        .expect("hints");
-    session.hints(&full()).expect("hints");
+    run.hints(
+        &mut session,
+        &TurnHints::default().with_mode(Mode::Chipping),
+    );
+    run.hints(&mut session, &full());
     run.shot(&device, &mut session, &rest);
     for _ in 0..20 {
         run.poll(&mut session).expect("poll");
@@ -1443,10 +1421,16 @@ fn a_second_full_result_in_the_same_shot_is_ignored() {
     );
     let events = run.shot(&device, &mut session, &shot);
     assert_eq!(
-        kinds(&events),
-        ["trigger", "launch", "flight", "club", "finished"]
+        lifecycle(&events),
+        [
+            "shot.trigger",
+            "shot.launch",
+            "shot.flight",
+            "shot.club",
+            "shot.finished"
+        ]
     );
-    assert_eq!(launch_of(&events).backspin_rpm, Some(7127));
+    assert_eq!(launches(&events)[0].clone().backspin_rpm, Some(7127));
 }
 
 /// The launch-only full result is synthesized, as in
@@ -1474,8 +1458,11 @@ fn a_launch_only_chip_with_the_e8_spin_source_sends_the_e8_total_and_no_flight()
         fixtures::XI_SHOT_ED.to_vec(),
     );
     let events = run.shot(&device, &mut session, &shot);
-    assert_eq!(kinds(&events), ["trigger", "launch", "club", "finished"]);
-    let launch = launch_of(&events);
+    assert_eq!(
+        lifecycle(&events),
+        ["shot.trigger", "shot.launch", "shot.club", "shot.finished"]
+    );
+    let launch = launches(&events)[0].clone();
     assert_eq!(launch.launch_elevation, Some(30.0));
     assert_eq!(
         (
@@ -1496,10 +1483,6 @@ fn sent_index(
     pred: impl Fn(&crate::frame::RawFrame) -> bool,
 ) -> Option<usize> {
     device.sent().iter().position(pred)
-}
-
-fn ever(events: &[DeviceEvent], key: &str) -> bool {
-    events.iter().any(|e| status(e, key).is_some())
 }
 
 #[test]
@@ -1541,22 +1524,24 @@ fn a_whole_mevo_plus_session_identifies_configures_arms_and_reports_a_shot() {
     assert!(radar_cal < cam && cam < arm, "{radar_cal} {cam} {arm}");
 
     // The Mevo+ DSP status gives battery, temperature and power at once.
-    let first = run
-        .events
-        .iter()
-        .find(|e| status(e, "ready").is_some())
-        .expect("telemetry");
-    assert_eq!(status(first, "battery_pct").as_deref(), Some("87"));
-    assert_eq!(status(first, "temp_c").as_deref(), Some("31.0"));
-    assert_eq!(status(first, "external_power").as_deref(), Some("false"));
+    let first = &statuses(&run.events)[0];
+    assert_eq!(first.battery_pct, Some(87));
+    assert_eq!(first.telemetry["temp_c"], "31.0");
+    assert_eq!(first.telemetry["external_power"], "false");
 
     // The Xi's result frames: the Mevo sends the same layout from the AVR.
     let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
     assert_eq!(
-        kinds(&shot),
-        ["trigger", "launch", "flight", "club", "finished"]
+        lifecycle(&shot),
+        [
+            "shot.trigger",
+            "shot.launch",
+            "shot.flight",
+            "shot.club",
+            "shot.finished"
+        ]
     );
-    assert_eq!(launch_of(&shot).backspin_rpm, Some(7127));
+    assert_eq!(launches(&shot)[0].clone().backspin_rpm, Some(7127));
     // A Mevo's results are not acked.
     assert!(!device.sent().iter().any(|f| f.type_id == 0x95));
     // The handshake (Pi network config included) left only as audit lines.
@@ -1592,17 +1577,15 @@ fn mevo_plus_keepalives_send_battery_temperature_and_power_when_they_change() {
     run.armed(&mut session);
     device.set_dsp_status(crate::testing::mevo_plus_dsp_status(55, 35.5, true));
     let before = run.events.len();
-    run.poll_until(&mut session, |e| {
-        status(e, "battery_pct").as_deref() == Some("55")
-    });
-    let changed = run.events[before..]
-        .iter()
-        .find(|e| status(e, "battery_pct").is_some())
-        .expect("telemetry");
-    assert_eq!(status(changed, "temp_c").as_deref(), Some("35.5"));
-    assert_eq!(status(changed, "external_power").as_deref(), Some("true"));
+    run.poll_until(
+        &mut session,
+        |e| matches!(e, DeviceEvent::Status(s) if s.battery_pct == Some(55)),
+    );
+    let changed = &statuses(&run.events[before..])[0];
+    assert_eq!(changed.telemetry["temp_c"], "35.5");
+    assert_eq!(changed.telemetry["external_power"], "true");
     // The status is complete: the attitude is still there.
-    assert!(status(changed, "tilt").is_some());
+    assert!(changed.tilt.is_some());
 }
 
 #[test]
@@ -1663,11 +1646,18 @@ fn a_mevo_gen2_session_sends_no_battery_temperature_or_power() {
     run.poll_until(&mut session, |_| polls(&device) >= before + 2);
     let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
     assert_eq!(
-        kinds(&shot),
-        ["trigger", "launch", "flight", "club", "finished"]
+        lifecycle(&shot),
+        [
+            "shot.trigger",
+            "shot.launch",
+            "shot.flight",
+            "shot.club",
+            "shot.finished"
+        ]
     );
-    for key in ["battery_pct", "temp_c", "external_power"] {
-        assert!(!ever(&run.events, key), "{key}");
+    for s in statuses(&run.events) {
+        assert_eq!(s.battery_pct, None);
+        assert!(s.telemetry.is_empty(), "{:?}", s.telemetry);
     }
     assert!(!device.sent().iter().any(|f| f.type_id == 0x95));
 }
@@ -1752,7 +1742,7 @@ fn the_raw_fusion_camera_config_is_sent_disarmed() {
     run.poll_for(&mut session, camera::WARMUP + Duration::from_secs(1))
         .expect("warmup");
     assert_eq!(arms(&device), armed + 1);
-    assert!(ready_last(&run.events));
+    assert!(status(&run.events).blockers.is_empty());
     let raw = CamConfig::raw_fusion_preset().encode();
     let sent = device.sent();
     let cam = sent
@@ -1845,11 +1835,17 @@ fn a_fusion_camera_setup_the_device_does_not_finish_alerts_and_the_session_carri
             camera::WARMUP + CAMERA_SETUP_TIMEOUT + Duration::from_secs(1),
         )
         .expect("carries on");
-        assert!(ready_last(&run.events), "{mode:?} {fault:?}");
+        assert!(
+            status(&run.events).blockers.is_empty(),
+            "{mode:?} {fault:?}"
+        );
 
         let events = &run.events[start..];
         assert_eq!(
-            alerts(events),
+            alerts(events)
+                .iter()
+                .map(|a| a.message.as_str())
+                .collect::<Vec<_>>(),
             [
                 "The Mevo+ didn't finish the Fusion camera setup, so it stays in standard camera mode. Check that the Pro Package is on, or try the other Fusion camera mode."
             ],
@@ -1875,8 +1871,14 @@ fn a_fusion_camera_setup_the_device_does_not_finish_alerts_and_the_session_carri
         device.set_camera_fault(None);
         let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
         assert_eq!(
-            kinds(&shot),
-            ["trigger", "launch", "flight", "club", "finished"],
+            lifecycle(&shot),
+            [
+                "shot.trigger",
+                "shot.launch",
+                "shot.flight",
+                "shot.club",
+                "shot.finished"
+            ],
             "{mode:?} {fault:?}"
         );
         assert_eq!(alerts(&run.events[start..]).len(), 1);
@@ -1907,21 +1909,12 @@ fn a_camera_warmup_the_device_does_not_finish_alerts_and_arms() {
             assert_eq!(warned.len(), 1, "{fault:?} {mode:?}");
             assert!(warned[0].contains("camera config ack"), "{}", warned[0]);
             assert_eq!(
-                alerts(&run.events)[0],
+                alerts(&run.events)[0].message,
                 "The Mevo+ didn't finish the camera setup, so the camera stays as it started.",
                 "{fault:?} {mode:?}"
             );
         }
     }
-}
-
-/// The last `ready` telemetry value is true.
-fn ready_last(events: &[DeviceEvent]) -> bool {
-    events
-        .iter()
-        .rev()
-        .find_map(|e| status(e, "ready"))
-        .is_some_and(|v| v == "true")
 }
 
 /// A device that finishes the camera setup raises nothing, in every camera
@@ -1947,18 +1940,25 @@ fn a_camera_setup_the_device_finishes_raises_no_alert() {
         // The Fusion config and its re-arm.
         let wanted_arms = if mode == CameraMode::Standard { 1 } else { 2 };
         let give_up = run.host.now() + GIVE_UP;
-        while run.host.now() < give_up && (arms(&device) < wanted_arms || !ready_last(&run.events))
+        while run.host.now() < give_up
+            && (arms(&device) < wanted_arms || !status(&run.events).blockers.is_empty())
         {
             run.poll(&mut session).expect("poll");
         }
         assert_eq!(arms(&device), wanted_arms, "{mode:?}");
-        assert!(ready_last(&run.events), "{mode:?}");
+        assert!(status(&run.events).blockers.is_empty(), "{mode:?}");
         assert!(alerts(&run.events).is_empty(), "{mode:?}");
         assert!(warns(&run.events, "did not finish").is_empty(), "{mode:?}");
         let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
         assert_eq!(
-            kinds(&shot),
-            ["trigger", "launch", "flight", "club", "finished"]
+            lifecycle(&shot),
+            [
+                "shot.trigger",
+                "shot.launch",
+                "shot.flight",
+                "shot.club",
+                "shot.finished"
+            ]
         );
     }
 }
@@ -1975,9 +1975,10 @@ fn a_mevo_mode_change_sends_only_the_mode_and_re_arms() {
     run.armed(&mut session);
     let armed = arms(&device);
     let sent = device.sent().len();
-    session
-        .hints(&TurnHints::default().with_mode(Mode::Chipping))
-        .expect("hints");
+    run.hints(
+        &mut session,
+        &TurnHints::default().with_mode(Mode::Chipping),
+    );
     run.poll_until(&mut session, |_| arms(&device) == armed + 1);
     run.armed(&mut session);
     assert_eq!(session.mode(), Mode::Chipping);

@@ -50,15 +50,15 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use flightrelay::config::{ConfigError, DriverConfig};
 use flightrelay::driver::{
-    Activity, ConnectCtx, DeviceEvent, DeviceIdentity, DeviceStatus, DriverInfo, Events, FrpDriver,
-    FrpSession, HostFlags, IDLE, Level, Live, NoAction, RawProfile, ShotIds, Stopped, TurnHints,
+    Activity, ConnectCtx, DeviceIdentity, DeviceStatus, DriverInfo, Events, FrpDriver, FrpSession,
+    IDLE, Level, Live, NoAction, RawProfile, ShotIds, Stopped, TurnHints,
 };
 use flightrelay::types::{ClubData, Launch, blockers};
-use flightrelay::{FrpBody, Mode, RawDir, RawFrame, Severity, ShotKey, Source};
+use flightrelay::{Mode, RawDir, RawFrame, Severity, ShotKey, Source};
 
 use crate::addr::BusAddr;
 use crate::client::{BinaryClient, BinaryEvent, HandshakeOutcome};
@@ -278,7 +278,6 @@ impl Mevo {
             session_start: now,
             last_event: now,
             status: DeviceStatus::not_armed(),
-            backlog: Vec::new(),
         };
         session.handshake_done(&handshake, &mut ctx.out);
         Ok(session)
@@ -367,7 +366,7 @@ impl Wire {
                 src: frame.src,
                 dst: dest,
                 payload: frame.payload,
-                at_ms: now_ms(),
+                at_ms: flightrelay::utc_ms(),
             });
         });
         let rx = wire.clone();
@@ -378,7 +377,7 @@ impl Wire {
                 src: env.src,
                 dst: BusAddr::App,
                 payload: env.raw.clone(),
-                at_ms: now_ms(),
+                at_ms: flightrelay::utc_ms(),
             });
         });
         wire
@@ -409,15 +408,13 @@ impl Wire {
                 }
             }
             let label = format!("{:02X} {}>{}", f.type_id, f.src, f.dst);
-            if !raw || audit_only(f.type_id) {
-                out.audit(f.dir, &label, &f.payload);
-            } else if out.wants_raw() {
-                out.frp(FrpBody::ShotRaw(RawFrame {
-                    timestamp: f.at_ms,
-                    label: Some(label),
-                    ..RawFrame::new(f.dir, 0, f.payload)
-                }));
-            }
+            out.wire(
+                f.dir,
+                label,
+                f.payload,
+                f.at_ms,
+                !raw || audit_only(f.type_id),
+            );
         }
         received
     }
@@ -455,9 +452,7 @@ struct Shot {
 
 /// One connection to a FlightScope device. See the [module docs](self).
 ///
-/// Generic over the stream so a test can run it on an in-memory device; the
-/// methods are those of [`FrpSession`], which `MevoSession<TcpStream>`
-/// implements.
+/// Generic over the stream so a test can run it on an in-memory device.
 pub struct MevoSession<S: Read + Write> {
     client: BinaryClient<S>,
     identity: DeviceIdentity,
@@ -478,8 +473,6 @@ pub struct MevoSession<S: Read + Write> {
     last_event: Instant,
     /// The status as last sent: blockers, battery, attitude and telemetry.
     status: DeviceStatus,
-    /// Events of a hints change, sent with the next step.
-    backlog: Vec<DeviceEvent>,
 }
 
 impl<S: Read + Write> std::fmt::Debug for MevoSession<S> {
@@ -503,71 +496,6 @@ impl<S: Read + Write> MevoSession<S> {
     #[must_use]
     pub fn mode(&self) -> Mode {
         self.mode
-    }
-
-    /// Who the device is. See [`FrpSession::identity`].
-    #[must_use]
-    pub fn identity(&self) -> &DeviceIdentity {
-        &self.identity
-    }
-
-    /// Handle what the device sent and what is due at `now`: one poll of the
-    /// client, whose event (if any) goes out as FRP events. Returns
-    /// [`Activity::Active`] after an event, [`Activity::Idle`] when there was none.
-    /// See [`FrpSession::step`].
-    ///
-    /// # Errors
-    ///
-    /// Returns what ended the session, [`Error::Stale`] once nothing has
-    /// arrived for `STALE_TIMEOUT` before `now`.
-    pub fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        self.flush_backlog(out);
-        self.apply_fusion_cam(now, out);
-        let polled = self.client.poll_at(now);
-        if self.wire.emit(out, &mut self.results, true) {
-            self.last_event = now;
-        }
-        let next = match polled {
-            Ok(Some(event)) => {
-                self.last_event = now;
-                self.on_event(event, out);
-                Activity::Active
-            }
-            Ok(None) => Activity::Idle,
-            Err(e @ (ConnError::Wire(_) | ConnError::Protocol(_))) => {
-                could_not_process(out, &e);
-                Activity::Idle
-            }
-            Err(e) => return Err(e.into()),
-        };
-        if now.saturating_duration_since(self.last_event) >= STALE_TIMEOUT {
-            return Err(Error::Stale);
-        }
-        Ok(next)
-    }
-
-    /// Take the mode of a new `golfer.turn`'s hints. A mode that changes
-    /// what is sent to the device reconfigures and re-arms it (at once when
-    /// it is armed, else once it is idle); one that does not (Xi chipping
-    /// and putting) is only recorded. No mode hint keeps the mode the device
-    /// has. The device has no handedness or club setting. See
-    /// [`FrpSession::hints`].
-    ///
-    /// What the change emits (log lines, the `not_armed` blocker) goes out
-    /// with the next [`step`](Self::step).
-    ///
-    /// # Errors
-    ///
-    /// Never; the signature is the trait's.
-    pub fn hints(&mut self, hints: &TurnHints) -> Result<(), Error> {
-        let flags = HostFlags::new();
-        let mut events = Vec::new();
-        {
-            let mut sink = |e| events.push(e);
-            self.take_hints(*hints, &mut Events::new(&mut sink, &flags));
-        }
-        self.backlog.extend(events);
-        Ok(())
     }
 
     fn take_hints(&mut self, hints: TurnHints, out: &mut Events<'_>) {
@@ -611,30 +539,6 @@ impl<S: Read + Write> MevoSession<S> {
                 format!("deferred mode change to {new} (operation in progress)"),
             );
             self.pending_mode = Some(new);
-        }
-    }
-
-    /// Release the device: the status goes back to `not_armed` with no
-    /// battery, attitude or telemetry, then the connection is dropped.
-    /// See [`FrpSession::close`].
-    ///
-    /// # Errors
-    ///
-    /// Never; the signature is the trait's.
-    pub fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
-        self.wire.emit(out, &mut self.results, true);
-        self.flush_backlog(out);
-        out.status(DeviceStatus::not_armed());
-        Ok(())
-    }
-
-    /// Send what a hints change emitted.
-    fn flush_backlog(&mut self, out: &mut Events<'_>) {
-        for event in std::mem::take(&mut self.backlog) {
-            match event {
-                DeviceEvent::Log(level, line) => out.log(level, line),
-                event => out.emit(event),
-            }
         }
     }
 
@@ -880,7 +784,7 @@ impl<S: Read + Write> MevoSession<S> {
             Level::Debug,
             format!("ball trigger detected -- shot #{}", key.shot_number),
         );
-        match now_ms() {
+        match flightrelay::utc_ms() {
             Some(ms) => out.shot_trigger_at(key.clone(), ms),
             None => out.shot_trigger(key.clone()),
         }
@@ -1051,23 +955,60 @@ impl<S: Read + Write> MevoSession<S> {
     }
 }
 
-impl FrpSession for MevoSession<TcpStream> {
-    type Driver = Mevo;
+impl<S: Read + Write> FrpSession for MevoSession<S> {
+    type Error = Error;
+    type Action = NoAction;
 
+    /// Handle what the device sent and what is due at `now`: one poll of the
+    /// client, whose event (if any) goes out as FRP events. Returns
+    /// [`Activity::Active`] after an event, [`Activity::Idle`] when there was
+    /// none. The session ends with [`Error::Stale`] once nothing has arrived
+    /// for 10 seconds before `now`.
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        MevoSession::<TcpStream>::step(self, now, out)
+        self.apply_fusion_cam(now, out);
+        let polled = self.client.poll_at(now);
+        if self.wire.emit(out, &mut self.results, true) {
+            self.last_event = now;
+        }
+        let next = match polled {
+            Ok(Some(event)) => {
+                self.last_event = now;
+                self.on_event(event, out);
+                Activity::Active
+            }
+            Ok(None) => Activity::Idle,
+            Err(e @ (ConnError::Wire(_) | ConnError::Protocol(_))) => {
+                could_not_process(out, &e);
+                Activity::Idle
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if now.saturating_duration_since(self.last_event) >= STALE_TIMEOUT {
+            return Err(Error::Stale);
+        }
+        Ok(next)
     }
 
-    fn hints(&mut self, hints: &TurnHints) -> Result<(), Error> {
-        MevoSession::<TcpStream>::hints(self, hints)
+    /// Take the mode of a new `golfer.turn`'s hints. A mode that changes
+    /// what is sent to the device reconfigures and re-arms it (at once when
+    /// it is armed, else once it is idle); one that does not (Xi chipping
+    /// and putting) is only recorded. No mode hint keeps the mode the device
+    /// has. The device has no handedness or club setting.
+    fn hints(&mut self, hints: &TurnHints, out: &mut Events<'_>) -> Result<(), Error> {
+        self.take_hints(*hints, out);
+        Ok(())
     }
 
     fn identity(&self) -> &DeviceIdentity {
         &self.identity
     }
 
-    fn close(self, out: &mut Events<'_>) -> Result<(), Error> {
-        MevoSession::<TcpStream>::close(self, out)
+    /// Release the device: the status goes back to `not_armed` with no
+    /// battery, attitude or telemetry, then the connection is dropped.
+    fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
+        self.wire.emit(out, &mut self.results, true);
+        out.status(DeviceStatus::not_armed());
+        Ok(())
     }
 }
 
@@ -1263,14 +1204,6 @@ fn hex(bytes: &[u8]) -> String {
             let _ = write!(s, "{b:02X}");
             s
         })
-}
-
-/// The current UTC time in milliseconds since the Unix epoch.
-fn now_ms() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
 }
 
 #[cfg(test)]
