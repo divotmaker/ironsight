@@ -14,7 +14,7 @@
 //! - status for its `bus.actor`: the `not_armed` blocker until it is armed
 //!   and from each trigger until it re-arms, tilt and roll, and on a Mevo+
 //!   the battery charge and the `temp_c` and `external_power` telemetry
-//!   keys; only values that changed;
+//!   keys;
 //! - for each shot: `shot.trigger` (with the host's clock), `shot.launch` and
 //!   `shot.flight` as soon as the full result arrives, `shot.club` once the
 //!   shot has a ball result, and `shot.finished` when the device is done.
@@ -471,7 +471,7 @@ pub struct MevoSession<S: Read + Write> {
     pending_fusion_cam: Option<CamConfig>,
     session_start: Instant,
     last_event: Instant,
-    /// The status as last sent: blockers, battery, attitude and telemetry.
+    /// The status: blockers, battery, attitude and telemetry.
     status: DeviceStatus,
 }
 
@@ -944,14 +944,10 @@ impl<S: Read + Write> MevoSession<S> {
         out.shot_finished(shot.key);
     }
 
-    /// Change the status and send the whole of it if something changed.
+    /// Change the status and send the whole of it.
     fn update_status(&mut self, out: &mut Events<'_>, change: impl FnOnce(&mut DeviceStatus)) {
-        let mut next = self.status.clone();
-        change(&mut next);
-        if next != self.status {
-            self.status = next;
-            out.status(self.status.clone());
-        }
+        change(&mut self.status);
+        out.status(self.status.clone());
     }
 }
 
@@ -1003,17 +999,16 @@ impl<S: Read + Write> FrpSession for MevoSession<S> {
         &self.identity
     }
 
-    /// Release the device: the status goes back to `not_armed` with no
-    /// battery, attitude or telemetry, then the connection is dropped.
+    /// Send the frames still collected, then drop the connection.
     fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
         self.wire.emit(out, &mut self.results, true);
-        out.status(DeviceStatus::not_armed());
         Ok(())
     }
 }
 
 /// `v` as printed with one decimal, the device's resolution, so a change
-/// below it sends nothing; `+ 0.0` turns a negative zero into zero.
+/// below it leaves the status as it was; `+ 0.0` turns a negative zero into
+/// zero.
 fn round_tenth(v: f64) -> f64 {
     format!("{v:.1}").parse().unwrap_or(v) + 0.0
 }

@@ -289,11 +289,10 @@ fn a_whole_xi_session_identifies_arms_and_reports_a_shot_once() {
     ready.dedup();
     assert_eq!(ready, [false, true]);
 
+    // Going back to `not_armed` at the close is the host's.
+    let before = run.events.len();
     run.close(session);
-    assert!(matches!(
-        run.events.last(),
-        Some(DeviceEvent::Status(s)) if s.blockers == [blockers::NOT_ARMED]
-    ));
+    assert!(statuses(&run.events[before..]).is_empty());
 }
 
 #[test]
