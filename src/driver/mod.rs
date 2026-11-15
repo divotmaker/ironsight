@@ -135,9 +135,9 @@ impl FrpDriver for Mevo {
     type Action = NoAction;
     type Session = MevoSession<TcpStream>;
 
-    /// The TCP connect gives up at once on a stop and the handshake checks
-    /// for one on every pass; closing sends nothing.
-    const STOP_WAIT: Duration = Duration::from_secs(3);
+    // The default STOP_WAIT holds: the TCP connect gives up at once on a
+    // stop and the handshake checks for one on every pass; closing sends
+    // nothing.
 
     fn info(_: &Config) -> DriverInfo {
         DriverInfo::new("ironsight", "FlightScope Mevo+ / Xi", Source::Measured)
@@ -486,14 +486,16 @@ impl<S: Read + Write> std::fmt::Debug for MevoSession<S> {
 
 impl<S: Read + Write> MevoSession<S> {
     /// The model the handshake detected.
+    #[cfg(test)]
     #[must_use]
-    pub fn model(&self) -> DeviceModel {
+    pub(crate) fn model(&self) -> DeviceModel {
         self.model
     }
 
     /// The mode the device is set to, or being set to.
+    #[cfg(test)]
     #[must_use]
-    pub fn mode(&self) -> Mode {
+    pub(crate) fn mode(&self) -> Mode {
         self.mode
     }
 
@@ -783,10 +785,7 @@ impl<S: Read + Write> MevoSession<S> {
             Level::Debug,
             format!("ball trigger detected -- shot #{}", key.shot_number),
         );
-        match flightrelay::utc_ms() {
-            Some(ms) => out.shot_trigger_at(key.clone(), ms),
-            None => out.shot_trigger(key.clone()),
-        }
+        out.shot_trigger(key.clone(), flightrelay::utc_ms());
         self.shot = Some(Shot {
             key,
             mode: self.mode,
@@ -999,9 +998,8 @@ impl<S: Read + Write> FrpSession for MevoSession<S> {
     }
 
     /// Send the frames still collected, then drop the connection.
-    fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
+    fn close(mut self, out: &mut Events<'_>) {
         self.wire.emit(out, &mut self.results, true);
-        Ok(())
     }
 }
 

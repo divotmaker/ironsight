@@ -146,7 +146,7 @@ impl Run {
     }
 
     fn close<S: Read + Write>(&mut self, session: MevoSession<S>) {
-        self.host.with(|_, out| session.close(out)).expect("close");
+        self.host.with(|_, out| session.close(out));
         self.collect();
     }
 }
