@@ -313,9 +313,9 @@ impl Config {
     pub fn wire_label(&self, model: DeviceModel, mode: Mode) -> &'static str {
         let outdoor = self.environment() == FlightScopeEnvironment::Outdoor;
         match (model, mode, outdoor) {
-            (DeviceModel::Xi, Mode::Full, false) => "full-swing limited-flight(9)",
-            (DeviceModel::Xi, Mode::Full, true) => "full-swing outdoor(8)",
-            (DeviceModel::Xi, _, _) => "pitching limited-flight(9)",
+            (DeviceModel::Xi, Mode::Chipping | Mode::Putting, _) => "pitching limited-flight(9)",
+            (DeviceModel::Xi, _, false) => "full-swing limited-flight(9)",
+            (DeviceModel::Xi, _, true) => "full-swing outdoor(8)",
             (DeviceModel::Mevo, Mode::Putting, _) => "putting(3)",
             (DeviceModel::Mevo, Mode::Chipping, _) => "chipping(5)",
             (DeviceModel::Mevo, _, false) => "limited-flight(9)",
@@ -502,6 +502,24 @@ mod tests {
             assert!(c.changes_wire(DeviceModel::Xi, Mode::Full, Mode::Putting));
             assert!(c.changes_wire(DeviceModel::Mevo, Mode::Chipping, Mode::Putting));
             assert_eq!(c.xi_settings(Mode::Full).shot_type, XiShotType::FullSwing);
+        }
+    }
+
+    #[test]
+    fn the_xi_label_names_the_session_xi_settings_selects() {
+        for env in [
+            FlightScopeEnvironment::LimitedFlight,
+            FlightScopeEnvironment::Outdoor,
+        ] {
+            let c = Config {
+                environment: Some(env),
+                ..Config::default()
+            };
+            for mode in [Mode::Full, Mode::Chipping, Mode::Putting] {
+                let pitching = c.xi_settings(mode).shot_type == XiShotType::Pitching;
+                let label = c.wire_label(DeviceModel::Xi, mode);
+                assert_eq!(label.starts_with("pitching"), pitching, "{mode:?}: {label}");
+            }
         }
     }
 
