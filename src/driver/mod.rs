@@ -12,9 +12,10 @@
 //! handedness or club setting. It sends:
 //!
 //! - status for its `bus.actor`: the `not_armed` blocker until it is armed
-//!   and from each trigger until it re-arms, tilt and roll, and on a Mevo+
-//!   the battery charge and the `temp_c` and `external_power` telemetry
-//!   keys;
+//!   and from each trigger until it re-arms; the `tilt` and `roll`
+//!   telemetry keys, in degrees with one decimal (`"12.4°"`); and on a
+//!   Mevo+ the battery charge and the `temp_c` and `external_power`
+//!   telemetry keys. A key with no reading is `"unknown"`;
 //! - for each shot: `shot.trigger` (with the host's clock), `shot.launch` and
 //!   `shot.flight` as soon as the full result arrives, `shot.club` once the
 //!   shot has a ball result, and `shot.finished` when the device is done.
@@ -143,6 +144,12 @@ impl FrpDriver for Mevo {
         DriverInfo::new("ironsight", "FlightScope Mevo+ / Xi", Source::Measured)
             .with_manufacturer("FlightScope")
             .with_raw(raw_profile())
+            .with_telemetry(&[
+                ("temp_c", "unknown"),
+                ("external_power", "unknown"),
+                ("tilt", "unknown"),
+                ("roll", "unknown"),
+            ])
     }
 
     fn new(config: Config) -> Result<Self, ConfigError> {
@@ -470,7 +477,7 @@ pub struct MevoSession<S: Read + Write> {
     pending_fusion_cam: Option<CamConfig>,
     session_start: Instant,
     last_event: Instant,
-    /// The status: blockers, battery, attitude and telemetry.
+    /// The status: blockers, battery and telemetry.
     status: DeviceStatus,
 }
 
@@ -1019,33 +1026,38 @@ fn set_ready(status: &mut DeviceStatus, ready: bool) {
     };
 }
 
-/// The attitude from an AVR status: `tilt` and `roll` in degrees (the device
-/// reports roll with the opposite sign).
+/// The `tilt` and `roll` telemetry from an AVR status: degrees, one
+/// decimal, e.g. `"12.4°"` (the device reports roll with the opposite
+/// sign). FlightScope publishes no numeric limit for either, so neither is
+/// flagged.
 fn set_avr(status: &mut DeviceStatus, avr: &AvrStatus) {
-    status.tilt = Some(round_tenth(avr.tilt));
-    status.roll = Some(round_tenth(-avr.roll));
+    let degrees = |v: f64| format!("{:.1}°", round_tenth(v));
+    status
+        .telemetry
+        .insert("tilt".to_owned(), degrees(avr.tilt));
+    status
+        .telemetry
+        .insert("roll".to_owned(), degrees(-avr.roll));
 }
 
 /// The battery charge, `temp_c` and `external_power` from a DSP status
-/// whose layout is decoded; a status that is not decoded reports none of
-/// them, so they leave the actor.
+/// whose layout is decoded; for a status that is not decoded, no battery
+/// and `"unknown"` for both keys.
 fn set_dsp(status: &mut DeviceStatus, dsp: &DspStatus) {
-    const KEYS: [&str; 2] = ["temp_c", "external_power"];
-    if dsp.is_decoded() {
+    let (temp_c, external_power) = if dsp.is_decoded() {
         status.battery_pct = Some(dsp.battery_percent());
-        status
-            .telemetry
-            .insert("temp_c".to_owned(), format!("{:.1}", dsp.temperature_c()));
-        status.telemetry.insert(
-            "external_power".to_owned(),
+        (
+            format!("{:.1}", dsp.temperature_c()),
             dsp.external_power().to_string(),
-        );
+        )
     } else {
         status.battery_pct = None;
-        for key in KEYS {
-            status.telemetry.remove(key);
-        }
-    }
+        ("unknown".to_owned(), "unknown".to_owned())
+    };
+    status.telemetry.insert("temp_c".to_owned(), temp_c);
+    status
+        .telemetry
+        .insert("external_power".to_owned(), external_power);
 }
 
 /// Log a message the session could not process and raise an alert; the

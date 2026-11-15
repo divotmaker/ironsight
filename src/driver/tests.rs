@@ -307,12 +307,13 @@ fn the_identity_status_comes_before_the_first_shot_and_has_no_placeholders() {
     let statuses = statuses(&run.events);
     let first = &statuses[0];
     assert_eq!(first.blockers, [blockers::NOT_ARMED]);
-    assert_eq!(first.tilt, Some(0.0));
-    assert!(first.roll.is_some());
+    assert_eq!(first.telemetry["tilt"], "0.0°");
+    assert!(first.telemetry.contains_key("roll"));
     // The Xi's status layout has no decoded battery, temperature or power.
     for s in &statuses {
         assert_eq!(s.battery_pct, None);
-        assert!(s.telemetry.is_empty(), "{:?}", s.telemetry);
+        assert_eq!(s.telemetry["temp_c"], "unknown");
+        assert_eq!(s.telemetry["external_power"], "unknown");
     }
 }
 
@@ -1064,10 +1065,14 @@ fn mevo_plus_status_gives_battery_temperature_and_power_and_others_give_none() {
     let mut p = vec![0u8; 71];
     p[0] = 0x46;
     let v46 = DspStatus::decode(&p).expect("Gen2 status");
-    // A status that is not decoded reports nothing: what a decoded one set
-    // leaves the status.
+    // A status that is not decoded: no battery, both keys unknown.
     set_dsp(&mut got, &v46);
-    assert_eq!(got, DeviceStatus::new());
+    assert_eq!(
+        got,
+        DeviceStatus::new()
+            .with_telemetry("temp_c", "unknown")
+            .with_telemetry("external_power", "unknown")
+    );
 
     let mut avr = crate::testing::avr_status([0, 0]);
     let mut angles = Vec::new();
@@ -1077,8 +1082,18 @@ fn mevo_plus_status_gives_battery_temperature_and_power_and_others_give_none() {
     let avr = AvrStatus::decode(&avr).expect("AVR status");
     let mut got = DeviceStatus::new();
     set_avr(&mut got, &avr);
-    assert_eq!(got.tilt, Some(1.5));
-    assert_eq!(got.roll, Some(-2.2));
+    assert_eq!(got.telemetry["tilt"], "1.5°");
+    assert_eq!(got.telemetry["roll"], "-2.2°", "roll negated");
+    assert!(got.flagged.is_empty());
+    // A roll that rounds to zero reads as zero, never negative zero.
+    let mut avr = crate::testing::avr_status([0, 0]);
+    let mut angles = Vec::new();
+    crate::codec::write_float40(&mut angles, 12.0);
+    crate::codec::write_float40(&mut angles, 0.04);
+    avr[15..25].copy_from_slice(&angles);
+    set_avr(&mut got, &AvrStatus::decode(&avr).expect("AVR status"));
+    assert_eq!(got.telemetry["tilt"], "12.0°");
+    assert_eq!(got.telemetry["roll"], "0.0°");
 }
 
 // -- Decode errors carry no payload bytes out ---------------------------------
@@ -1583,8 +1598,8 @@ fn mevo_plus_keepalives_send_battery_temperature_and_power_when_they_change() {
     let changed = &statuses(&run.events[before..])[0];
     assert_eq!(changed.telemetry["temp_c"], "35.5");
     assert_eq!(changed.telemetry["external_power"], "true");
-    // The status is complete: the attitude is still there.
-    assert!(changed.tilt.is_some());
+    // The status is complete: tilt is still there.
+    assert!(changed.telemetry.contains_key("tilt"));
 }
 
 #[test]
@@ -1613,10 +1628,18 @@ fn a_dsp_status_that_is_not_decoded_takes_the_battery_off_the_actor() {
         })
         .expect("status");
     assert_eq!(cleared.battery_pct, None);
-    assert!(!cleared.telemetry.contains_key("temp_c"));
-    assert!(!cleared.telemetry.contains_key("external_power"));
-    // The attitude is still reported.
-    assert!(cleared.tilt.is_some());
+    assert_eq!(cleared.telemetry["temp_c"], "unknown");
+    assert_eq!(cleared.telemetry["external_power"], "unknown");
+    // Tilt is still reported.
+    assert!(cleared.telemetry.contains_key("tilt"));
+
+    // Every state's actor carries the same, declared keys.
+    let info = Mevo::info(&Config::default());
+    for status in statuses(&run.events) {
+        let actor = info.bus_actor("x", Duration::from_secs(2), None, &status);
+        let keys: Vec<String> = actor.telemetry.expect("telemetry").into_keys().collect();
+        assert_eq!(keys, ["external_power", "roll", "temp_c", "tilt"]);
+    }
 }
 
 #[test]
@@ -1656,7 +1679,8 @@ fn a_mevo_gen2_session_sends_no_battery_temperature_or_power() {
     );
     for s in statuses(&run.events) {
         assert_eq!(s.battery_pct, None);
-        assert!(s.telemetry.is_empty(), "{:?}", s.telemetry);
+        assert_eq!(s.telemetry["temp_c"], "unknown");
+        assert_eq!(s.telemetry["external_power"], "unknown");
     }
     assert!(!device.sent().iter().any(|f| f.type_id == 0x95));
 }
