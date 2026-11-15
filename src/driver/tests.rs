@@ -6,12 +6,12 @@ use std::io;
 use std::rc::Rc;
 use std::time::Duration;
 
+use flightrelay::Basis;
 use flightrelay::config::DriverConfig;
 use flightrelay::driver::{DeviceEvent, FrpDriver, Level, TurnHints};
 use flightrelay::testing::{
     TestHost, alerts, clubs, flights, kinds, launches, raw_frames, status, statuses,
 };
-use flightrelay::types::Basis;
 use flightrelay::{FrpBody, Mode, RawDir, Severity, Source};
 
 use super::*;

@@ -10,7 +10,7 @@
 //! from its own flight model. An early result (0xE8) is converted the same
 //! way, for a shot whose full result never came.
 
-use flightrelay::types::{Basis, ClubData, FlightResult, Launch};
+use flightrelay::{Basis, ClubData, FlightResult, Launch};
 use flightrelay::{Distance, Velocity};
 
 use crate::protocol::shot::{ClubResult, FlightResult as FullResult, FlightResultV1};

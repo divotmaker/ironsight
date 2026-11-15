@@ -57,7 +57,7 @@ use flightrelay::driver::{
     Activity, ConnectCtx, DeviceIdentity, DeviceStatus, DriverInfo, Events, FrpDriver, FrpSession,
     IDLE, Level, Live, NoAction, RawProfile, ShotIds, Stopped, TurnHints,
 };
-use flightrelay::types::{ClubData, Launch, blockers};
+use flightrelay::{ClubData, Launch, blockers};
 use flightrelay::{Mode, RawDir, RawFrame, Severity, ShotKey, Source};
 
 use crate::addr::BusAddr;
