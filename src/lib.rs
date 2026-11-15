@@ -72,6 +72,9 @@ pub use client::{
 pub use config::Config;
 pub use conn::{BinaryConnection, ConnError, DEFAULT_ADDR, Envelope};
 pub use error::WireError;
+/// The flightrelay SDK this crate was built with, so callers name its types at the same version.
+#[cfg(feature = "config")]
+pub use flightrelay;
 pub use frame::{FrameSplitter, RawFrame};
 pub use protocol::{Command, Message};
 pub use seq::{
