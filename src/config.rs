@@ -519,6 +519,8 @@ mod tests {
                 let pitching = c.xi_settings(mode).shot_type == XiShotType::Pitching;
                 let label = c.wire_label(DeviceModel::Xi, mode);
                 assert_eq!(label.starts_with("pitching"), pitching, "{mode:?}: {label}");
+                let number = format!("({})", c.xi_settings(mode).mode);
+                assert!(label.ends_with(&number), "{mode:?}: {label}");
             }
         }
     }
