@@ -569,8 +569,8 @@ impl<S: Read + Write> MevoSession<S> {
                 self.identity.model.as_deref().unwrap_or("unknown model"),
                 self.identity.firmware.as_deref().unwrap_or("unknown"),
                 if charging { " (charging)" } else { "" },
-                h.avr.status.tilt,
-                -h.avr.status.roll,
+                round_tenth(h.avr.status.tilt),
+                round_tenth(-h.avr.status.roll),
             ),
         );
         // The whole device info text carries more than the firmware.
