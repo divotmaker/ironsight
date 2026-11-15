@@ -5,6 +5,9 @@
 //! ([`result::BallTrackerResult`]), which carries raw pixel
 //! tracking data for the club head and ball.
 //!
+//! Work in progress: this module is unstable and outside the semver promise;
+//! any release may change it.
+//!
 //! # Message types
 //!
 //! | Type | Direction | Rust type |

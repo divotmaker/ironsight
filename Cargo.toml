@@ -15,7 +15,7 @@ exclude = ["docs/"]
 # Serialize/Deserialize on the decoded shot results.
 serde = ["dep:serde"]
 # `ironsight::gvp`: a client for the camera processor's JSON protocol
-# (TCP port 1258).
+# (TCP port 1258). Work in progress: unstable, outside the semver promise.
 gvp = ["dep:serde", "dep:serde_json"]
 # The driver's settings (`ironsight::config`): serde types only, no device
 # stack, for settings forms and WebAssembly UIs.

@@ -36,7 +36,8 @@
 //! - `serde`: `Serialize`/`Deserialize` on the decoded shot results (flight,
 //!   early flight, club and spin results).
 //! - `gvp`: `ironsight::gvp`, a client for the camera processor's JSON protocol (TCP
-//!   port 1258).
+//!   port 1258). Work in progress: `gvp` is unstable and outside the semver promise; any
+//!   release may change it.
 //! - `config`: `ironsight::config`, the FRP driver's settings (serde types only, no
 //!   device stack; builds for WebAssembly).
 //! - `driver`: `ironsight::driver`, the [flightrelay](https://docs.rs/flightrelay)
