@@ -1081,7 +1081,7 @@ fn mevo_plus_status_gives_battery_temperature_and_power_and_others_give_none() {
     avr[15..25].copy_from_slice(&angles);
     let avr = AvrStatus::decode(&avr).expect("AVR status");
     let mut got = DeviceStatus::new();
-    set_avr(&mut got, &avr);
+    set_avr(&mut got, &avr, None);
     assert_eq!(got.telemetry["tilt"], "1.5°");
     assert_eq!(got.telemetry["roll"], "-2.2°", "roll negated");
     assert!(got.flagged.is_empty());
@@ -1091,9 +1091,141 @@ fn mevo_plus_status_gives_battery_temperature_and_power_and_others_give_none() {
     crate::codec::write_float40(&mut angles, 12.0);
     crate::codec::write_float40(&mut angles, 0.04);
     avr[15..25].copy_from_slice(&angles);
-    set_avr(&mut got, &AvrStatus::decode(&avr).expect("AVR status"));
+    set_avr(
+        &mut got,
+        &AvrStatus::decode(&avr).expect("AVR status"),
+        None,
+    );
     assert_eq!(got.telemetry["tilt"], "12.0°");
     assert_eq!(got.telemetry["roll"], "0.0°");
+}
+
+/// An AVR status payload reporting `tilt` and `roll` as the device sends
+/// them (roll with the opposite sign to the telemetry).
+fn avr_angles(tilt: f64, wire_roll: f64) -> Vec<u8> {
+    let mut avr = crate::testing::avr_status([0, 0]);
+    let mut angles = Vec::new();
+    crate::codec::write_float40(&mut angles, tilt);
+    crate::codec::write_float40(&mut angles, wire_roll);
+    avr[15..25].copy_from_slice(&angles);
+    avr
+}
+
+/// The flagged keys after an AVR status with `tilt` and telemetry `roll`.
+fn flags_after(status: &mut DeviceStatus, level: LevelLimits, tilt: f64, roll: f64) -> Vec<String> {
+    let avr = AvrStatus::decode(&avr_angles(tilt, -roll)).expect("AVR status");
+    set_avr(status, &avr, Some(level));
+    status.flagged.iter().cloned().collect()
+}
+
+#[test]
+fn tilt_and_roll_are_flagged_outside_the_recommended_range_and_unflagged_back_inside() {
+    let level = LevelLimits::MEVO_PLUS;
+    let mut s = DeviceStatus::new();
+    assert!(flags_after(&mut s, level, 12.0, 0.0).is_empty());
+    assert_eq!(flags_after(&mut s, level, 13.6, 0.0), ["tilt"]);
+    assert_eq!(flags_after(&mut s, level, 10.4, 1.6), ["roll", "tilt"]);
+    assert_eq!(flags_after(&mut s, level, 12.0, -1.6), ["roll"]);
+    assert!(flags_after(&mut s, level, 12.0, 0.3).is_empty());
+    assert_eq!(s.telemetry["tilt"], "12.0°");
+}
+
+#[test]
+fn each_end_of_a_range_is_inside_it() {
+    let mut s = DeviceStatus::new();
+    for (level, tilt, roll) in [
+        (LevelLimits::MEVO_PLUS, 10.5, -1.5),
+        (LevelLimits::MEVO_PLUS, 13.5, 1.5),
+        (LevelLimits::GEN2, 10.0, -2.5),
+        (LevelLimits::GEN2, 16.0, 2.5),
+        (LevelLimits::XI, 8.5, -1.5),
+        (LevelLimits::XI, 11.5, 1.5),
+    ] {
+        assert!(
+            flags_after(&mut s, level, tilt, roll).is_empty(),
+            "{tilt} {roll}"
+        );
+    }
+    // Compared at the device's single precision: a reading that only rounds
+    // onto an end is inside, one a hundredth past it is outside, even though
+    // both read "13.5°".
+    let level = LevelLimits::MEVO_PLUS;
+    assert!(flags_after(&mut s, level, 13.500_000_1, 1.500_000_1).is_empty());
+    assert_eq!(flags_after(&mut s, level, 13.51, 1.51), ["roll", "tilt"]);
+    assert_eq!(s.telemetry["tilt"], "13.5°");
+    assert_eq!(
+        flags_after(&mut s, LevelLimits::GEN2, 16.01, -2.51),
+        ["roll", "tilt"]
+    );
+    assert_eq!(flags_after(&mut s, LevelLimits::XI, 8.49, 0.0), ["tilt"]);
+    // A reading that is not a number is outside.
+    assert!(level.tilt_out_of_range(f64::NAN));
+    assert!(level.roll_out_of_range(f64::NAN));
+}
+
+#[test]
+fn each_model_has_its_own_ranges_and_an_unknown_mevo_none() {
+    assert_eq!(
+        LevelLimits::for_device(DeviceModel::Mevo, Some(DeviceGen::MevoPlus)),
+        Some(LevelLimits::MEVO_PLUS)
+    );
+    assert_eq!(
+        LevelLimits::for_device(DeviceModel::Mevo, Some(DeviceGen::Gen2)),
+        Some(LevelLimits::GEN2)
+    );
+    assert_eq!(
+        LevelLimits::for_device(DeviceModel::Xi, None),
+        Some(LevelLimits::XI)
+    );
+    assert_eq!(
+        LevelLimits::for_device(DeviceModel::Mevo, Some(DeviceGen::Unknown(0x40))),
+        None
+    );
+    assert_eq!(LevelLimits::for_device(DeviceModel::Mevo, None), None);
+    // A tilt the Mevo+ flags is inside the Gen2's range.
+    let mut s = DeviceStatus::new();
+    assert_eq!(
+        flags_after(&mut s, LevelLimits::MEVO_PLUS, 15.0, 2.0),
+        ["roll", "tilt"]
+    );
+    assert!(flags_after(&mut s, LevelLimits::GEN2, 15.0, 2.0).is_empty());
+    // Without ranges nothing is flagged, and a flag already set comes off.
+    let avr = AvrStatus::decode(&avr_angles(0.0, 9.0)).expect("AVR status");
+    set_avr(&mut s, &avr, None);
+    assert!(s.flagged.is_empty());
+}
+
+#[test]
+fn a_mevo_plus_session_flags_its_tilt_until_the_device_is_level() {
+    let mut run = Run::new();
+    let mut mevo = driver(Config::default());
+    let device = FakeDevice::mevo_plus();
+    let mut session = run
+        .connect(&mut mevo, device.clone(), full())
+        .expect("connect");
+    run.armed(&mut session);
+    // The fake device reports a tilt and roll of zero.
+    let first = &statuses(&run.events)[0];
+    assert_eq!(first.telemetry["tilt"], "0.0°");
+    assert_eq!(
+        first.flagged,
+        std::collections::BTreeSet::from(["tilt".to_owned()])
+    );
+    device.push(
+        BusAddr::Avr,
+        crate::protocol::TYPE_STATUS,
+        avr_angles(12.0, 0.0),
+    );
+    let before = run.events.len();
+    run.poll_until(
+        &mut session,
+        |e| matches!(e, DeviceEvent::Status(s) if s.telemetry["tilt"] == "12.0°"),
+    );
+    let level = statuses(&run.events[before..])
+        .into_iter()
+        .find(|s| s.telemetry["tilt"] == "12.0°")
+        .expect("level status");
+    assert!(level.flagged.is_empty());
 }
 
 // -- Decode errors carry no payload bytes out ---------------------------------

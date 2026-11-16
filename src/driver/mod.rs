@@ -13,9 +13,11 @@
 //!
 //! - status for its `bus.actor`: the `not_armed` blocker until it is armed
 //!   and from each trigger until it re-arms; the `tilt` and `roll`
-//!   telemetry keys, in degrees with one decimal (`"12.4°"`); and on a
-//!   Mevo+ the battery charge and the `temp_c` and `external_power`
-//!   telemetry keys. A key with no reading is `"unknown"`;
+//!   telemetry keys, in degrees with one decimal (`"12.4°"`), each flagged
+//!   while its reading is outside FlightScope's recommended range for the
+//!   model (below) and unflagged once back inside; and on a Mevo+ the
+//!   battery charge and the `temp_c` and `external_power` telemetry keys. A
+//!   key with no reading is `"unknown"`;
 //! - for each shot: `shot.trigger` (with the host's clock), `shot.launch` and
 //!   `shot.flight` as soon as the full result arrives, `shot.club` once the
 //!   shot has a ball result, and `shot.finished` when the device is done.
@@ -38,6 +40,20 @@
 //! The session ends with an error when the device closes the connection, an
 //! operation times out, or no message arrives for 10 seconds. The host
 //! reconnects with the driver's advised delay.
+//!
+//! The recommended ranges, in degrees, each including its ends:
+//!
+//! | Model | Tilt | Roll |
+//! |---|---|---|
+//! | Mevo+ | 10.5 to 13.5 | -1.5 to 1.5 |
+//! | Mevo Gen2 | 10.0 to 16.0 | -2.5 to 2.5 |
+//! | Xi | 8.5 to 11.5 | -1.5 to 1.5 |
+//!
+//! A reading is compared at the device's single precision, not as rounded
+//! for the telemetry text, so a tilt of 13.54 reads `"13.5°"` and is
+//! flagged; a reading that is not a number is flagged. A Mevo whose
+//! generation the handshake does not identify has no ranges, and neither
+//! key is flagged.
 //!
 //! [`MevoSession`] is generic over its stream; [`Mevo::connect`] builds it on
 //! a `TcpStream`, and with the `testing` feature `Mevo::connect_with` runs a
@@ -268,11 +284,20 @@ impl Mevo {
 
         let identity = identity(&handshake, addr);
         let model = handshake.model;
+        let level = LevelLimits::for_device(
+            model,
+            handshake
+                .dsp
+                .hw_info
+                .as_ref()
+                .map(crate::protocol::handshake::DspQueryResp::device_gen),
+        );
         let mode = ctx.hints().mode.unwrap_or(Mode::Full);
         let mut session = MevoSession {
             client,
             identity,
             model,
+            level,
             config: self.config.clone(),
             spin_source: self.spin_source.clone(),
             ids: self.ids.clone(),
@@ -463,6 +488,8 @@ pub struct MevoSession<S: Read + Write> {
     client: BinaryClient<S>,
     identity: DeviceIdentity,
     model: DeviceModel,
+    /// The model's tilt and roll ranges, when the model has known ones.
+    level: Option<LevelLimits>,
     config: Config,
     spin_source: Live<SpinSource>,
     ids: ShotIds,
@@ -578,8 +605,9 @@ impl<S: Read + Write> MevoSession<S> {
             Level::Trace,
             format!("AVR device info: {}", h.avr.dev_info.text),
         );
+        let level = self.level;
         self.update_status(out, |s| {
-            set_avr(s, &h.avr.status);
+            set_avr(s, &h.avr.status, level);
             set_dsp(s, dsp);
             set_ready(s, false);
         });
@@ -702,9 +730,10 @@ impl<S: Read + Write> MevoSession<S> {
                 self.apply_pending_mode(out);
             }
             BinaryEvent::Keepalive(status) => {
+                let level = self.level;
                 self.update_status(out, |s| {
                     if let Some(avr) = &status.avr {
-                        set_avr(s, avr);
+                        set_avr(s, avr, level);
                     }
                     if let Some(dsp) = &status.dsp {
                         set_dsp(s, dsp);
@@ -729,7 +758,10 @@ impl<S: Read + Write> MevoSession<S> {
             } => self.camera_setup_unfinished(step, fusion, refused.as_ref(), out),
             BinaryEvent::Message(env) => match &env.message {
                 Message::DspStatus(dsp) => self.update_status(out, |s| set_dsp(s, dsp)),
-                Message::AvrStatus(avr) => self.update_status(out, |s| set_avr(s, avr)),
+                Message::AvrStatus(avr) => {
+                    let level = self.level;
+                    self.update_status(out, |s| set_avr(s, avr, level));
+                }
                 _ => {}
             },
         }
@@ -1026,18 +1058,97 @@ fn set_ready(status: &mut DeviceStatus, ready: bool) {
     };
 }
 
+/// The tilt and roll ranges a FlightScope model should be set up within,
+/// in degrees, each including its ends (the table in the [module
+/// docs](self)).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LevelLimits {
+    /// Lowest and highest tilt.
+    tilt: (f32, f32),
+    /// Lowest and highest roll.
+    roll: (f32, f32),
+}
+
+impl LevelLimits {
+    /// The ranges for a Mevo+.
+    const MEVO_PLUS: Self = Self {
+        tilt: (10.5, 13.5),
+        roll: (-1.5, 1.5),
+    };
+    /// The ranges for a Mevo Gen2.
+    const GEN2: Self = Self {
+        tilt: (10.0, 16.0),
+        roll: (-2.5, 2.5),
+    };
+    /// The ranges for an Xi.
+    const XI: Self = Self {
+        tilt: (8.5, 11.5),
+        roll: (-1.5, 1.5),
+    };
+
+    /// The ranges for a detected model and, on a Mevo, its generation;
+    /// `None` for a Mevo of another or unknown generation.
+    #[must_use]
+    fn for_device(model: DeviceModel, gen_: Option<DeviceGen>) -> Option<Self> {
+        match (model, gen_) {
+            (DeviceModel::Xi, _) => Some(Self::XI),
+            (DeviceModel::Mevo, Some(DeviceGen::MevoPlus)) => Some(Self::MEVO_PLUS),
+            (DeviceModel::Mevo, Some(DeviceGen::Gen2)) => Some(Self::GEN2),
+            (DeviceModel::Mevo, _) => None,
+        }
+    }
+
+    /// Whether `tilt` (degrees) is outside the tilt range.
+    #[must_use]
+    fn tilt_out_of_range(&self, tilt: f64) -> bool {
+        !within(tilt, self.tilt)
+    }
+
+    /// Whether `roll` (degrees, positive as the telemetry shows it) is
+    /// outside the roll range.
+    #[must_use]
+    fn roll_out_of_range(&self, roll: f64) -> bool {
+        !within(roll, self.roll)
+    }
+}
+
+/// Whether `v`, at single precision, is within `lo..=hi`; never for NaN.
+fn within(v: f64, (lo, hi): (f32, f32)) -> bool {
+    // The device's angles are single precision; comparing at that precision
+    // keeps a reading that only rounds onto an end inside the range.
+    #[allow(clippy::cast_possible_truncation)]
+    let v = v as f32;
+    lo <= v && v <= hi
+}
+
 /// The `tilt` and `roll` telemetry from an AVR status: degrees, one
 /// decimal, e.g. `"12.4°"` (the device reports roll with the opposite
-/// sign). FlightScope publishes no numeric limit for either, so neither is
-/// flagged.
-fn set_avr(status: &mut DeviceStatus, avr: &AvrStatus) {
+/// sign). With `level`, each is flagged while outside its range and
+/// unflagged once back inside; without, neither is flagged.
+fn set_avr(status: &mut DeviceStatus, avr: &AvrStatus, level: Option<LevelLimits>) {
     let degrees = |v: f64| format!("{:.1}°", round_tenth(v));
+    let roll = -avr.roll;
     status
         .telemetry
         .insert("tilt".to_owned(), degrees(avr.tilt));
-    status
-        .telemetry
-        .insert("roll".to_owned(), degrees(-avr.roll));
+    status.telemetry.insert("roll".to_owned(), degrees(roll));
+    let flag = |status: &mut DeviceStatus, key: &str, out: bool| {
+        if out {
+            status.flagged.insert(key.to_owned());
+        } else {
+            status.flagged.remove(key);
+        }
+    };
+    flag(
+        status,
+        "tilt",
+        level.is_some_and(|l| l.tilt_out_of_range(avr.tilt)),
+    );
+    flag(
+        status,
+        "roll",
+        level.is_some_and(|l| l.roll_out_of_range(roll)),
+    );
 }
 
 /// The battery charge, `temp_c` and `external_power` from a DSP status
