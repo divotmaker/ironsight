@@ -16,6 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag v${tag} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy
