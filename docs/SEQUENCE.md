@@ -201,7 +201,7 @@ before PiStatus.
 | 5. PI post-config | ~250 ms | 20–50 ms/exchange |
 | 6. ARM &rarr; ARMED | ~170 ms | Async text responses |
 | **Total (no retries)** | **~1.2 s** | |
-| **Total (with retries)** | **~3.8 s** | Observed with config retry backoff |
+| **Total (with retries)** | **~3.8 s** | With config retry backoff |
 
 ---
 
@@ -287,7 +287,7 @@ On E5 "IDLE":
   AVR→APP  0xE3             "ARMED DetectionMode=XX"
 ```
 
-**Key behaviors observed in live testing:**
+**Key behaviors:**
 
 - **ShotDataAck (0x69)**: Send both immediately after "PROCESSED". Do not wait
   for E9 retransmissions between them — E9 responses may be delayed or
@@ -437,9 +437,9 @@ needed. The duplicate ED from 0x6D can be discarded.
 | --------- | ------------------- |
 | All exchanges (unified) | **1000 ms** |
 
-Live testing showed that 500 ms is too tight for some post-shot exchanges,
+500 ms is too tight for some post-shot exchanges,
 particularly after "PROCESSED" when the device is flushing results. A unified
-1 s timeout simplifies the implementation and accommodates all observed
+1 s timeout simplifies the implementation and accommodates all
 latencies with margin.
 
 **Retry strategy**: On timeout, log the error and retry the same operation.

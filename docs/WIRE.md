@@ -399,7 +399,7 @@ stored consecutively:
 
 Spin measurement data. 1 per shot. Contains per-antenna signal data and spin
 estimates from multiple algorithms. The version/length byte [0] determines
-format; all observed data uses version 0x89 (137 data bytes).
+format; devices send version 0x89 in practice (137 data bytes).
 
 ```
 Offset     Width   Scale  Field
@@ -535,7 +535,7 @@ Each frame has a 4-byte header followed by N sub-records of 60 bytes:
 ```
 
 Version detection: `(header_byte - 3) % 60 == 0` &rarr; version 4 (60B stride).
-Older versions use stride 26 (v3) or 23 (v2), but only v4 has been observed.
+Older versions use stride 26 (v3) or 23 (v2), but devices send v4 in practice.
 
 **Sub-record layout** (60 bytes, version 4):
 
@@ -696,7 +696,7 @@ mode change or settings change cycle.
 Parameter read request. APP &rarr; AVR or APP &rarr; PI.
 
 Format: `[03 00 00 XX]` where `XX` is the parameter ID (low byte of a 16-bit
-param ID; high byte is always 0x00 in observed traffic).
+param ID; high byte is always 0x00 in practice).
 
 #### 0xBF &mdash; PARAM_VALUE (7-9 bytes)
 

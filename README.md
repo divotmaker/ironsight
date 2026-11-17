@@ -17,16 +17,16 @@ non-blocking clients share the same `poll()` pattern:
 - **`BinaryClient`** — binary radar protocol (TCP port 5100). Handles
   handshake, configuration, arming, keepalives, and shot detection.
 - **`GvpClient`** — GVP camera protocol (TCP port 1258, `gvp` feature). Handles
-  trigger, trajectory hints, and ball tracker results.
+  trigger, trajectory hints, and ball tracker results. Work in progress:
+  unstable and outside the semver promise.
 - **`driver::Mevo`** — a device driver for the
   [Flight Relay Protocol](https://github.com/flightrelay/spec) SDK's driver
   contract (`driver` feature): connect, configure, arm, reconnect and report
   shots as FRP messages. The `ironsight-frp` binary (`frp` feature) runs it as
   a launch monitor actor on an FRP bus over WebSocket.
 
-Both clients are generic over any `Read + Write` stream. The low-level
-sequencer state machines are also available. No async runtime or heavyweight
-dependencies.
+Both clients are generic over any `Read + Write` stream. No async runtime or
+heavyweight dependencies.
 
 ## Legal Basis — DMCA Section 1201(f)
 
@@ -57,15 +57,12 @@ This project is an exercise of the interoperability exception under
 The FlightScope Mevo+ uses a proprietary binary protocol over TCP to
 communicate shot data (ball speed, launch angle, spin, club data, etc.) to
 companion software. FlightScope does not publish this protocol or provide an
-SDK for third-party integration. The protocol was worked out from WiFi traffic
-between the researcher's own lawfully purchased device and the official FS Golf
-app, and from analysis of that app, solely to enable interoperability with
-third-party golf simulation software.
+SDK for third-party integration. This project exists solely to enable
+interoperability with third-party golf simulation software.
 
 No FlightScope code is reproduced here; the protocol is described and
-implemented in our own words and names. No access controls were circumvented —
-the device operates as an open WiFi access point, and all traffic was captured
-from the researcher's own hardware.
+implemented in our own words and names. No access controls are circumvented —
+the device operates as an open WiFi access point.
 
 ## Acceptable Use
 
@@ -96,7 +93,7 @@ at your option.
 
 ## Status
 
-Pre-1.0 (`0.x`). The protocol is reverse-engineered and still being mapped —
+Pre-1.0 (`0.x`). The protocol is still being mapped —
 some message types and modes aren't decoded yet, and the API may change as
 that work continues. This crate follows [SemVer](https://semver.org/): while
 the version is `0.x`, any minor release may contain breaking changes. Once the
@@ -127,18 +124,18 @@ Pi, so `BinaryClient` adapts once the handshake has identified it:
   straight away).
 - ironsight does not rely on the DSP query (`0x48`): the Xi's DSP may not
   answer it, and without an answer the handshake moves on after
-  `DSP_QUERY_TIMEOUT` (2 s), leaving `DspSync::hw_info` as `None`.
+  2 s, leaving `DspSync::hw_info` as `None`.
 - The DSP sync ends with a power-mode write to the DSP,
   `BF [06 00 00 01 00 00 01]` (DSP param `0x01` = 1, Normal; 4 is Standby),
   answered by `0x95 [02 40 3F]`. It wakes a DSP that was left in Standby,
   and changes nothing on one already in Normal. With no answer within
-  `DSP_QUERY_TIMEOUT` (2 s) the handshake carries on and sets
+  2 s the handshake carries on and sets
   `DspSync::power_mode_unanswered`.
 - The AVR sync stops after the IF calibration exchange (no factory
   calibration, hardware config query, param `0x64` or time sync). For a few
   seconds after power-on the Xi's AVR refuses status polls (`0x94
   [02 30 2A]`); the handshake re-sends the poll every
-  `STATUS_REPOLL_INTERVAL` (1 s) until the AVR answers. This applies to every
+  second until the AVR answers. This applies to every
   model, and changes nothing when the AVR answers the first poll.
 - `BinaryClient::configure_xi(XiSettings)` sends the Xi its full parameter
   set, radar calibration and mode on the connection's first configuration
@@ -153,13 +150,9 @@ Pi, so `BinaryClient` adapts once the handshake has identified it:
   the ball and a 25 mm surface height. Each frame waits for its reply. A `0x94` refusing a frame (or the DSP
   power-mode write) ends that step too: `BinaryClient` reports it as
   `BinaryEvent::StepRefused`, carrying the `0x94` frame, and carries on.
-- `AvrSettings::xi()` and `AvrSettings::xi_with_mode(mode)` are deprecated:
-  they send the detection mode only, with no parameter writes or radar
-  calibration.
 - Shot results (`E8`, `D4`, `ED`, `EF`) decode with the Mevo+ layouts.
   `BinaryClient` acks every `E8` and `D4` with `0x95` the moment it arrives
-  (`[02 10 68]` / `[02 10 54]`); `seq::result_ack` builds the ack for callers
-  that drive the sequencers themselves.
+  (`[02 10 68]` / `[02 10 54]`).
 
 It connects, arms and reports shots on a real Xi. Full swing and pitching in
 mode 9 are tested; mode 8 sends the same frames with only the mode changed,
@@ -168,7 +161,7 @@ and is untested. ironsight has no putting configuration for the Xi. See
 
 ### Mevo+ and Mevo Gen2 configuration
 
-`seq::MevoSettings` holds a full configuration: detection mode, ball type
+`MevoSettings` holds a full configuration: detection mode, ball type
 (param `0x06`), minimum track percentage as a fraction (written to param
 `0x0F`, whose exact use by the device is not yet confirmed), tee height in
 meters (param `0x26`) and the radar calibration. Build it with
@@ -181,7 +174,7 @@ Send `CamConfig::warmup_preset()` when the session starts. The camera accepts
 a Fusion configuration (`CamConfig::fusion_preset()`,
 `CamConfig::raw_fusion_preset()`) only after it has run in standard mode for
 `camera::WARMUP` (15 s). A camera configuration the device refuses (0x94) or
-does not finish within `client::CAMERA_SETUP_TIMEOUT` (8 s) ends with
+does not finish within `CAMERA_SETUP_TIMEOUT` (8 s) ends with
 `BinaryEvent::CameraSetupUnfinished`, which names the step it stopped at; the
 session goes on with the next queued operation (the arm), and the camera stays
 as the device has it.
@@ -216,10 +209,8 @@ single `poll()` call. Keepalives, operation sequencing, and shot detection are
 handled automatically:
 
 ```rust
-use ironsight::client::{BinaryClient, BinaryEvent};
 use ironsight::protocol::handshake::DeviceModel;
-use ironsight::seq::XiSettings;
-use ironsight::BinaryConnection;
+use ironsight::{BinaryClient, BinaryConnection, BinaryEvent, XiSettings};
 
 let conn = BinaryConnection::connect("192.168.2.1:5100")?;
 let mut client = BinaryClient::from_tcp(conn)?;
@@ -249,16 +240,6 @@ loop {
 of the client (operation deadlines, keepalives, the trigger watchdog, the
 handshake's timed steps) compares against the `now` it is given, so a test
 on an in-memory device steps time instead of waiting for it.
-
-### Low-level sequencer API
-
-For callers that need full control over the event loop, the `Sequence` trait
-exposes the underlying pollable state machines. Each sequencer has `feed()`
-(accept a message and the time it is handled, return commands to send) and
-`is_complete()`; the timed steps (`check_timeout()`, `check_cal_timeout()`,
-`check_drain_timeout()`) take a `now` too, so no sequencer reads a clock. Call
-`feed()` with each received `Envelope` and send the returned `Action`s with
-`seq::send_action`; `BinaryClient` is built that way.
 
 ### Device driver and FRP binary
 
@@ -292,9 +273,21 @@ What it sends:
   card text is manufacturer and model (`FlightScope Xi`).
 - **Status** (`bus.actor`): the `not_armed` blocker until the device is
   armed and from each trigger until it re-arms (no blockers while armed),
-  tilt and roll, and on the Mevo+ the battery charge and the `temp_c` and
-  `external_power` telemetry keys (the Gen2's and Xi's status layout has no
-  decoded values for them, so they are left out).
+  the `tilt` and `roll` telemetry keys (degrees with one decimal, e.g.
+  `12.4°`), each flagged while its reading is outside FlightScope's
+  recommended range for the model (below), and on the Mevo+ the battery
+  charge and the `temp_c` and `external_power` telemetry keys (the Gen2's and
+  Xi's status layout has no decoded values for them: no battery, and both
+  keys `unknown`). A key with no reading is `unknown`.
+
+  | Model | Tilt | Roll |
+  |---|---|---|
+  | Mevo+ | 10.5 to 13.5 | -1.5 to 1.5 |
+  | Mevo Gen2 | 10.0 to 16.0 | -2.5 to 2.5 |
+  | Xi | 8.5 to 11.5 | -1.5 to 1.5 |
+
+  The ranges are in degrees, each including its ends. A Mevo whose generation
+  the handshake does not identify has no ranges, and neither key is flagged.
 - **Shots:** `shot.trigger` with a timestamp, then `shot.launch` and
   `shot.flight` (`basis: modeled`: carry, offline, apex, flight time,
   descent, and total and roll when the device reports them) as soon as the
@@ -405,7 +398,7 @@ tests of applications built on ironsight:
 
 ```toml
 [dev-dependencies]
-ironsight = { version = "0.5.1", features = ["testing"] }
+ironsight = { version = "0.9.0", features = ["testing"] }
 ```
 
 ## Dependencies

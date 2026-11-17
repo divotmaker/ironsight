@@ -163,11 +163,11 @@ shot.
 | ----- | ---- | ----------- |
 | `guid` | string | UUID for this shot (used in binary E9 DTO client-side) |
 | `epochTime` | float | Trigger time as Unix epoch (fractional seconds) |
-| `frameNumber` | int | Always 0 in observed traffic |
+| `frameNumber` | int | Always 0 in practice |
 | `savePath` | string | On-device storage path (= guid) |
 | `reprocessPath` | string | Empty in normal operation |
 | `skipTracking` | bool | Always false in normal operation |
-| `triggerTimeOffset` | float | Always 0 in observed traffic |
+| `triggerTimeOffset` | float | Always 0 in practice |
 
 ### 1.7 LOG
 
@@ -182,7 +182,7 @@ Debug/informational messages from the GVP processor.
 }
 ```
 
-`level` values observed: 1 (info), 2 (debug/encoding). The `message` field
+`level` values: 1 (info), 2 (debug/encoding). The `message` field
 contains timestamped log text with memory usage and subsystem tags.
 
 ### 1.8 MT_GOLF_EXPECTED_CLUB_TRACK
@@ -299,7 +299,7 @@ raw pixel tracking data from the SimpleObjectTracker (~3200 bytes).
 | `v` | float[] | Vertical pixel coordinates (sub-pixel precision) |
 | `radius` | float[] | Detected object radius in pixels |
 | `circularityFactor` | float[] | Shape metric (high = circular, low = elongated) |
-| `shutterTime_ms` | int[] | Shutter time per frame (always 1 ms observed) |
+| `shutterTime_ms` | int[] | Shutter time per frame (1 ms in practice) |
 
 **Track IDs:**
 
@@ -312,7 +312,7 @@ raw pixel tracking data from the SimpleObjectTracker (~3200 bytes).
 | 4 | Reference | 1 | 1.0 | Unit reference at trigger epoch (cf=31) |
 
 All tracks use the same coordinate system (camera sensor pixels). The
-`cameraCalibration` in the RESULT is always all-zeros in observed traffic — the
+`cameraCalibration` in the RESULT is always all-zeros in practice — the
 GVP does not provide its own calibration; the client is expected to use
 calibration data from the binary protocol (0xD1 CAM_PARAM_RESP).
 
