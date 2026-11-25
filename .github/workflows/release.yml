@@ -8,21 +8,47 @@ on:
 permissions:
   contents: write
 
+# A plain vX.Y.Z tag is a release and must be on main: it publishes to
+# crates.io and bumps the version on develop. A tag with a -betaN or -rcN
+# suffix (v0.9.1-rc1) is a pre-release test build: it may come from develop,
+# publishes the crate under that prerelease version (0.9.1-rc1, which Cargo
+# only picks when asked for exactly), gets a GitHub pre-release with the
+# binaries, and skips the version bump.
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      prerelease: ${{ steps.kind.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Verify tag matches Cargo.toml version
+        id: kind
         run: |
           tag="${GITHUB_REF_NAME#v}"
+          base="${tag%%-*}"
+          suffix="${tag#"$base"}"
           cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if [ "$tag" != "$cargo_version" ]; then
+          if [ "$base" != "$cargo_version" ]; then
             echo "::error::Tag v${tag} does not match Cargo.toml version ${cargo_version}"
             exit 1
+          fi
+          if [ -n "$suffix" ]; then
+            if ! [[ "$suffix" =~ ^-(beta|rc)\.?[0-9]+$ ]]; then
+              echo "::error::Pre-release suffix must be -betaN or -rcN, got ${suffix}"
+              exit 1
+            fi
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            if ! git merge-base --is-ancestor "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" origin/main; then
+              echo "::error::v${tag} is not on main; a build from develop needs a -betaN or -rcN suffix"
+              exit 1
+            fi
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: Swatinem/rust-cache@v2
@@ -43,14 +69,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # A pre-release publishes under the tag's full version (0.9.1-rc1),
+      # set here for the upload only; Cargo.toml on develop keeps 0.9.1.
+      - name: Set pre-release version
+        if: needs.test.outputs.prerelease == 'true'
+        run: sed -i "0,/^version = \".*\"/s//version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
+
       - name: Publish
-        run: cargo publish
+        run: cargo publish --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   version-bump:
     name: Version bump
-    needs: publish
+    needs: [test, publish]
+    if: needs.test.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -118,7 +151,7 @@ jobs:
 
   release:
     name: Release
-    needs: build
+    needs: [test, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -135,6 +168,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: ${{ needs.test.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.test.outputs.prerelease == 'true' && 'false' || 'true' }}
           files: |
             dist/ironsight-frp-windows-x86_64.exe
             dist/ironsight-frp-linux-x86_64
