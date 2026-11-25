@@ -64,8 +64,9 @@ pub enum BinaryEvent {
     /// from DSP/AVR/PI responses. Useful for staleness detection and
     /// telemetry updates.
     Keepalive(StatusSnapshot),
-    /// The device refused (0x94) a step of the Xi configuration or the Xi
-    /// DSP power-mode write, and the operation carried on with its next
+    /// The device refused (0x94) a step of an AVR configuration
+    /// (`configure_avr` or `configure_xi`) or the Xi DSP power-mode write,
+    /// and the operation carried on with its next
     /// step. Carries the 0x94 frame: `raw` is `[02 bus type & 0x7F]`, the
     /// refusing bus and the refused command. Worth logging as a warning
     /// with that hex. Emitted before the operation's own completion event.
@@ -505,7 +506,7 @@ impl<S: Read + Write> BinaryClient<S> {
                     return Ok(event);
                 };
                 // The refusal goes first; the operation's own event follows
-                // on the next poll. Neither refusing operation finishes by
+                // on the next poll. No refusing operation finishes by
                 // starting another, so `ready_event` is free here.
                 debug_assert!(self.ready_event.is_none());
                 self.ready_event = event;
@@ -770,6 +771,7 @@ impl<S: Read + Write> BinaryClient<S> {
     /// The 0x94 that ended a step of the active operation, if any.
     fn take_refused(active: &mut ActiveOp) -> Option<Envelope> {
         match active {
+            ActiveOp::Configure(ConfigurePhase::Avr(seq)) => seq.take_refused(),
             ActiveOp::Configure(ConfigurePhase::Xi(seq)) => seq.take_refused(),
             ActiveOp::Handshake { phase, .. } => match &mut **phase {
                 HandshakePhase::Dsp(seq) => seq.take_refused(),
@@ -962,9 +964,9 @@ impl<S: Read + Write> BinaryClient<S> {
     fn complete_handshake(&mut self, outcome: HandshakeOutcome) -> BinaryEvent {
         // Detect if a Mevo was armed from a prior session.
         // DspStatus state 6 = armed. This ensures the next
-        // configure_avr will auto-disarm. The Xi's DSP status has a
-        // different layout; its configuration sends B0[01 00] before the
-        // mode block, which disarms it.
+        // configure_avr will auto-disarm. The Xi's and X2's DSP status has
+        // a different layout; their configuration sends B0[01 00] before
+        // anything else, which disarms them.
         if outcome.model == DeviceModel::Mevo && outcome.dsp.status.state() == 6 {
             self.armed = true;
         }

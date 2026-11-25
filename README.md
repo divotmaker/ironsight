@@ -11,7 +11,7 @@ FlightScope and Mevo are trademarks of their respective owner.
 
 ## Description
 
-Client library for the FlightScope Mevo+ / Mevo Gen2 / Xi protocol. Two
+Client library for the FlightScope Mevo+ / Mevo Gen2 / Xi / X2 protocol. Two
 non-blocking clients share the same `poll()` pattern:
 
 - **`BinaryClient`** — binary radar protocol (TCP port 5100). Handles
@@ -106,11 +106,12 @@ API stabilizes it will move to `1.0`.
 | Mevo+ (Gen1) | `FS M2-XXXXXX`  | Fully supported |
 | Mevo Gen2    | `FS MG2-XXXXXX` | Fully supported |
 | Xi           | &mdash;         | **Supported**   |
+| X2           | &mdash;         | **Beta**        |
 
 The model family (`DeviceModel`) is detected during the handshake from the DSP
-device info (`0xE7`): the Xi names itself `FS Xi` there. Mevo generation is
-detected from the `0xC8` DSP query response (`dspType`: `0x80` = Mevo+,
-`0xC0` = Gen2).
+device info (`0xE7`): the Xi names itself `FS Xi` there, the X2 `FS X2`. Mevo
+generation is detected from the `0xC8` DSP query response (`dspType`: `0x80` =
+Mevo+, `0xC0` = Gen2); the X2 answers `0x80` too, so the device info decides.
 
 ### FlightScope Xi
 
@@ -159,6 +160,41 @@ mode 9 are tested; mode 8 sends the same frames with only the mode changed,
 and is untested. ironsight has no putting configuration for the Xi. See
 [SEQUENCE.md](docs/SEQUENCE.md#8-flightscope-xi).
 
+### FlightScope X2 (beta)
+
+The X2 speaks the same protocol on the same address and port
+(`192.168.2.1:5100`). It is a radar-only unit like the Xi, with the Mevo+'s
+AVR handshake, configuration and shot results:
+
+- No camera Pi: as on the Xi, the PI phase is skipped, nothing is sent to the
+  PI bus address and `configure_cam()` sends nothing.
+- The DSP sync is the Mevo's (the X2 answers the DSP query); no power-mode
+  write.
+- The AVR sync is the Mevo's up to the hardware config query (`0x23`), then
+  ends: the X2 refuses the param `0x64` read and does not answer the time
+  sync, so neither is sent. It refuses the factory calibration request
+  (`0x94 [02 30 52]`); the handshake moves on at once.
+- Configure it like a Mevo+, with `MevoSettings` / `AvrSettings` through
+  `BinaryClient::configure_avr` (the `MevoSettings` parameters, the mode and
+  the radar calibration). A `0x94` refusing a frame ends that step:
+  `BinaryClient` reports it as `BinaryEvent::StepRefused` and carries on.
+  Only limited-flight mode (9) is tested on the X2; the other modes send the
+  same frames with only the mode changed, and are untested. What the X2 does
+  with param `0x0F` (the track percentage on the Mevo+) is not known. It
+  prints `INDOOR ONLY` when armed in mode 9.
+- Shot results (`E8`, `D4`, `ED`, `EF`, `D9`, `E9`) decode with the Mevo+
+  layouts; no result acks are sent. It also sends two short summary messages
+  per shot, `0xE0` and `0xE1`, which ironsight passes on as
+  `Message::Unknown`.
+- Its DSP status is a 28-byte layout (version `0x1B`), decoded as the raw
+  `DspStatus` variant: no battery, temperature or power values.
+
+Beta: ball speed, club speed, launch angles, total spin, attack angle, club
+path and swing plane match the values FS Golf displays. On the driver, the
+spin axis and the flight numbers (carry, apex, flight time) are the device's
+own and can differ from what FS Golf displays. ironsight has not yet run
+against a real X2.
+
 ### Mevo+ and Mevo Gen2 configuration
 
 `MevoSettings` holds a full configuration: detection mode, ball type
@@ -168,7 +204,9 @@ meters (param `0x26`) and the radar calibration. Build it with
 `MevoSettings::new`. It converts into
 the `AvrSettings` that `BinaryClient::configure_avr` takes. For a mode change,
 send `AvrSettings::mode_only(mode)`: the device re-arms sooner after the mode
-alone than after a full parameter set.
+alone than after a full parameter set. A `0x94` refusing a frame of the
+configuration ends that step: `BinaryClient` reports it as
+`BinaryEvent::StepRefused`, carrying the `0x94` frame, and carries on.
 
 Send `CamConfig::warmup_preset()` when the session starts. The camera accepts
 a Fusion configuration (`CamConfig::fusion_preset()`,
@@ -251,7 +289,7 @@ SDK (0.7, FRP 0.3.0):
   `MevoSettings` / `XiSettings`. It needs no device stack and builds for
   `wasm32-unknown-unknown`, so a settings form can use it.
 - **`driver`**: `ironsight::driver::Mevo`, flightrelay's `FrpDriver` for the
-  Mevo+, Gen2 and Xi, and `driver::convert` (shot results to FRP types).
+  Mevo+, Gen2, Xi and X2, and `driver::convert` (shot results to FRP types).
 - **`frp`**: the `ironsight-frp` binary.
 
 The driver configures the device for the detected model in the mode of the
@@ -265,10 +303,11 @@ the pitching shot type. The radar has no club or handedness setting.
 What it sends:
 
 - **Identity** (the `device` block of the actor's `bus.actor`):
-  manufacturer `FlightScope`, model `Mevo+`, `Mevo Gen2` or `Xi`, firmware
+  manufacturer `FlightScope`, model `Mevo+`, `Mevo Gen2`, `Xi` or `X2`, firmware
   from the AVR device info (version and build date). The device's own id,
   for the host's logs only, is the Mevo's WiFi SSID, or
-  `FlightScope Xi (<address>)` (`FlightScope Mevo (<address>)` for a Mevo
+  `FlightScope Xi (<address>)` or `FlightScope X2 (<address>)`
+  (`FlightScope Mevo (<address>)` for a Mevo
   that reports no SSID); it never goes on the bus. No `label` is set, so the
   card text is manufacturer and model (`FlightScope Xi`).
 - **Status** (`bus.actor`): the `not_armed` blocker until the device is
@@ -276,9 +315,9 @@ What it sends:
   the `tilt` and `roll` telemetry keys (degrees with one decimal, e.g.
   `12.4°`), each flagged while its reading is outside FlightScope's
   recommended range for the model (below), and on the Mevo+ the battery
-  charge and the `temp_c` and `external_power` telemetry keys (the Gen2's and
-  Xi's status layout has no decoded values for them: no battery, and both
-  keys `unknown`). A key with no reading is `unknown`.
+  charge and the `temp_c` and `external_power` telemetry keys (the Gen2's,
+  Xi's and X2's status layout has no decoded values for them: no battery, and
+  both keys `unknown`). A key with no reading is `unknown`.
 
   | Model | Tilt | Roll |
   |---|---|---|
@@ -287,7 +326,8 @@ What it sends:
   | Xi | 8.5 to 11.5 | -1.5 to 1.5 |
 
   The ranges are in degrees, each including its ends. A Mevo whose generation
-  the handshake does not identify has no ranges, and neither key is flagged.
+  the handshake does not identify has no ranges, and neither has the X2:
+  neither key is flagged.
 - **Shots:** `shot.trigger` with a timestamp, then `shot.launch` and
   `shot.flight` (`basis: modeled`: carry, offline, apex, flight time,
   descent, and total and roll when the device reports them) as soon as the
@@ -351,9 +391,9 @@ ironsight-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
 | `environment` | `limited_flight` | or `outdoor` (full flight, about 40 yd needed) |
 | `range` | `8ft` | distance from the device to the ball |
 | `surface_height` | `0in` | height of the hitting surface |
-| `tee_height` | `1.5in` | Mevo+ and Gen2 |
-| `ball_type` | `1` | Mevo+ and Gen2: 0 = standard, 1 = RCT |
-| `track_pct` | `80` | Mevo+ and Gen2, 0 to 100 |
+| `tee_height` | `1.5in` | Mevo+, Gen2 and X2 |
+| `ball_type` | `1` | Mevo+, Gen2 and X2: 0 = standard, 1 = RCT |
+| `track_pct` | `80` | Mevo+ and Gen2, 0 to 100 (the X2 is sent it too; its effect there is unknown) |
 | `camera_mode` | `standard` | Mevo+ and Gen2: `fusion` or `raw_fusion` (Pro Package); a Fusion setup the device doesn't finish raises an alert and the camera stays in standard mode |
 | `use_estimated` | `false` | send a shot from the early result when the full one is missing |
 | `spin_source` | `d4` | Xi: `e8` or `auto` |
@@ -378,8 +418,9 @@ tests of applications built on ironsight:
 - `FakeDevice`: a scripted in-memory device (`Read + Write`) to hand to
   `BinaryConnection::new`. It answers status polls, the arm and the
   shot-completion requests itself; `FakeDevice::xi()` also answers the Xi's
-  handshake and configuration, and `FakeDevice::mevo_plus()` /
+  handshake and configuration, `FakeDevice::mevo_plus()` /
   `FakeDevice::mevo_gen2()` the Mevo handshake, AVR and camera
+  configuration, and `FakeDevice::x2()` the X2's handshake and AVR
   configuration (`with_ssid` sets the camera Pi's WiFi name,
   `set_dsp_status` the status it reports).
 - `Shot`: one shot's frames (`Shot::xi_full_swing()`, `Shot::xi_chip()`,

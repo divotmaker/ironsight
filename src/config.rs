@@ -316,10 +316,10 @@ impl Config {
             (DeviceModel::Xi, Mode::Chipping | Mode::Putting, _) => "pitching limited-flight(9)",
             (DeviceModel::Xi, _, false) => "full-swing limited-flight(9)",
             (DeviceModel::Xi, _, true) => "full-swing outdoor(8)",
-            (DeviceModel::Mevo, Mode::Putting, _) => "putting(3)",
-            (DeviceModel::Mevo, Mode::Chipping, _) => "chipping(5)",
-            (DeviceModel::Mevo, _, false) => "limited-flight(9)",
-            (DeviceModel::Mevo, _, true) => "outdoor(8)",
+            (DeviceModel::Mevo | DeviceModel::X2, Mode::Putting, _) => "putting(3)",
+            (DeviceModel::Mevo | DeviceModel::X2, Mode::Chipping, _) => "chipping(5)",
+            (DeviceModel::Mevo | DeviceModel::X2, _, false) => "limited-flight(9)",
+            (DeviceModel::Mevo | DeviceModel::X2, _, true) => "outdoor(8)",
         }
     }
 
@@ -329,7 +329,7 @@ impl Config {
     pub fn changes_wire(&self, model: DeviceModel, from: Mode, to: Mode) -> bool {
         match model {
             DeviceModel::Xi => self.xi_settings(from) != self.xi_settings(to),
-            DeviceModel::Mevo => from != to,
+            DeviceModel::Mevo | DeviceModel::X2 => from != to,
         }
     }
 }

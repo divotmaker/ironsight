@@ -1,4 +1,4 @@
-//! Client library for the FlightScope Mevo+, Mevo Gen2 and Xi binary
+//! Client library for the FlightScope Mevo+, Mevo Gen2, Xi and X2 binary
 //! protocol (TCP port 5100).
 //!
 //! [`BinaryClient`] runs a device over a [`BinaryConnection`]: the

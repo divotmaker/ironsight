@@ -144,6 +144,12 @@ config commit**, not just at the start/end.
 | APP&rarr;AVR | 0xB0 | `[01 00]` | Config commit |
 | AVR&rarr;APP | 0x95 | `[02 30 30]` | CONFIG_ACK |
 
+A 0x94 refusing a frame, `[02 30 TT]` with `TT` the frame's type & 0x7F
+(`3F` for a BF write, `30` for B0, `25` for A5, `24` for A4), ends that step
+as its reply would: ironsight sends the next frame and reports the refusal
+(`BinaryEvent::StepRefused`, carrying the 0x94). A 0x94 for another type
+does not end the step.
+
 **Retry behavior**: The AVR may not fully configure on the first attempt. Retry with
 exponential backoff: 200 ms &rarr; 300 ms &rarr; 600 ms. In practice the initial config
 usually succeeds; retry if no response within ~200 ms.

@@ -216,6 +216,48 @@ fn xi_draw() -> FakeShot {
     )
 }
 
+/// An X2 is identified by its DSP device info (not as the Mevo+ its DSP
+/// query reply suggests), gets the Mevo configuration without the camera,
+/// and reports a shot; its `INDOOR ONLY` text and the shot's 0xE0 and 0xE1
+/// summary frames change nothing.
+#[test]
+fn a_whole_x2_session_identifies_arms_and_reports_a_shot() {
+    let mut run = Run::new();
+    let mut mevo = driver(Config::default());
+    let device = FakeDevice::x2();
+    let mut session = run
+        .connect(&mut mevo, device.clone(), full())
+        .expect("connect");
+
+    let id = session.identity().clone();
+    assert_eq!(id.device, "FlightScope X2 (192.168.2.1:5100)");
+    assert_eq!(id.model.as_deref(), Some("X2"));
+    assert_eq!(id.label(), "FlightScope X2");
+    assert_eq!(session.model(), DeviceModel::X2);
+
+    run.armed(&mut session);
+    assert!(device.sent().iter().all(|f| f.dest != BusAddr::Pi));
+    let shot = run.shot(&device, &mut session, &FakeShot::xi_full_swing());
+    assert_eq!(
+        lifecycle(&shot),
+        [
+            "shot.trigger",
+            "shot.launch",
+            "shot.flight",
+            "shot.club",
+            "shot.finished"
+        ]
+    );
+    let pushed: Vec<u8> = device.pushed().iter().map(|f| f.type_id).collect();
+    assert!(pushed.contains(&0xE0) && pushed.contains(&0xE1));
+    assert!(
+        device
+            .pushed()
+            .iter()
+            .any(|f| f.type_id == 0xE3 && f.payload.ends_with(b"INDOOR ONLY\0"))
+    );
+}
+
 #[test]
 fn a_whole_xi_session_identifies_arms_and_reports_a_shot_once() {
     let mut run = Run::new();

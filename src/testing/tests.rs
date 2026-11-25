@@ -319,6 +319,159 @@ fn xi_connection_through_the_client() {
     assert_eq!(acks, ["AVR 95 021068", "AVR 95 021054"]);
 }
 
+/// `FakeDevice::x2` answers the X2's whole connection: the handshake is
+/// detected as an X2 from the DSP device info (its DSP query reply carries
+/// the Mevo+ generation byte), the AVR sync moves on from the refused
+/// factory calibration request at once and ends after the AVR config query
+/// (no param 0x64 read, no time sync), nothing goes to a camera Pi, the
+/// Mevo configuration arms it (the `INDOOR ONLY` text after `ARMED` changes
+/// nothing), and a shot gets no result acks. The shot's 0xE0 and 0xE1
+/// summary frames reach the connection as `Message::Unknown` and leave the
+/// shot as it is.
+#[test]
+fn x2_connection_through_the_client() {
+    let device = FakeDevice::x2();
+    let mut conn = device.connection();
+    let unknown: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let seen = Arc::clone(&unknown);
+    conn.set_on_recv(move |env| {
+        if matches!(env.message, crate::protocol::Message::Unknown { .. }) {
+            seen.lock().unwrap().push(env.type_id);
+        }
+    });
+    let mut client = BinaryClient::new(conn);
+    let start = now();
+    client.handshake();
+    let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::Handshake(_)));
+    let Some(BinaryEvent::Handshake(h)) = events.last() else {
+        unreachable!()
+    };
+    assert_eq!(h.model, DeviceModel::X2);
+    assert!(h.pi.is_none());
+    assert!(h.avr.factory_cal.is_none());
+    assert!(h.avr.if_cal.is_some());
+    assert!(h.avr.avr_config.is_some());
+    // The refused factory calibration request did not wait out its timeout.
+    assert!(now() - start < seq::TIMEOUT);
+
+    let line = |f: &RawFrame| format!("{} {:02X} {}", f.dest, f.type_id, hex(&f.payload));
+    let sent: Vec<String> = device.sent().iter().map(line).collect();
+    assert_eq!(
+        sent,
+        [
+            "DSP AA 0101",
+            "DSP 48 ",
+            "DSP 67 ",
+            "DSP FD 0100",
+            "DSP FD 0108",
+            "DSP FD 0109",
+            "DSP 21 ",
+            "AVR AA 0101",
+            "AVR AA 0101",
+            "AVR 67 ",
+            "AVR 67 ",
+            "AVR BE 0300000c",
+            "AVR BE 0300000d",
+            "AVR 21 ",
+            "AVR D2 090000030000000000a5",
+            "AVR D0 020008",
+            "AVR 23 ",
+        ]
+    );
+
+    let settings = seq::MevoSettings::new(
+        crate::protocol::config::MODE_LIMITED_FLIGHT,
+        0,
+        0.8,
+        0.0,
+        crate::protocol::config::RadarCal {
+            range_mm: 2438,
+            height_mm: 0,
+        },
+    );
+    client.configure_avr(settings.into());
+    client.configure_cam(CamConfig::warmup_preset());
+    client.arm();
+    poll_until(&mut client, |e| matches!(e, BinaryEvent::Armed));
+    assert!(device.sent().iter().all(|f| f.dest != BusAddr::Pi));
+    assert_eq!(
+        device.sent().last().map(line).as_deref(),
+        Some("AVR B0 0101")
+    );
+
+    let indoor_only = |f: &RawFrame| f.type_id == 0xE3 && f.payload == b" INDOOR ONLY\0";
+    assert_eq!(device.pushed().iter().filter(|f| indoor_only(f)).count(), 1);
+
+    let before = device.sent().len();
+    device.push_shot(&Shot::xi_full_swing());
+    let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::ShotComplete(_)));
+    assert!(device.sent()[before..].iter().all(|f| f.type_id != 0x95));
+    assert_eq!(*unknown.lock().unwrap(), [0xE0, 0xE1]);
+    let Some(BinaryEvent::ShotComplete(shot)) = events.last() else {
+        unreachable!()
+    };
+    assert!(shot.flight.is_some() && shot.club.is_some() && shot.spin.is_some());
+    // The re-arm after the shot prints it again.
+    assert_eq!(device.pushed().iter().filter(|f| indoor_only(f)).count(), 2);
+}
+
+/// A configuration write the device refuses (0x94 acking 0x3F) ends that
+/// step at once: it is reported as `StepRefused` before `Configured`, the
+/// rest of the configuration goes out as it does without the refusal, and
+/// the arm follows.
+#[test]
+fn x2_refused_config_write_continues_to_the_arm() {
+    let settings = seq::MevoSettings::new(
+        crate::protocol::config::MODE_LIMITED_FLIGHT,
+        1,
+        0.8,
+        0.038,
+        crate::protocol::config::RadarCal {
+            range_mm: 2438,
+            height_mm: 0,
+        },
+    );
+    let line = |f: &RawFrame| format!("{} {:02X} {}", f.dest, f.type_id, hex(&f.payload));
+    let configure = |refuse: bool| {
+        let device = FakeDevice::x2();
+        let mut client = BinaryClient::new(device.connection());
+        client.handshake();
+        poll_until(&mut client, |e| matches!(e, BinaryEvent::Handshake(_)));
+        let before = device.sent().len();
+        if refuse {
+            device.refuse_next_avr(0xBF);
+        }
+        client.configure_avr(settings.clone().into());
+        client.arm();
+        let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::Armed));
+        let sent: Vec<String> = device.sent()[before..].iter().map(line).collect();
+        (events, sent)
+    };
+    let (events, baseline) = configure(false);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, BinaryEvent::StepRefused(_)))
+    );
+    assert_eq!(baseline[..2], ["AVR B0 0100", "AVR BF 06000006000001"]);
+
+    let (events, sent) = configure(true);
+    assert_eq!(sent, baseline);
+    let refused: Vec<&[u8]> = events
+        .iter()
+        .filter_map(|e| match e {
+            BinaryEvent::StepRefused(env) => Some(env.raw.as_slice()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refused, [[0x02, 0x30, 0x3F]]);
+    let pos = |pred: fn(&BinaryEvent) -> bool| events.iter().position(pred).unwrap();
+    assert!(
+        pos(|e| matches!(e, BinaryEvent::StepRefused(_)))
+            < pos(|e| matches!(e, BinaryEvent::Configured))
+    );
+}
+
 /// `FakeDevice::new` answers the status polls of `BinaryClient::arm`: DSP,
 /// AVR, the arm, then the camera Pi.
 #[test]

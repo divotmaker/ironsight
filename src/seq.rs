@@ -27,8 +27,8 @@ use crate::protocol::shot::{
 };
 use crate::protocol::status::{AvrStatus, ConfigAck, DspStatus, StatusPoll};
 use crate::protocol::{
-    Command, Message, TYPE_DSP_QUERY, TYPE_FLIGHT_RESULT, TYPE_FLIGHT_RESULT_V1, TYPE_PARAM_VALUE,
-    TYPE_STATUS,
+    Command, Message, TYPE_CAL_DATA_REQ, TYPE_DSP_QUERY, TYPE_FLIGHT_RESULT, TYPE_FLIGHT_RESULT_V1,
+    TYPE_PARAM_VALUE, TYPE_STATUS,
 };
 
 /// Per-exchange timeout.
@@ -138,6 +138,23 @@ fn should_skip(env: &Envelope, expected_src: BusAddr) -> bool {
                 | Message::ConfigNack(_)
                 | Message::Unknown { .. }
         )
+}
+
+/// The refusal rule of the configuration sequencers: a 0x94 from the AVR
+/// whose `acked_cmd` is the type of `sent` (the command the current step
+/// waits on a reply to) without the reply bit ends that step. The frame is
+/// kept in `refused`, for the caller to report as
+/// [`BinaryEvent::StepRefused`](crate::BinaryEvent::StepRefused), and the
+/// sequence carries on with its next frame.
+fn step_refused(env: &Envelope, sent: &Command, refused: &mut Option<Box<Envelope>>) -> bool {
+    let Message::ConfigNack(ref nack) = env.message else {
+        return false;
+    };
+    if env.src != BusAddr::Avr || nack.acked_cmd != sent.encode(BusAddr::Avr).type_id & 0x7F {
+        return false;
+    }
+    *refused = Some(Box::new(env.clone()));
+    true
 }
 
 /// Like `should_skip` but also skips ModeAck .
@@ -476,6 +493,13 @@ enum AvrStep {
 /// request, AvrConfigQuery (which the Xi rejects), param 0x64 and TimeSync
 /// are not sent.
 ///
+/// X2 sequence ([`new(DeviceModel::X2)`](Self::new)): the Mevo sequence up
+/// to AvrConfigQuery, then done. The X2 refuses the param 0x64 read and
+/// does not answer TimeSync, so neither is sent.
+///
+/// A 0x94 refusing the factory cal request ends that step at once (the X2
+/// refuses it); without a reply the step ends after [`TIMEOUT`].
+///
 /// An AVR that is still starting up refuses the status poll with a 0x94
 /// (`[02 30 2A]`); the Xi does so for several seconds after power-on. The
 /// poll is then sent again [`STATUS_REPOLL_INTERVAL`] later, from
@@ -595,6 +619,14 @@ impl Sequence for AvrSequencer {
             self.repoll_at
                 .get_or_insert_with(|| now + STATUS_REPOLL_INTERVAL);
             return vec![];
+        }
+        if matches!(self.step, AvrStep::WaitFactoryCal)
+            && env.src == BusAddr::Avr
+            && let Message::ConfigNack(ref nack) = env.message
+            && nack.acked_cmd == TYPE_CAL_DATA_REQ & 0x7F
+        {
+            self.cal_deadline = None;
+            return self.advance_past_cal(now);
         }
         // Cal steps use a different skip filter (allow ConfigAck through
         // so we can skip it, but don't reject it as unexpected).
@@ -716,6 +748,10 @@ impl Sequence for AvrSequencer {
             AvrStep::WaitAvrConfig => {
                 if let Message::AvrConfigResp(ref r) = env.message {
                     self.avr_config = Some(r.clone());
+                    if self.model == DeviceModel::X2 {
+                        self.step = AvrStep::Done;
+                        return vec![];
+                    }
                     self.step = AvrStep::WaitParam64;
                     return vec![Action::Send(
                         Command::ParamReadReq(ParamReadReq { param_id: 0x64 }),
@@ -1109,9 +1145,21 @@ enum AvrConfigStep {
 }
 
 /// Pollable state machine for AVR configuration (Phase 4).
+///
+/// Sends the frames one at a time, each after the reply to the one before:
+/// a leading B0[01 00] gate, each parameter write followed by a B0 commit,
+/// the mode set and its commit, then the radar calibration and its commit.
+/// A 0x94 refusing the current step's command ends that step: the sequence
+/// carries on with the next frame, and the refusal is kept for
+/// [`take_refused()`](Self::take_refused). A step that gets no reply at all
+/// waits for the caller's timeout.
 pub(crate) struct AvrConfigSequencer {
     step: AvrConfigStep,
     settings: AvrSettings,
+    /// The command the current step waits on a reply to.
+    sent: Command,
+    /// 0x94 that ended a step, not yet taken.
+    refused: Option<Box<Envelope>>,
 }
 
 impl AvrConfigSequencer {
@@ -1120,109 +1168,108 @@ impl AvrConfigSequencer {
         // Send a leading B0[01 00] config-gate before any params: after a
         // disarm the device needs it to enter config mode before it accepts
         // the arm.
+        let gate = Command::AvrConfigCmd(AvrConfigCmd { arm: false });
         let seq = Self {
             step: AvrConfigStep::WaitInitGateAck,
             settings,
+            sent: gate.clone(),
+            refused: None,
         };
-        let actions = vec![Action::Send(
-            Command::AvrConfigCmd(AvrConfigCmd { arm: false }),
-            BusAddr::Avr,
-        )];
-        (seq, actions)
+        (seq, vec![Action::Send(gate, BusAddr::Avr)])
+    }
+
+    /// The latest 0x94 with which the device refused a step, once. The
+    /// sequence carried on with the next step; log the frame's hex.
+    #[must_use]
+    pub fn take_refused(&mut self) -> Option<Envelope> {
+        self.refused.take().map(|env| *env)
+    }
+
+    /// The current step is over (answered or refused): move to the next one
+    /// and send its frame.
+    fn advance(&mut self) -> Vec<Action> {
+        let commit = || Command::AvrConfigCmd(AvrConfigCmd { arm: false });
+        let mode_set = Command::ModeSet(ModeSet {
+            mode: self.settings.mode,
+        });
+        let param = |idx: usize| Command::ParamValue(self.settings.params[idx].clone());
+        let (step, command) = match self.step {
+            AvrConfigStep::WaitInitGateAck if self.settings.params.is_empty() => {
+                // No params — jump straight to ModeSet.
+                (AvrConfigStep::WaitModeEcho, Some(mode_set))
+            }
+            AvrConfigStep::WaitInitGateAck => {
+                (AvrConfigStep::WaitParamAck { param_idx: 0 }, Some(param(0)))
+            }
+            AvrConfigStep::WaitParamAck { param_idx } => (
+                AvrConfigStep::WaitParamCommitAck { param_idx },
+                Some(commit()),
+            ),
+            AvrConfigStep::WaitParamCommitAck { param_idx }
+                if param_idx + 1 < self.settings.params.len() =>
+            {
+                (
+                    AvrConfigStep::WaitParamAck {
+                        param_idx: param_idx + 1,
+                    },
+                    Some(param(param_idx + 1)),
+                )
+            }
+            // All params done — ModeSet.
+            AvrConfigStep::WaitParamCommitAck { .. } => {
+                (AvrConfigStep::WaitModeEcho, Some(mode_set))
+            }
+            AvrConfigStep::WaitModeEcho => (AvrConfigStep::WaitModeCommitAck, Some(commit())),
+            AvrConfigStep::WaitModeCommitAck => match self.settings.radar_cal {
+                Some(ref cal) => (
+                    AvrConfigStep::WaitRadarCalEcho,
+                    Some(Command::RadarCal(cal.clone())),
+                ),
+                // No RadarCal — done (mode changes don't need it).
+                None => (AvrConfigStep::Done, None),
+            },
+            AvrConfigStep::WaitRadarCalEcho => {
+                (AvrConfigStep::WaitRadarCalCommitAck, Some(commit()))
+            }
+            AvrConfigStep::WaitRadarCalCommitAck | AvrConfigStep::Done => {
+                (AvrConfigStep::Done, None)
+            }
+        };
+        self.step = step;
+        match command {
+            Some(command) => {
+                self.sent = command.clone();
+                vec![Action::Send(command, BusAddr::Avr)]
+            }
+            None => vec![],
+        }
     }
 }
 
 impl Sequence for AvrConfigSequencer {
     fn feed(&mut self, env: &Envelope, _now: Instant) -> Vec<Action> {
+        if self.is_complete() {
+            return vec![];
+        }
+        if step_refused(env, &self.sent, &mut self.refused) {
+            return self.advance();
+        }
         if should_skip_with_mode_ack(env, BusAddr::Avr) {
             return vec![];
         }
-        let b0_commit = Command::AvrConfigCmd(AvrConfigCmd { arm: false });
-
-        match self.step {
-            AvrConfigStep::WaitInitGateAck => {
-                if let Message::ConfigAck(_) = env.message {
-                    if self.settings.params.is_empty() {
-                        // No params — jump straight to ModeSet.
-                        self.step = AvrConfigStep::WaitModeEcho;
-                        return vec![Action::Send(
-                            Command::ModeSet(ModeSet {
-                                mode: self.settings.mode,
-                            }),
-                            BusAddr::Avr,
-                        )];
-                    }
-                    self.step = AvrConfigStep::WaitParamAck { param_idx: 0 };
-                    return vec![Action::Send(
-                        Command::ParamValue(self.settings.params[0].clone()),
-                        BusAddr::Avr,
-                    )];
-                }
-                vec![]
-            }
-            AvrConfigStep::WaitParamAck { param_idx } => {
-                if let Message::ConfigAck(_) = env.message {
-                    self.step = AvrConfigStep::WaitParamCommitAck { param_idx };
-                    return vec![Action::Send(b0_commit, BusAddr::Avr)];
-                }
-                vec![]
-            }
-            AvrConfigStep::WaitParamCommitAck { param_idx } => {
-                if let Message::ConfigAck(_) = env.message {
-                    let next_idx = param_idx + 1;
-                    if next_idx < self.settings.params.len() {
-                        self.step = AvrConfigStep::WaitParamAck {
-                            param_idx: next_idx,
-                        };
-                        return vec![Action::Send(
-                            Command::ParamValue(self.settings.params[next_idx].clone()),
-                            BusAddr::Avr,
-                        )];
-                    }
-                    // All params done — ModeSet
-                    self.step = AvrConfigStep::WaitModeEcho;
-                    return vec![Action::Send(
-                        Command::ModeSet(ModeSet {
-                            mode: self.settings.mode,
-                        }),
-                        BusAddr::Avr,
-                    )];
-                }
-                vec![]
-            }
-            AvrConfigStep::WaitModeEcho => {
-                if let Message::ModeSet(_) = env.message {
-                    self.step = AvrConfigStep::WaitModeCommitAck;
-                    return vec![Action::Send(b0_commit, BusAddr::Avr)];
-                }
-                vec![]
-            }
-            AvrConfigStep::WaitModeCommitAck => {
-                if let Message::ConfigAck(_) = env.message {
-                    if let Some(ref cal) = self.settings.radar_cal {
-                        self.step = AvrConfigStep::WaitRadarCalEcho;
-                        return vec![Action::Send(Command::RadarCal(cal.clone()), BusAddr::Avr)];
-                    }
-                    // No RadarCal — skip to done (mode changes don't need it).
-                    self.step = AvrConfigStep::Done;
-                }
-                vec![]
-            }
-            AvrConfigStep::WaitRadarCalEcho => {
-                if let Message::RadarCal(_) = env.message {
-                    self.step = AvrConfigStep::WaitRadarCalCommitAck;
-                    return vec![Action::Send(b0_commit, BusAddr::Avr)];
-                }
-                vec![]
-            }
-            AvrConfigStep::WaitRadarCalCommitAck => {
-                if let Message::ConfigAck(_) = env.message {
-                    self.step = AvrConfigStep::Done;
-                }
-                vec![]
-            }
-            AvrConfigStep::Done => vec![],
-        }
+        let answered = matches!(
+            (&self.step, &env.message),
+            (
+                AvrConfigStep::WaitInitGateAck
+                    | AvrConfigStep::WaitParamAck { .. }
+                    | AvrConfigStep::WaitParamCommitAck { .. }
+                    | AvrConfigStep::WaitModeCommitAck
+                    | AvrConfigStep::WaitRadarCalCommitAck,
+                Message::ConfigAck(_),
+            ) | (AvrConfigStep::WaitModeEcho, Message::ModeSet(_))
+                | (AvrConfigStep::WaitRadarCalEcho, Message::RadarCal(_))
+        );
+        if answered { self.advance() } else { vec![] }
     }
 
     fn is_complete(&self) -> bool {
@@ -1571,17 +1618,14 @@ impl Sequence for XiConfigSequencer {
             return vec![];
         }
         let step_type = cmd.encode(BusAddr::Avr).type_id & 0x7F;
-        let done = match (*reply, &env.message) {
-            (_, Message::ConfigNack(a)) if a.acked_cmd == step_type => {
-                self.refused = Some(Box::new(env.clone()));
-                true
-            }
-            (XiReply::Ack, Message::ConfigAck(a)) => a.acked_cmd == step_type,
-            (XiReply::ModeEcho, Message::ModeSet(_))
-            | (XiReply::RadarCalEcho, Message::RadarCal(_)) => true,
-            (XiReply::Param(id), Message::ParamValue(p)) => p.param_id == id,
-            _ => false,
-        };
+        let done = step_refused(env, cmd, &mut self.refused)
+            || match (*reply, &env.message) {
+                (XiReply::Ack, Message::ConfigAck(a)) => a.acked_cmd == step_type,
+                (XiReply::ModeEcho, Message::ModeSet(_))
+                | (XiReply::RadarCalEcho, Message::RadarCal(_)) => true,
+                (XiReply::Param(id), Message::ParamValue(p)) => p.param_id == id,
+                _ => false,
+            };
         if !done {
             return vec![];
         }
@@ -1890,8 +1934,8 @@ enum ArmStep {
 /// can still produce ConfigNack retries, but typically fewer.
 /// The overall operation timeout (set by the caller) limits retries.
 ///
-/// On a model without a camera Pi ([`new(DeviceModel::Xi)`](Self::new))
-/// step 4 skips the PI poll and waits for the "ARMED" text alone.
+/// On a model without a camera Pi (Xi, X2) step 4 skips the PI poll and
+/// waits for the "ARMED" text alone.
 pub(crate) struct ArmSequencer {
     step: ArmStep,
     retries: u16,

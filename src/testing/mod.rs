@@ -17,15 +17,17 @@
 //!   with made-up identity frames;
 //! - with [`FakeDevice::mevo_plus`] and [`FakeDevice::mevo_gen2`], also the
 //!   Mevo handshake (DSP, AVR and camera Pi), the AVR configuration and the
-//!   camera configuration, with made-up identity frames.
+//!   camera configuration, with made-up identity frames;
+//! - with [`FakeDevice::x2`], also the X2's handshake (DSP and AVR) and AVR
+//!   configuration, with made-up identity frames.
 //!
 //! [`FakeDevice::set_camera_fault`] makes the camera Pi leave a camera
 //! configuration step unanswered or refuse it.
 //!
 //! [`FakeDevice::new`] answers nothing else of the handshake, so
 //! [`BinaryClient::handshake`](crate::BinaryClient::handshake) completes on
-//! [`FakeDevice::xi`], [`FakeDevice::mevo_plus`] and
-//! [`FakeDevice::mevo_gen2`] only.
+//! [`FakeDevice::xi`], [`FakeDevice::mevo_plus`], [`FakeDevice::mevo_gen2`]
+//! and [`FakeDevice::x2`] only.
 //!
 //! ```
 //! use ironsight::testing::{FakeDevice, Shot};
@@ -98,6 +100,10 @@ struct State {
     dsp_power_mode: u8,
     /// How the camera Pi mishandles a camera configuration step.
     camera_fault: Option<CameraFault>,
+    /// Refuse the next AVR frame of this type with a 0x94, once.
+    refuse_avr: Option<u8>,
+    /// The detection mode last set (A5 to the AVR).
+    mode: Option<u8>,
 }
 
 /// How a [`FakeDevice`]'s camera Pi mishandles a frame sent to it, by the
@@ -152,6 +158,20 @@ impl FakeDevice {
         Self::mevo(MevoGen::Gen2, "FS MG2-TEST01")
     }
 
+    /// An X2, answering the Mevo handshake and configuration as
+    /// [`mevo_plus`](Self::mevo_plus) does, except: its DSP status is the
+    /// 28-byte version 0x1B layout, its DSP device info names it
+    /// `"1.00 FS X2"`, it refuses the factory calibration request (0xD2) and
+    /// the param 0x64 read with a 0x94, never answers the time sync (0x9B),
+    /// and has no camera Pi. Armed in limited-flight mode (9) it prints
+    /// `" INDOOR ONLY"` after `"ARMED"`, and its shots carry the 0xE0 and
+    /// 0xE1 summary frames (see [`push_shot`](Self::push_shot)). Every
+    /// identity and summary value is made up.
+    #[must_use]
+    pub fn x2() -> Self {
+        Self::mevo(MevoGen::X2, "")
+    }
+
     fn mevo(gen_: MevoGen, ssid: &str) -> Self {
         let device = Self::default();
         {
@@ -184,6 +204,14 @@ impl FakeDevice {
         self.0.borrow_mut().camera_fault = fault;
     }
 
+    /// Refuse the next frame of type `type_id` sent to the AVR with a 0x94
+    /// (`[02 30 type & 0x7F]`) instead of answering it; later ones are
+    /// answered again.
+    #[cfg(test)]
+    pub(crate) fn refuse_next_avr(&self, type_id: u8) {
+        self.0.borrow_mut().refuse_avr = Some(type_id);
+    }
+
     /// A connection over a clone of this device.
     #[must_use]
     pub fn connection(&self) -> BinaryConnection<FakeDevice> {
@@ -198,11 +226,25 @@ impl FakeDevice {
     /// Queue `shot`'s frames and answer its shot result request with its
     /// club result. Shots pushed before the client asks are answered in
     /// order: the first request gets the first shot's club result.
+    ///
+    /// An [`x2`](Self::x2) also sends its two summary frames, 0xE0 and
+    /// 0xE1 with made-up values, right after the shot's early result
+    /// (0xE8), or after the trigger text when the shot has none.
     pub fn push_shot(&self, shot: &Shot) {
         let mut st = self.0.borrow_mut();
         st.club_replies.push_back(shot.club_reply.clone());
-        for f in &shot.frames {
+        let x2 = st.mevo == Some(MevoGen::X2);
+        let summary_after = shot
+            .frames
+            .iter()
+            .position(|f| f.type_id == TYPE_FLIGHT_RESULT_V1)
+            .unwrap_or(0);
+        for (i, f) in shot.frames.iter().enumerate() {
             st.push(f.src, f.type_id, f.payload.clone());
+            if x2 && i == summary_after {
+                st.push(BusAddr::Avr, X2_SUMMARY_E0, x2_summary_e0());
+                st.push(BusAddr::Avr, X2_SUMMARY_E1, x2_summary_e1());
+            }
         }
     }
 
@@ -243,6 +285,14 @@ impl State {
                 _ => {}
             }
         }
+        if (f.dest, f.type_id) == (BusAddr::Avr, 0xA5) {
+            self.mode = p.get(2).copied();
+        }
+        if f.dest == BusAddr::Avr && self.refuse_avr == Some(f.type_id) {
+            self.refuse_avr = None;
+            self.push(BusAddr::Avr, 0x94, vec![0x02, 0x30, f.type_id & 0x7F]);
+            return;
+        }
         match (f.dest, f.type_id) {
             (BusAddr::Dsp, 0xAA) => {
                 let status = if self.xi {
@@ -253,6 +303,7 @@ impl State {
                     match self.mevo {
                         Some(MevoGen::Plus) => mevo_plus_dsp_status(87, 31.0, false),
                         Some(MevoGen::Gen2) => gen2_dsp_status(),
+                        Some(MevoGen::X2) => x2_dsp_status(),
                         None => mevo_dsp_status(),
                     }
                 };
@@ -265,12 +316,18 @@ impl State {
                     avr_status([FAKE_SERIAL[0], FAKE_SERIAL[1]]),
                 );
             }
-            (BusAddr::Pi, 0xAA) if !self.xi => self.push(BusAddr::Pi, 0xAA, pi_status()),
+            (BusAddr::Pi, _) if self.xi || self.mevo == Some(MevoGen::X2) => {}
+            (BusAddr::Pi, 0xAA) => self.push(BusAddr::Pi, 0xAA, pi_status()),
             (BusAddr::Avr, 0xB0) => {
                 self.push(BusAddr::Avr, 0x95, vec![0x02, 0x30, 0x30]);
                 if p == [0x01, 0x01] {
                     self.armed = true;
                     self.push(BusAddr::Avr, 0xE3, b"\n\rARMED\0".to_vec());
+                    if self.mevo == Some(MevoGen::X2)
+                        && self.mode == Some(crate::protocol::config::MODE_LIMITED_FLIGHT)
+                    {
+                        self.push(BusAddr::Avr, 0xE3, b" INDOOR ONLY\0".to_vec());
+                    }
                 } else if self.armed {
                     self.armed = false;
                     self.push(BusAddr::Avr, 0xE3, b"  ARMED CANCELLED\0".to_vec());
@@ -292,7 +349,19 @@ impl State {
     fn respond_mevo(&mut self, f: &RawFrame) {
         let p = f.payload.as_slice();
         let gen2 = self.mevo == Some(MevoGen::Gen2);
+        let x2 = self.mevo == Some(MevoGen::X2);
         match (f.dest, f.type_id) {
+            (BusAddr::Avr, 0xD2) if x2 => self.push(BusAddr::Avr, 0x94, vec![0x02, 0x30, 0x52]),
+            (BusAddr::Avr, 0xBE) if x2 && p.get(3) == Some(&0x64) => {
+                self.push(BusAddr::Avr, 0x94, vec![0x02, 0x30, 0x3E]);
+            }
+            (BusAddr::Avr, 0x9B) if x2 => {}
+            (BusAddr::Dsp, 0x67) if x2 => {
+                let mut info = vec![0u8; 76];
+                info[0] = 0x4B;
+                info[28..42].copy_from_slice(b"1.00 FS X2    ");
+                self.push(BusAddr::Dsp, 0xE7, info);
+            }
             (BusAddr::Dsp, 0x48) => {
                 let dsp_type = if gen2 { 0xC0 } else { 0x80 };
                 self.push(BusAddr::Dsp, 0xC8, vec![0x02, dsp_type, 0x0E]);
@@ -606,6 +675,8 @@ pub fn mevo_plus_dsp_status(battery_pct: u8, temp_c: f64, external_power: bool) 
 enum MevoGen {
     Plus,
     Gen2,
+    /// Answers the Mevo handshake with the X2's differences.
+    X2,
 }
 
 /// Made-up serial number in the Xi's identity frames.
@@ -622,6 +693,31 @@ fn mevo_dsp_status() -> Vec<u8> {
 fn gen2_dsp_status() -> Vec<u8> {
     let mut p = vec![0u8; 71];
     p[0] = 0x46;
+    p
+}
+
+/// Type of the X2's first per-shot summary frame.
+const X2_SUMMARY_E0: u8 = 0xE0;
+/// Type of the X2's second per-shot summary frame.
+const X2_SUMMARY_E1: u8 = 0xE1;
+
+/// A made-up X2 0xE0 payload (a length byte and six bytes; ironsight does
+/// not decode it).
+fn x2_summary_e0() -> Vec<u8> {
+    vec![0x06, 0x03, 0xE8, 0x02, 0xBC, 0x00, 0x01]
+}
+
+/// A made-up X2 0xE1 payload (a length byte and two bytes; ironsight does
+/// not decode it).
+fn x2_summary_e1() -> Vec<u8> {
+    vec![0x02, 0x03, 0xE8]
+}
+
+/// X2 DSP status (28 bytes, version byte 0x1B).
+fn x2_dsp_status() -> Vec<u8> {
+    let mut p = vec![0u8; 28];
+    p[0] = 0x1B;
+    p[4..8].copy_from_slice(&FAKE_SERIAL);
     p
 }
 

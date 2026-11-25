@@ -1,4 +1,4 @@
-//! The FlightScope [`FrpDriver`]: Mevo, Mevo+, Mevo Gen2 and Xi.
+//! The FlightScope [`FrpDriver`]: Mevo, Mevo+, Mevo Gen2, Xi and X2.
 //!
 //! Requires the `driver` feature. [`Mevo`] plugs a FlightScope device into
 //! any host of flightrelay's driver contract: flightrelay's `FrpServer` and
@@ -53,7 +53,7 @@
 //! for the telemetry text, so a tilt of 13.54 reads `"13.5°"` and is
 //! flagged; a reading that is not a number is flagged. A Mevo whose
 //! generation the handshake does not identify has no ranges, and neither
-//! key is flagged.
+//! has an X2: neither key is flagged.
 //!
 //! [`MevoSession`] is generic over its stream; [`Mevo::connect`] builds it on
 //! a `TcpStream`, and with the `testing` feature `Mevo::connect_with` runs a
@@ -334,8 +334,8 @@ fn is_bulk_frame(frame: &RawFrame) -> bool {
 }
 
 /// Who the device is: the camera Pi's WiFi SSID, or the model and address
-/// on a model without one (the Xi). The model is `"Mevo+"`, `"Mevo Gen2"`,
-/// `"Mevo"` or `"Xi"`; the firmware is the AVR device info's version and
+/// on a model without one (the Xi, the X2). The model is `"Mevo+"`,
+/// `"Mevo Gen2"`, `"Mevo"`, `"Xi"` or `"X2"`; the firmware is the AVR device info's version and
 /// build date, `"1.23 (Feb 3 2024)"`. Nothing else of the device info is
 /// used: the DSP's carries the serial number. No label is set, so the card
 /// text is manufacturer and model for every model (`"FlightScope Xi"`).
@@ -352,6 +352,7 @@ fn identity(h: &HandshakeOutcome, addr: SocketAddr) -> DeviceIdentity {
             .map(crate::protocol::handshake::DspQueryResp::device_gen),
     ) {
         (DeviceModel::Xi, _) => "Xi",
+        (DeviceModel::X2, _) => "X2",
         (DeviceModel::Mevo, Some(g @ (DeviceGen::MevoPlus | DeviceGen::Gen2))) => g.label(),
         (DeviceModel::Mevo, _) => DeviceModel::Mevo.label(),
     };
@@ -621,6 +622,15 @@ impl<S: Read + Write> MevoSession<S> {
                 ),
             );
             self.queue_configure(false, out);
+        } else if self.model == DeviceModel::X2 {
+            out.log(
+                Level::Info,
+                format!(
+                    "FlightScope X2: configured for {}; camera mode does not apply",
+                    self.config.wire_label(self.model, self.mode)
+                ),
+            );
+            self.queue_configure(false, out);
         } else {
             self.pending_fusion_cam = match self.config.camera_mode() {
                 CameraMode::Standard => None,
@@ -638,17 +648,17 @@ impl<S: Read + Write> MevoSession<S> {
     // -- Poll ----------------------------------------------------------------
 
     /// Queue the configuration for the current mode, then an arm. A Mevo+
-    /// gets the mode alone on a mode change and its full settings otherwise;
-    /// the Xi gets its configuration (the full set on the connection's first
+    /// or X2 gets the mode alone on a mode change and its full settings
+    /// otherwise; the Xi gets its configuration (the full set on the connection's first
     /// one, the mode set after that).
     fn queue_configure(&mut self, mode_change: bool, out: &mut Events<'_>) {
         out.phase("configuring");
         match self.model {
             DeviceModel::Xi => self.client.configure_xi(self.config.xi_settings(self.mode)),
-            DeviceModel::Mevo if mode_change => self
+            DeviceModel::Mevo | DeviceModel::X2 if mode_change => self
                 .client
                 .configure_avr(self.config.mevo_mode_settings(self.mode)),
-            DeviceModel::Mevo => self
+            DeviceModel::Mevo | DeviceModel::X2 => self
                 .client
                 .configure_avr(self.config.mevo_settings(self.mode)),
         }
@@ -1094,7 +1104,7 @@ impl LevelLimits {
             (DeviceModel::Xi, _) => Some(Self::XI),
             (DeviceModel::Mevo, Some(DeviceGen::MevoPlus)) => Some(Self::MEVO_PLUS),
             (DeviceModel::Mevo, Some(DeviceGen::Gen2)) => Some(Self::GEN2),
-            (DeviceModel::Mevo, _) => None,
+            (DeviceModel::Mevo | DeviceModel::X2, _) => None,
         }
     }
 

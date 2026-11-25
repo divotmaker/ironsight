@@ -98,6 +98,9 @@ impl DspQueryResp {
 /// Xi DSP (99B): binary header followed by a single 16-byte text slot at the
 /// end of the payload holding the firmware version and model
 /// (e.g. `"0.38 FS Xi"`).
+///
+/// X2 DSP (76B): the Mevo DSP layout, with the firmware version and model in
+/// the first slot (e.g. `"1.00 FS X2"`) and the other two empty.
 #[derive(Debug, Clone)]
 pub struct DevInfoResp {
     /// Concatenation of all non-empty text slots, separated by spaces.
@@ -181,8 +184,8 @@ impl DevInfoResp {
 /// Launch monitor model family, detected from the DSP device info (0xE7).
 ///
 /// The family decides the handshake: the Mevo+ and Mevo Gen2 have a camera
-/// Pi on the bus, the Xi does not. [`DeviceGen`] tells the Mevo generations
-/// apart.
+/// Pi on the bus, the Xi and X2 do not. [`DeviceGen`] tells the Mevo
+/// generations apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum DeviceModel {
@@ -191,18 +194,26 @@ pub enum DeviceModel {
     Mevo,
     /// Xi: radar only, no camera Pi.
     Xi,
+    /// X2: radar only, no camera Pi. Its AVR handshake, configuration and
+    /// shot results are the Mevo+'s.
+    X2,
 }
 
 impl DeviceModel {
     /// Detect the model family from the DSP device info.
     ///
-    /// The Xi names itself `"FS Xi"` in its DSP device info. Anything else is
-    /// treated as a Mevo.
+    /// The Xi names itself `"FS Xi"` in its DSP device info, the X2
+    /// `"FS X2"`. Anything else is treated as a Mevo. (The X2's DSP query
+    /// reply carries the Mevo+ generation byte, so the device info decides.)
     #[must_use]
     pub fn from_dev_info(info: &DevInfoResp) -> Self {
         const XI_TAG: &[u8] = b"FS Xi";
-        if info.payload.windows(XI_TAG.len()).any(|w| w == XI_TAG) {
+        const X2_TAG: &[u8] = b"FS X2";
+        let names = |tag: &[u8]| info.payload.windows(tag.len()).any(|w| w == tag);
+        if names(XI_TAG) {
             DeviceModel::Xi
+        } else if names(X2_TAG) {
+            DeviceModel::X2
         } else {
             DeviceModel::Mevo
         }
@@ -223,6 +234,7 @@ impl DeviceModel {
         match self {
             DeviceModel::Mevo => "Mevo",
             DeviceModel::Xi => "Xi",
+            DeviceModel::X2 => "X2",
         }
     }
 }
@@ -536,6 +548,19 @@ mod tests {
         assert_eq!(info.model(), DeviceModel::Xi);
         assert!(!info.model().has_camera());
         assert_eq!(info.model().to_string(), "FlightScope Xi");
+    }
+
+    /// The X2 names itself in the first slot of the Mevo DSP layout.
+    #[test]
+    fn x2_dsp_dev_info() {
+        let mut p = vec![0u8; 76];
+        p[0] = 0x4B;
+        p[28..42].copy_from_slice(b"1.00 FS X2    ");
+        let info = DevInfoResp::decode(&p).unwrap();
+        assert_eq!(info.version(), Some("1.00"));
+        assert_eq!(info.model(), DeviceModel::X2);
+        assert!(!info.model().has_camera());
+        assert_eq!(info.model().to_string(), "FlightScope X2");
     }
 
     #[test]

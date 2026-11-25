@@ -1,5 +1,5 @@
 //! ironsight-frp — Flight Relay Protocol device for the FlightScope Mevo+,
-//! Mevo Gen2 and Xi.
+//! Mevo Gen2, Xi and X2.
 //!
 //! ```text
 //! ironsight-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
