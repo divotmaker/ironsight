@@ -102,6 +102,11 @@ struct State {
     camera_fault: Option<CameraFault>,
     /// Refuse the next AVR frame of this type with a 0x94, once.
     refuse_avr: Option<u8>,
+    /// Leave the next AVR frame of this type unanswered, once.
+    ignore_avr: Option<u8>,
+    /// An X2 whose DSP is in Standby: its status says so and the AVR
+    /// answers nothing, until the DSP power mode is set to Normal.
+    standby: bool,
     /// The detection mode last set (A5 to the AVR).
     mode: Option<u8>,
 }
@@ -160,7 +165,8 @@ impl FakeDevice {
 
     /// An X2, answering the Mevo handshake and configuration as
     /// [`mevo_plus`](Self::mevo_plus) does, except: its DSP status is the
-    /// 28-byte version 0x1B layout, its DSP device info names it
+    /// 28-byte version 0x1B layout (reporting the DSP in Normal), it answers
+    /// a DSP parameter write with a 0x95, its DSP device info names it
     /// `"1.00 FS X2"`, it refuses the factory calibration request (0xD2) and
     /// the param 0x64 read with a 0x94, never answers the time sync (0x9B),
     /// and has no camera Pi. Armed in limited-flight mode (9) it prints
@@ -210,6 +216,23 @@ impl FakeDevice {
     #[cfg(test)]
     pub(crate) fn refuse_next_avr(&self, type_id: u8) {
         self.0.borrow_mut().refuse_avr = Some(type_id);
+    }
+
+    /// Leave the next frame of type `type_id` sent to the AVR unanswered;
+    /// later ones are answered again.
+    #[cfg(test)]
+    pub(crate) fn ignore_next_avr(&self, type_id: u8) {
+        self.0.borrow_mut().ignore_avr = Some(type_id);
+    }
+
+    /// This [`x2`](Self::x2) with its DSP in Standby: the DSP status
+    /// reports Standby and the AVR answers nothing until a DSP power-mode
+    /// write (DSP param 0x01) sets Normal (1).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn in_standby(self) -> Self {
+        self.0.borrow_mut().standby = true;
+        self
     }
 
     /// A connection over a clone of this device.
@@ -288,6 +311,12 @@ impl State {
         if (f.dest, f.type_id) == (BusAddr::Avr, 0xA5) {
             self.mode = p.get(2).copied();
         }
+        if f.dest == BusAddr::Avr && (self.standby || self.ignore_avr == Some(f.type_id)) {
+            if !self.standby {
+                self.ignore_avr = None;
+            }
+            return;
+        }
         if f.dest == BusAddr::Avr && self.refuse_avr == Some(f.type_id) {
             self.refuse_avr = None;
             self.push(BusAddr::Avr, 0x94, vec![0x02, 0x30, f.type_id & 0x7F]);
@@ -303,7 +332,7 @@ impl State {
                     match self.mevo {
                         Some(MevoGen::Plus) => mevo_plus_dsp_status(87, 31.0, false),
                         Some(MevoGen::Gen2) => gen2_dsp_status(),
-                        Some(MevoGen::X2) => x2_dsp_status(),
+                        Some(MevoGen::X2) => x2_dsp_status(self.standby),
                         None => mevo_dsp_status(),
                     }
                 };
@@ -356,6 +385,13 @@ impl State {
                 self.push(BusAddr::Avr, 0x94, vec![0x02, 0x30, 0x3E]);
             }
             (BusAddr::Avr, 0x9B) if x2 => {}
+            (BusAddr::Dsp, 0xBF) if x2 => {
+                self.push(BusAddr::Dsp, 0x95, vec![0x02, 0x40, 0x3F]);
+                if p.len() >= 7 && p[3] == 0x01 {
+                    self.dsp_power_mode = p[6];
+                    self.standby = p[6] != 0x01;
+                }
+            }
             (BusAddr::Dsp, 0x67) if x2 => {
                 let mut info = vec![0u8; 76];
                 info[0] = 0x4B;
@@ -713,11 +749,13 @@ fn x2_summary_e1() -> Vec<u8> {
     vec![0x02, 0x03, 0xE8]
 }
 
-/// X2 DSP status (28 bytes, version byte 0x1B).
-fn x2_dsp_status() -> Vec<u8> {
+/// X2 DSP status (28 bytes, version byte 0x1B); its last byte is the
+/// DSP's power mode, 1 in Standby and 2 in Normal.
+fn x2_dsp_status(standby: bool) -> Vec<u8> {
     let mut p = vec![0u8; 28];
     p[0] = 0x1B;
     p[4..8].copy_from_slice(&FAKE_SERIAL);
+    p[27] = if standby { 0x01 } else { 0x02 };
     p
 }
 

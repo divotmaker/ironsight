@@ -415,6 +415,61 @@ fn x2_connection_through_the_client() {
     assert_eq!(device.pushed().iter().filter(|f| indoor_only(f)).count(), 2);
 }
 
+/// The frames an X2's handshake sends from the DSP's config query on:
+/// the AVR sync, ending at the hardware config query.
+const X2_AVR_SYNC: [&str; 10] = [
+    "AVR AA 0101",
+    "AVR AA 0101",
+    "AVR 67 ",
+    "AVR 67 ",
+    "AVR BE 0300000c",
+    "AVR BE 0300000d",
+    "AVR 21 ",
+    "AVR D2 090000030000000000a5",
+    "AVR D0 020008",
+    "AVR 23 ",
+];
+
+/// Handshake `device`, an X2; return the frames sent, one line each.
+fn x2_handshake(device: &FakeDevice) -> Vec<String> {
+    let mut client = BinaryClient::new(device.connection());
+    client.handshake();
+    let events = poll_until(&mut client, |e| matches!(e, BinaryEvent::Handshake(_)));
+    let Some(BinaryEvent::Handshake(h)) = events.last() else {
+        unreachable!()
+    };
+    assert_eq!(h.model, DeviceModel::X2);
+    assert!(h.avr.avr_config.is_some());
+    let line = |f: &RawFrame| format!("{} {:02X} {}", f.dest, f.type_id, hex(&f.payload));
+    device.sent().iter().map(line).collect()
+}
+
+/// An X2 whose DSP is in Standby answers the DSP sync but not the AVR.
+/// The DSP sync ends with the power-mode write (param 0x01 = 1, Normal),
+/// after which the AVR answers and the handshake completes.
+#[test]
+fn x2_in_standby_is_woken_and_completes_the_handshake() {
+    let device = FakeDevice::x2().in_standby();
+    let sent = x2_handshake(&device);
+    let dsp_sync = sent.iter().position(|l| l == "DSP 21 ").expect("DSP 21") + 1;
+    assert_eq!(sent[dsp_sync], "DSP BF 06000001000001");
+    assert_eq!(sent[dsp_sync + 1..], X2_AVR_SYNC);
+}
+
+/// An AVR status poll the X2 leaves unanswered is sent again one
+/// `STATUS_REPOLL_INTERVAL` later, and the handshake completes.
+#[test]
+fn x2_unanswered_avr_status_poll_is_re_sent() {
+    let device = FakeDevice::x2();
+    device.ignore_next_avr(TYPE_STATUS);
+    let start = now();
+    let sent = x2_handshake(&device);
+    assert!(now() - start >= seq::STATUS_REPOLL_INTERVAL);
+    let avr_sync = sent.iter().position(|l| l == "DSP 21 ").expect("DSP 21") + 1;
+    assert_eq!(sent[avr_sync], "AVR AA 0101");
+    assert_eq!(sent[avr_sync + 1..], X2_AVR_SYNC);
+}
+
 /// A configuration write the device refuses (0x94 acking 0x3F) ends that
 /// step at once: it is reported as `StepRefused` before `Configured`, the
 /// rest of the configuration goes out as it does without the refusal, and

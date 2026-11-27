@@ -135,8 +135,8 @@ Pi, so `BinaryClient` adapts once the handshake has identified it:
 - The AVR sync stops after the IF calibration exchange (no factory
   calibration, hardware config query, param `0x64` or time sync). For a few
   seconds after power-on the Xi's AVR refuses status polls (`0x94
-  [02 30 2A]`); the handshake re-sends the poll every
-  second until the AVR answers. This applies to every
+  [02 30 2A]`); the handshake re-sends a poll that is refused or
+  unanswered every second until the AVR answers. This applies to every
   model, and changes nothing when the AVR answers the first poll.
 - `BinaryClient::configure_xi(XiSettings)` sends the Xi its full parameter
   set, radar calibration and mode on the connection's first configuration
@@ -168,8 +168,11 @@ AVR handshake, configuration and shot results:
 
 - No camera Pi: as on the Xi, the PI phase is skipped, nothing is sent to the
   PI bus address and `configure_cam()` sends nothing.
-- The DSP sync is the Mevo's (the X2 answers the DSP query); no power-mode
-  write.
+- The DSP sync is the Mevo's (the X2 answers the DSP query). When the DSP's
+  first status reports Standby (byte 27 = 1; 2 is Normal), the sync ends with
+  the Xi's power-mode write, `BF [06 00 00 01 00 00 01]`; an X2 in Normal is
+  not sent it. While the DSP is in Standby the AVR answers nothing, so the
+  AVR sync re-sends its status poll every second until the AVR answers.
 - The AVR sync is the Mevo's up to the hardware config query (`0x23`), then
   ends: the X2 refuses the param `0x64` read and does not answer the time
   sync, so neither is sent. It refuses the factory calibration request
@@ -192,8 +195,8 @@ AVR handshake, configuration and shot results:
 Beta: ball speed, club speed, launch angles, total spin, attack angle, club
 path and swing plane match the values FS Golf displays. On the driver, the
 spin axis and the flight numbers (carry, apex, flight time) are the device's
-own and can differ from what FS Golf displays. ironsight has not yet run
-against a real X2.
+own and can differ from what FS Golf displays. ironsight has not yet tracked
+a shot on a real X2.
 
 ### Mevo+ and Mevo Gen2 configuration
 

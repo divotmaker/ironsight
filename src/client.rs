@@ -65,7 +65,7 @@ pub enum BinaryEvent {
     /// telemetry updates.
     Keepalive(StatusSnapshot),
     /// The device refused (0x94) a step of an AVR configuration
-    /// (`configure_avr` or `configure_xi`) or the Xi DSP power-mode write,
+    /// (`configure_avr` or `configure_xi`) or the DSP power-mode write,
     /// and the operation carried on with its next
     /// step. Carries the 0x94 frame: `raw` is `[02 bus type & 0x7F]`, the
     /// refusing bus and the refused command. Worth logging as a warning
@@ -400,8 +400,7 @@ impl<S: Read + Write> BinaryClient<S> {
                     for a in dsp.check_timers(now) {
                         seq::send_action(&mut self.conn, a)?;
                     }
-                    // On the Xi a timed-out power-mode write is the last
-                    // DSP step.
+                    // A timed-out power-mode write is the last DSP step.
                     if dsp.is_complete() {
                         return self.advance_phase(now);
                     }
@@ -905,7 +904,7 @@ impl<S: Read + Write> BinaryClient<S> {
             ActiveOp::Handshake { phase, dsp, avr } => match *phase {
                 HandshakePhase::Dsp(seq) => {
                     let dsp_result = seq.into_result();
-                    let (avr_seq, actions) = AvrSequencer::new(dsp_result.model);
+                    let (avr_seq, actions) = AvrSequencer::new(dsp_result.model, now);
                     for a in actions {
                         seq::send_action(&mut self.conn, a)?;
                     }

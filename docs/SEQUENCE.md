@@ -80,9 +80,10 @@ DSP response latency: 10–30 ms.
 AVR response latency: 2–32 ms.
 
 An AVR that is still starting up refuses the status poll with 0x94
-`[02 30 2A]` instead of answering it. ironsight sends the poll again 1 s
-later (`STATUS_REPOLL_INTERVAL`), once per refusal, until the AVR answers or
-the operation times out. Without a refusal nothing changes.
+`[02 30 2A]`, or does not answer it. ironsight sends a poll the AVR has not
+answered again 1 s later (`STATUS_REPOLL_INTERVAL`), every second, until the
+AVR answers or the operation times out. When the AVR answers within 1 s
+nothing changes.
 
 **Intermediate responses**: The D0 (CalParamReq) exchange produces an 0xE3 Text
 and 0x95 ConfigAck before the actual 0xD1 response. The D2 (CalDataReq) may also
@@ -524,6 +525,8 @@ refusing the write also ends the step, and so does no reply within 2 s
 (`DSP_QUERY_TIMEOUT`); the handshake then carries on with the AVR sync and
 sets `DspSync::power_mode_unanswered`. Param 0x01 on the AVR is a different
 parameter (Altitude, &sect;8.3). The Mevo+ and Gen2 are not sent this write.
+The X2 is sent it only when its DSP's first status reports Standby (README,
+FlightScope X2).
 
 ### 8.3 Configuration
 

@@ -70,7 +70,16 @@ fn dsp_dev_info(text: &[u8; 14]) -> Envelope {
 /// Run a DSP sync up to and including the config query's reply (0xA0);
 /// returns what that reply produced.
 fn dsp_sync_to_config(seq: &mut DspSequencer, model: &[u8; 14]) -> Vec<Action> {
-    assert_eq!(sent(&seq.feed(&dsp_status(), t0())), [(BusAddr::Dsp, 0x48)]);
+    dsp_sync_to_config_from(seq, &dsp_status(), model)
+}
+
+/// [`dsp_sync_to_config`], with the DSP's first status `status`.
+fn dsp_sync_to_config_from(
+    seq: &mut DspSequencer,
+    status: &Envelope,
+    model: &[u8; 14],
+) -> Vec<Action> {
+    assert_eq!(sent(&seq.feed(status, t0())), [(BusAddr::Dsp, 0x48)]);
     let nack = env(BusAddr::Dsp, 0x94, vec![0x02, 0x40, 0x48]);
     assert_eq!(sent(&seq.feed(&nack, t0())), [(BusAddr::Dsp, 0x67)]);
     assert_eq!(
@@ -159,6 +168,49 @@ fn xi_dsp_power_mode_timeout_completes() {
     assert_eq!(sync.model, DeviceModel::Xi);
 }
 
+/// An X2 DSP status (version 0x1B) whose last byte, the power mode, is
+/// `power`: 1 in Standby, 2 in Normal.
+fn x2_dsp_status(power: u8) -> Envelope {
+    let mut p = vec![0u8; 28];
+    p[0] = 0x1B;
+    p[27] = power;
+    env(BusAddr::Dsp, 0xAA, p)
+}
+
+/// An X2 whose DSP reports Standby is sent the power-mode write (param
+/// 0x01 = 1, Normal) after the config query's reply; the DSP's 0x95 ends
+/// the sync.
+#[test]
+fn x2_dsp_sync_wakes_a_dsp_in_standby() {
+    let (mut seq, _) = DspSequencer::new();
+    let actions = dsp_sync_to_config_from(&mut seq, &x2_dsp_status(1), b"0.31 FS X2    ");
+    assert_eq!(actions.len(), 1);
+    assert_eq!(
+        wire(&actions[0]),
+        (BusAddr::Dsp, 0xBF, hex("06000001000001"))
+    );
+    assert!(!seq.is_complete());
+    assert!(
+        seq.feed(&env(BusAddr::Dsp, 0x95, hex("02403f")), t0())
+            .is_empty()
+    );
+    assert!(seq.is_complete());
+    let sync = seq.into_result();
+    assert_eq!(sync.model, DeviceModel::X2);
+    assert!(!sync.power_mode_unanswered);
+}
+
+/// An X2 whose DSP reports Normal is not sent the power-mode write: its
+/// DSP sync ends on the config query's reply.
+#[test]
+fn x2_dsp_sync_in_normal_sends_no_power_mode() {
+    let (mut seq, _) = DspSequencer::new();
+    let actions = dsp_sync_to_config_from(&mut seq, &x2_dsp_status(2), b"0.31 FS X2    ");
+    assert!(actions.is_empty());
+    assert!(seq.is_complete());
+    assert_eq!(seq.into_result().model, DeviceModel::X2);
+}
+
 /// A Mevo's DSP sync ends on the config query's reply, with nothing
 /// sent after it.
 #[test]
@@ -170,12 +222,12 @@ fn mevo_dsp_sync_sends_no_power_mode() {
     assert_eq!(seq.into_result().model, DeviceModel::Mevo);
 }
 
-/// A refused status poll (0x94 `[02 30 2A]`, a starting AVR) is sent
-/// again after `STATUS_REPOLL_INTERVAL`, once per refusal, until the AVR
-/// answers.
+/// A status poll the AVR leaves unanswered, or refuses (0x94
+/// `[02 30 2A]`, a starting AVR), is sent again every
+/// `STATUS_REPOLL_INTERVAL` until the AVR answers.
 #[test]
-fn avr_status_nack_repolls() {
-    let (mut seq, actions) = AvrSequencer::new(DeviceModel::Xi);
+fn avr_status_poll_is_re_sent_until_answered() {
+    let (mut seq, actions) = AvrSequencer::new(DeviceModel::Xi, t0());
     assert_eq!(sent(&actions), [(BusAddr::Avr, 0xAA)]);
     let nack = env(BusAddr::Avr, 0x94, hex("02302a"));
     let mut status = vec![0u8; 25];
@@ -183,37 +235,32 @@ fn avr_status_nack_repolls() {
     let status = env(BusAddr::Avr, 0xAA, status);
 
     let mut t = t0();
-    for _ in 0..2 {
-        assert!(seq.feed(&nack, t).is_empty());
-        // Not before the interval.
+    // Unanswered, then refused: re-sent once per interval, never before.
+    for reply in [None, Some(&nack), None] {
+        if let Some(reply) = reply {
+            assert!(seq.feed(reply, t + MS).is_empty());
+        }
         t += STATUS_REPOLL_INTERVAL;
         assert!(seq.check_timers(t - MS).is_empty());
         assert_eq!(sent(&seq.check_timers(t)), [(BusAddr::Avr, 0xAA)]);
-        // Once per refusal.
-        t += STATUS_REPOLL_INTERVAL;
         assert!(seq.check_timers(t).is_empty());
     }
-    // A NACK of another command is not a refused poll.
-    assert!(
-        seq.feed(&env(BusAddr::Avr, 0x94, hex("023023")), t)
-            .is_empty()
-    );
-    assert!(seq.repoll_at.is_none());
-    // The AVR answers: the handshake goes on as normal.
+    // The AVR answers: the second poll goes out, re-sent the same way.
     assert_eq!(sent(&seq.feed(&status, t)), [(BusAddr::Avr, 0xAA)]);
-    assert!(seq.feed(&nack, t).is_empty());
     t += STATUS_REPOLL_INTERVAL;
+    assert!(seq.check_timers(t - MS).is_empty());
     assert_eq!(sent(&seq.check_timers(t)), [(BusAddr::Avr, 0xAA)]);
     assert_eq!(sent(&seq.feed(&status, t)), [(BusAddr::Avr, 0x67)]);
-    // Past the status polls a refused poll schedules nothing.
-    assert!(seq.feed(&nack, t0()).is_empty());
+    // Past the status polls nothing is re-sent.
     assert!(seq.repoll_at.is_none());
+    assert!(seq.feed(&nack, t).is_empty());
+    assert!(seq.check_timers(t + 10 * STATUS_REPOLL_INTERVAL).is_empty());
 }
 
 /// Without a refusal the AVR sync sends exactly what it always has.
 #[test]
 fn mevo_avr_sync_without_nack_is_unchanged() {
-    let (mut seq, actions) = AvrSequencer::new(DeviceModel::Mevo);
+    let (mut seq, actions) = AvrSequencer::new(DeviceModel::Mevo, t0());
     assert_eq!(sent(&actions), [(BusAddr::Avr, 0xAA)]);
     let mut status = vec![0u8; 25];
     status[0] = 0x18;
@@ -227,7 +274,7 @@ fn mevo_avr_sync_without_nack_is_unchanged() {
 
 #[test]
 fn xi_avr_sync_ends_after_if_cal() {
-    let (mut seq, actions) = AvrSequencer::new(DeviceModel::Xi);
+    let (mut seq, actions) = AvrSequencer::new(DeviceModel::Xi, t0());
     assert_eq!(sent(&actions), [(BusAddr::Avr, 0xAA)]);
     let mut status = vec![0u8; 25];
     status[0] = 0x18;
@@ -257,7 +304,7 @@ fn xi_avr_sync_ends_after_if_cal() {
 
 #[test]
 fn xi_avr_sync_if_cal_timeout_completes() {
-    let (mut seq, _) = AvrSequencer::new(DeviceModel::Xi);
+    let (mut seq, _) = AvrSequencer::new(DeviceModel::Xi, t0());
     seq.step = AvrStep::WaitIfCal;
     seq.status = Some(AvrStatus::decode(&[0u8; 25]).unwrap());
     seq.cal_deadline = Some(t0());

@@ -28,7 +28,7 @@ use crate::protocol::shot::{
 use crate::protocol::status::{AvrStatus, ConfigAck, DspStatus, StatusPoll};
 use crate::protocol::{
     Command, Message, TYPE_CAL_DATA_REQ, TYPE_DSP_QUERY, TYPE_FLIGHT_RESULT, TYPE_FLIGHT_RESULT_V1,
-    TYPE_PARAM_VALUE, TYPE_STATUS,
+    TYPE_PARAM_VALUE,
 };
 
 /// Per-exchange timeout.
@@ -39,9 +39,10 @@ pub(crate) const TIMEOUT: Duration = Duration::from_secs(2);
 /// does not depend on one.
 pub(crate) const DSP_QUERY_TIMEOUT: Duration = TIMEOUT;
 
-/// How long the AVR sequencer waits before re-sending a status poll the
-/// AVR refused (0x94). The Xi's AVR refuses status polls for several
-/// seconds after power-on.
+/// How long the AVR sequencer waits for the answer to a status poll before
+/// sending it again. The Xi's AVR refuses status polls (0x94) for several
+/// seconds after power-on; the X2's does not answer them while its DSP is
+/// in Standby.
 pub(crate) const STATUS_REPOLL_INTERVAL: Duration = Duration::from_secs(1);
 
 // ===========================================================================
@@ -193,9 +194,10 @@ pub struct DspSync {
     pub config: ConfigResp,
     /// Model family, detected from the DSP device info.
     pub model: DeviceModel,
-    /// Xi only: `true` when the DSP did not answer the power-mode write
-    /// within 2 seconds and the sync carried on without a
-    /// reply. Always `false` on the Mevo+ and Gen2, which are not sent it.
+    /// `true` when the DSP did not answer the power-mode write within 2
+    /// seconds and the sync carried on without a reply. Always `false`
+    /// when the write is not sent: on the Mevo+ and Gen2, and on an X2
+    /// whose DSP reports Normal.
     pub power_mode_unanswered: bool,
 }
 
@@ -208,18 +210,33 @@ enum DspStep {
     WaitProdInfo1,
     WaitProdInfo2,
     WaitConfig,
-    /// Xi only: wait for the 0x95 (or 0x94) of the power-mode write, at
-    /// most [`DSP_QUERY_TIMEOUT`].
+    /// Xi, and an X2 in Standby: wait for the 0x95 (or 0x94) of the
+    /// power-mode write, at most [`DSP_QUERY_TIMEOUT`].
     WaitPowerMode,
     Done,
 }
 
-/// Param 0x01 on the Xi's DSP, the power mode: 1 = Normal, 4 = Standby.
-/// (Param 0x01 on the AVR is a different parameter, the altitude.)
-const XI_DSP_POWER_MODE_ID: u8 = 0x01;
-/// DSP power mode Normal (1), written at every Xi connection. A DSP left
-/// in Standby (4) wakes up; one already in Normal is unchanged.
-const XI_DSP_POWER_MODE_NORMAL: i32 = 1;
+/// Param 0x01 on the Xi's and the X2's DSP, the power mode: 1 = Normal,
+/// 4 = Standby. (Param 0x01 on the AVR is a different parameter, the
+/// altitude.)
+const DSP_POWER_MODE_ID: u8 = 0x01;
+/// DSP power mode Normal (1). A DSP left in Standby (4) wakes up; one
+/// already in Normal is unchanged.
+const DSP_POWER_MODE_NORMAL: i32 = 1;
+
+/// Version byte of the X2's DSP status.
+const X2_DSP_STATUS_VERSION: u8 = 0x1B;
+/// Byte of the X2's DSP status that reports its power mode: 1 in Standby,
+/// 2 in Normal. While the DSP is in Standby the AVR answers nothing.
+const X2_DSP_STATUS_POWER: usize = 27;
+/// [`X2_DSP_STATUS_POWER`] of a DSP in Standby.
+const X2_DSP_STATUS_STANDBY: u8 = 0x01;
+
+/// Whether `status`, an X2's DSP status, reports the DSP in Standby.
+fn x2_dsp_in_standby(status: &DspStatus) -> bool {
+    matches!(status, DspStatus::V46(s) if s.version == X2_DSP_STATUS_VERSION
+        && s.payload.get(X2_DSP_STATUS_POWER) == Some(&X2_DSP_STATUS_STANDBY))
+}
 
 /// Pollable state machine for DSP sync (Phase 1).
 ///
@@ -230,9 +247,11 @@ const XI_DSP_POWER_MODE_NORMAL: i32 = 1;
 ///
 /// On the Xi the sequence ends with a power-mode write to the DSP, BF
 /// `[06 00 00 01 00 00 01]` (param 0x01 = 1, Normal), which wakes a DSP left
-/// in Standby. It completes on the DSP's 0x95, or on a 0x94 refusing it;
-/// the refusal is kept for [`take_refused()`](Self::take_refused). With no
-/// reply within [`DSP_QUERY_TIMEOUT`] it completes too, and
+/// in Standby. On the X2 it ends with the same write when the DSP's first
+/// status reports Standby (an X2 in Normal is not sent it). It completes
+/// on the DSP's 0x95, or on a 0x94 refusing it; the refusal is kept for
+/// [`take_refused()`](Self::take_refused). With no reply within
+/// [`DSP_QUERY_TIMEOUT`] it completes too, and
 /// [`DspSync::power_mode_unanswered`] is set. The Mevo+ and Gen2 are not
 /// sent it.
 pub(crate) struct DspSequencer {
@@ -272,7 +291,7 @@ impl DspSequencer {
         (seq, actions)
     }
 
-    /// The 0x94 with which the DSP refused the Xi power-mode write, once.
+    /// The 0x94 with which the DSP refused the power-mode write, once.
     /// The sequence carries on without it; log the frame's hex.
     #[must_use]
     pub fn take_refused(&mut self) -> Option<Envelope> {
@@ -295,7 +314,7 @@ impl DspSequencer {
         }
     }
 
-    /// Check whether the DSP query or the Xi power-mode write has gone
+    /// Check whether the DSP query or the power-mode write has gone
     /// unanswered for [`DSP_QUERY_TIMEOUT`]. A timed-out query moves on to
     /// DevInfoReq; a timed-out power-mode write completes the sequence
     /// (check [`is_complete()`](Sequence::is_complete) afterward).
@@ -316,6 +335,16 @@ impl DspSequencer {
                 vec![]
             }
             _ => vec![],
+        }
+    }
+
+    /// Whether the sync ends with the power-mode write: always on the Xi,
+    /// and on the X2 when its first status reported Standby.
+    fn wakes_dsp(&self) -> bool {
+        match self.dev_info.as_ref().map(DevInfoResp::model) {
+            Some(DeviceModel::Xi) => true,
+            Some(DeviceModel::X2) => self.status.as_ref().is_some_and(x2_dsp_in_standby),
+            _ => false,
         }
     }
 
@@ -420,17 +449,13 @@ impl Sequence for DspSequencer {
             DspStep::WaitConfig => {
                 if let Message::ConfigResp(ref r) = env.message {
                     self.config = Some(r.clone());
-                    if self
-                        .dev_info
-                        .as_ref()
-                        .is_some_and(|d| d.model() == DeviceModel::Xi)
-                    {
+                    if self.wakes_dsp() {
                         self.step = DspStep::WaitPowerMode;
                         self.deadline = Some(now + DSP_QUERY_TIMEOUT);
                         return vec![Action::Send(
                             Command::ParamValue(ParamValue {
-                                param_id: XI_DSP_POWER_MODE_ID,
-                                value: ParamData::Int24(XI_DSP_POWER_MODE_NORMAL),
+                                param_id: DSP_POWER_MODE_ID,
+                                value: ParamData::Int24(DSP_POWER_MODE_NORMAL),
                             }),
                             BusAddr::Dsp,
                         )];
@@ -501,9 +526,10 @@ enum AvrStep {
 /// refuses it); without a reply the step ends after [`TIMEOUT`].
 ///
 /// An AVR that is still starting up refuses the status poll with a 0x94
-/// (`[02 30 2A]`); the Xi does so for several seconds after power-on. The
-/// poll is then sent again [`STATUS_REPOLL_INTERVAL`] later, from
-/// [`check_timers()`](Self::check_timers), once per refusal,
+/// (`[02 30 2A]`), as the Xi does for several seconds after power-on, or
+/// does not answer it, as the X2 does while its DSP is in Standby. A status
+/// poll the AVR has not answered within [`STATUS_REPOLL_INTERVAL`] is sent
+/// again, from [`check_timers()`](Self::check_timers), every interval
 /// until the AVR answers. The caller's overall deadline bounds the wait.
 pub(crate) struct AvrSequencer {
     step: AvrStep,
@@ -516,14 +542,14 @@ pub(crate) struct AvrSequencer {
     avr_config: Option<AvrConfigResp>,
     /// Timeout tracking for optional cal responses.
     cal_deadline: Option<Instant>,
-    /// When to re-send a refused status poll.
+    /// When to re-send an unanswered status poll.
     repoll_at: Option<Instant>,
 }
 
 impl AvrSequencer {
-    /// AVR sync for the given model family.
+    /// AVR sync for the given model family, started at `now`.
     #[must_use]
-    pub fn new(model: DeviceModel) -> (Self, Vec<Action>) {
+    pub fn new(model: DeviceModel, now: Instant) -> (Self, Vec<Action>) {
         let seq = Self {
             step: AvrStep::WaitStatus1,
             model,
@@ -534,7 +560,7 @@ impl AvrSequencer {
             if_cal: None,
             avr_config: None,
             cal_deadline: None,
-            repoll_at: None,
+            repoll_at: Some(now + STATUS_REPOLL_INTERVAL),
         };
         let actions = vec![Action::Send(
             Command::StatusPoll(StatusPoll { pi_mode: false }),
@@ -556,15 +582,15 @@ impl AvrSequencer {
         }
     }
 
-    /// Check the timed steps: re-send a refused status poll once
-    /// [`STATUS_REPOLL_INTERVAL`] has passed, and move past an optional cal
-    /// step that has gone unanswered. Call this periodically in the event
-    /// loop.
+    /// Check the timed steps: re-send a status poll that has gone
+    /// unanswered for [`STATUS_REPOLL_INTERVAL`], and move past an optional
+    /// cal step that has gone unanswered. Call this periodically in the
+    /// event loop.
     pub fn check_timers(&mut self, now: Instant) -> Vec<Action> {
         if let Some(at) = self.repoll_at
             && now >= at
         {
-            self.repoll_at = None;
+            self.repoll_at = Some(now + STATUS_REPOLL_INTERVAL);
             return vec![Action::Send(
                 Command::StatusPoll(StatusPoll { pi_mode: false }),
                 BusAddr::Avr,
@@ -611,15 +637,6 @@ impl AvrSequencer {
 
 impl Sequence for AvrSequencer {
     fn feed(&mut self, env: &Envelope, now: Instant) -> Vec<Action> {
-        if matches!(self.step, AvrStep::WaitStatus1 | AvrStep::WaitStatus2)
-            && env.src == BusAddr::Avr
-            && let Message::ConfigNack(ref nack) = env.message
-            && nack.acked_cmd == TYPE_STATUS & 0x7F
-        {
-            self.repoll_at
-                .get_or_insert_with(|| now + STATUS_REPOLL_INTERVAL);
-            return vec![];
-        }
         if matches!(self.step, AvrStep::WaitFactoryCal)
             && env.src == BusAddr::Avr
             && let Message::ConfigNack(ref nack) = env.message
@@ -647,7 +664,7 @@ impl Sequence for AvrSequencer {
             AvrStep::WaitStatus1 => {
                 if let Message::AvrStatus(ref s) = env.message {
                     self.status = Some(s.clone());
-                    self.repoll_at = None;
+                    self.repoll_at = Some(now + STATUS_REPOLL_INTERVAL);
                     self.step = AvrStep::WaitStatus2;
                     return vec![Action::Send(
                         Command::StatusPoll(StatusPoll { pi_mode: false }),
